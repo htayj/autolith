@@ -111,7 +111,7 @@ between discovery and checkout.
 
 #+BEGIN_SRC sh
 tag=v0.16.1
-repository=https://github.com/luciusmagn/autolith.git
+repository=https://github.com/lambda-symbolics/autolith.git
 commit=$(git ls-remote --tags --refs "$repository" "refs/tags/$tag" |
   awk 'NR == 1 { print $1 }')
 test "${#commit}" -eq 40

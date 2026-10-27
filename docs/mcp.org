@@ -4,7 +4,7 @@
 * MCP
 
 Autolith is an MCP client. It supports MCP 2025-11-25 and 2025-06-18
-through stdio and Streamable HTTP, using [[https://github.com/luciusmagn/mcparen][mcparen]]. It requests the newer
+through stdio and Streamable HTTP, using [[https://github.com/lambda-symbolics/mcparen][mcparen]]. It requests the newer
 revision and accepts either one the server selects.
 
 As with other agents servers can offer tools, resources, resource

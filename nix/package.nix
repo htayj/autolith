@@ -1001,7 +1001,7 @@ pkgs.writeShellApplication {
 
   meta = {
     description = "A live, self-modifying Common Lisp agent";
-    homepage = "https://github.com/luciusmagn/autolith";
+    homepage = "https://github.com/lambda-symbolics/autolith";
     license = lib.licenses.mit;
     mainProgram = "autolith";
     platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];

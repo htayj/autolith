@@ -541,7 +541,7 @@ presentation. Detached sessions carry the theme across handoff.
 Nix is the simplest way to install Autolith:
 
 #+BEGIN_SRC sh
-nix run github:luciusmagn/autolith
+nix run github:lambda-symbolics/autolith
 #+END_SRC
 
 The first launch builds Lisp images Autolith needs to launch.
