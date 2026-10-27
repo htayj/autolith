@@ -96,8 +96,8 @@
   :version "git-33f60d6c528f77467abf8fa9ebf59fc45d050d6e"))
 ("cl-rfc8252" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-rfc8252.git" :ref "b9affbd04c12e2adac4a2403f60a3a2802f9ac45")
-  :version "git-b9affbd04c12e2adac4a2403f60a3a2802f9ac45"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-rfc8252.git" :ref "e2bbd2374ec159f86123c046c020fce27fce2d99")
+  :version "git-e2bbd2374ec159f86123c046c020fce27fce2d99"))
 ("cl-rfc8628" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/cl-rfc8628.git" :ref "740ccdff7d10c192c75cc1589259682e3e66e007")
