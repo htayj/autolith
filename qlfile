@@ -53,6 +53,6 @@ git surgeon https://github.com/lambda-symbolics/surgeon.git :ref b159c64231f35d2
 git structlisp https://github.com/lambda-symbolics/structlisp.git :ref 66bbfbe947b69f3105f71f5e4293637decc91746
 git argo https://github.com/lambda-symbolics/argo.git :ref c8034c208f43436b19af2858bfb6112ac7e66e1f
 git setinka https://github.com/lambda-symbolics/setinka.git :ref ce63dce34287b20ad81f08f6d208e6e18bc3163f
-git lambda-debugger https://github.com/lambda-symbolics/lambda-debugger.git :ref 713c4a64ad109eb4f511426c21ae422b18674c77
+git lambda-debugger https://github.com/lambda-symbolics/lambda-debugger.git :ref 7399adcec0af3e0fd4f1e8be260bea2689d8e7af
 git yolokuva https://github.com/lambda-symbolics/yolokuva.git :ref e35d37d21bf07bb99473c0144144fa73c313d898
 git defingerprinter https://github.com/chakanysystems/defingerprinter.git :ref ade272f23397fc1791b5c0a9b1046407cbe39e04
