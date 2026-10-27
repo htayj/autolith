@@ -48,7 +48,7 @@ git sbcl-generations https://github.com/lambda-symbolics/sbcl-generations.git :r
 git sexp-config https://github.com/lambda-symbolics/sexp-config.git :ref d36be049fb4f31e7f51d0f9b718fbf36bd642fca
 git sexp-store https://github.com/lambda-symbolics/sexp-store.git :ref 4d38e6544d87412d99acef9f097272df41359eff
 git sophisticated-clipboard https://github.com/lambda-symbolics/sophisticated-clipboard.git :ref 756b65f4f8be18c786e2331de89708729df42bd4
-git sbcl-workers https://github.com/lambda-symbolics/sbcl-workers.git :ref 42e72f0e80e0a8ab7ebbbdd4d287133e33cefd62
+git sbcl-workers https://github.com/lambda-symbolics/sbcl-workers.git :ref cded09d0c0d2a3c889f6fbb3414342b957978d74
 git surgeon https://github.com/lambda-symbolics/surgeon.git :ref b159c64231f35d2b20aedd41544f8621d16a0c29
 git structlisp https://github.com/lambda-symbolics/structlisp.git :ref 66bbfbe947b69f3105f71f5e4293637decc91746
 git argo https://github.com/lambda-symbolics/argo.git :ref c8034c208f43436b19af2858bfb6112ac7e66e1f
