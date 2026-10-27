@@ -224,8 +224,8 @@
   :version "git-713c4a64ad109eb4f511426c21ae422b18674c77"))
 ("yolokuva" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/yolokuva.git" :ref "1a6e6e68b8d184496dbfda9defcac1f6dfaf18fe")
-  :version "git-1a6e6e68b8d184496dbfda9defcac1f6dfaf18fe"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/yolokuva.git" :ref "e35d37d21bf07bb99473c0144144fa73c313d898")
+  :version "git-e35d37d21bf07bb99473c0144144fa73c313d898"))
 ("defingerprinter" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/chakanysystems/defingerprinter.git" :ref "ade272f23397fc1791b5c0a9b1046407cbe39e04")

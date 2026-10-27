@@ -54,5 +54,5 @@ git structlisp https://github.com/lambda-symbolics/structlisp.git :ref 66bbfbe94
 git argo https://github.com/lambda-symbolics/argo.git :ref c8034c208f43436b19af2858bfb6112ac7e66e1f
 git setinka https://github.com/lambda-symbolics/setinka.git :ref ce63dce34287b20ad81f08f6d208e6e18bc3163f
 git lambda-debugger https://github.com/lambda-symbolics/lambda-debugger.git :ref 713c4a64ad109eb4f511426c21ae422b18674c77
-git yolokuva https://github.com/lambda-symbolics/yolokuva.git :ref 1a6e6e68b8d184496dbfda9defcac1f6dfaf18fe
+git yolokuva https://github.com/lambda-symbolics/yolokuva.git :ref e35d37d21bf07bb99473c0144144fa73c313d898
 git defingerprinter https://github.com/chakanysystems/defingerprinter.git :ref ade272f23397fc1791b5c0a9b1046407cbe39e04
