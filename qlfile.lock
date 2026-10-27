@@ -84,8 +84,8 @@
   :version "git-3dbecffb6340d4256a322c6e0daf32eb0205014f"))
 ("clermaid" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/clermaid.git" :ref "adda288e76c2116da99c611af22442ad7c277756")
-  :version "git-adda288e76c2116da99c611af22442ad7c277756"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/clermaid.git" :ref "7a4497aff7514134dd69ab28b7d07c06335b7852")
+  :version "git-7a4497aff7514134dd69ab28b7d07c06335b7852"))
 ("cl-jobpond" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/cl-jobpond.git" :ref "3fa176f20caaf954ebe3b352a18c01fef34d33ee")
