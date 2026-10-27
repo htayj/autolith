@@ -72,7 +72,7 @@
   :version "git-0adb33b6801d1218ce6249d2a751b05f88b98c40"))
 ("cl-colorist" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/luciusmagn/cl-colorist.git" :ref "a70749493fbdbe79d6766f254a664119042102b9")
+  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-colorist.git" :ref "a70749493fbdbe79d6766f254a664119042102b9")
   :version "git-a70749493fbdbe79d6766f254a664119042102b9"))
 ("cl+ssl" .
  (:class qlot/source/git:source-git
@@ -176,7 +176,7 @@
   :version "git-0e3e0ada0f5b693cb3f32f46aefbb8dbebcc20f2"))
 ("idsmall" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/luciusmagn/idsmall.git" :ref "3f4b8e067a1e41b5388f7c5af58585e8c9ab51b9")
+  :initargs (:remote-url "https://github.com/lambda-symbolics/idsmall.git" :ref "3f4b8e067a1e41b5388f7c5af58585e8c9ab51b9")
   :version "git-3f4b8e067a1e41b5388f7c5af58585e8c9ab51b9"))
 ("mcparen" .
  (:class qlot/source/git:source-git
