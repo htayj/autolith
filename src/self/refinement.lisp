@@ -91,8 +91,9 @@
               (and (eq (getf previous :state) :promoting) (eq state :promoted)
                    (eq scope (getf previous :destination))
                    (eq scope (case (getf previous :scope) (:session
-                                                           ':project) (:project
-                                                                       ':global))))))
+                                                           ':project)
+                                                          (:project
+                                                           ':global))))))
          (and (eq scope :session)
               (eq state (if (eq (getf current :target) :none) ':no-op ':proposed))))
      (or (not (eq state :passed))
@@ -331,8 +332,9 @@ with the owner, especially self.commit's clean-process replay checks."
            (state         (getf proposal :state))
            (evaluation-p  (eq phase :evaluate))
            (next-scope    (case current-scope (:session
-                                               ':project) (:project
-                                                           ':global))))
+                                               ':project)
+                                              (:project
+                                               ':global))))
       (case phase
         (:experiment
          (unless (member state '(:proposed :failed :experiment :observed :passed :promoted))
@@ -371,8 +373,9 @@ with the owner, especially self.commit's clean-process replay checks."
                                       (case phase (:experiment
                                                    ':applying)
                                             (:evaluate
-                                             ':evaluating) (:promote
-                                                            ':promoting))))
+                                             ':evaluating)
+                                            (:promote
+                                             ':promoting))))
       (handler-case
           (let* ((result    (refinement--delegate context proposal
                                                 :source       operation

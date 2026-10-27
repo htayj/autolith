@@ -95,8 +95,9 @@
                                                               (case phase (:experiment
                                                                            "define")
                                                                     (:evaluate
-                                                                     "exercise") (:promote
-                                                                                  "commit"))))))
+                                                                     "exercise")
+                                                                    (:promote
+                                                                     "commit"))))))
 
 (-> refinement-tests--assess (tool-context list keyword) list)
 (defun refinement-tests--assess (context proposal verdict)

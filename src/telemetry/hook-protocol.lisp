@@ -42,11 +42,13 @@ Evaluation events require an explicit incident link; ordinary probes are not rep
               (check-p    (member kind '(:exercise :verification)))
               (outcome    (case result
                             (:pending
-                             ':proposed) (:installed
-                                          ':applied)
+                             ':proposed)
+                            (:installed
+                             ':applied)
                             (:passed
-                             ':verified) (:failed
-                                          ':failed)
+                             ':verified)
+                            (:failed
+                             ':failed)
                             ((:discarded :superseded)
                              ':reverted)
                             ((:committed :durable)
@@ -75,8 +77,9 @@ Evaluation events require an explicit incident link; ordinary probes are not rep
                                         (case kind (:definition
                                                     ':redefine-function)
                                                    (:set
-                                                    ':change-setting) (otherwise
-                                                                       ':other)))
+                                                    ':change-setting)
+                                                   (otherwise
+                                                    ':other)))
                 :outcome outcome :verified (and check-p (member result '(:passed :checked)) t)
                 :summary-function   (lambda () (getf context :diagnostic))
                 :verification-scope (when check-p (or (getf context :verification-scope) ':focused))))))))))

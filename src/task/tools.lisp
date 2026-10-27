@@ -34,8 +34,9 @@
     ((and (non-empty-string-p shared) (non-empty-string-p item))
      (format nil "~A~2%~A" shared item))
     ((non-empty-string-p shared)
-     shared) ((non-empty-string-p item)
-              item)
+     shared)
+    ((non-empty-string-p item)
+     item)
     (t
      nil)))
 

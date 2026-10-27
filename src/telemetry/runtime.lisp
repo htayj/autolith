@@ -906,9 +906,11 @@ Reports after finish are ignored with a local debug diagnostic."
 (defun telemetry--outcome-order (outcome)
   "Return a stable ordering key for bounded borrower outcome metadata."
   (format nil "~D/~A/~A" (ecase (first outcome) (:success
-                                                 0) (:cancelled
-                                                     1) (:error
-                                                         2))
+                                                 0)
+                                                (:cancelled
+                                                 1)
+                                                (:error
+                                                 2))
           (or (second outcome) "") (or (third outcome) "")))
 
 (-> telemetry-finish-run ((option telemetry-run) t &optional list) null)

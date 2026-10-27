@@ -8,8 +8,9 @@
   (let ((export-p (eq operation ':export)))
     (make-command
      :name        (ecase operation (:export
-                                    "export") (:import
-                                               "import"))
+                                    "export")
+                                   (:import
+                                    "import"))
      :description (if export-p
                       "export all portable user data or one workspace"
                       "import portable user data, optionally relocating a workspace")

@@ -223,19 +223,24 @@ conversation transaction can roll back before releasing either lease."
            (idle-p (and waiting-for-input-p (not paused-p) (zerop task-live-count)))
            (state
             (cond (stopping-p
-                   ':stopping) (failed-p
-                                ':failed) (handoff-p
-                                           ':detaching)
+                   ':stopping)
+                  (failed-p
+                   ':failed)
+                  (handoff-p
+                   ':detaching)
                   (paused-p
-                   ':paused) (cancelling-p
-                              ':cancelling) (active-p
-                                             ':active)
+                   ':paused)
+                  (cancelling-p
+                   ':cancelling)
+                  (active-p
+                   ':active)
                   ((or (plusp queued-count) (plusp steering-count) recalled-p
                        (plusp task-live-count))
                    ':working)
                   (idle-p
-                   ':idle) (t
-                            ':starting))))
+                   ':idle)
+                  (t
+                   ':starting))))
       (list :localgroup-status :version *daemon-protocol-version* :session-id
             (conversation-identifier conversation) :pid (current-process-id)
             :autolith-version *autolith-version* :state state :idle-p (not (null idle-p))

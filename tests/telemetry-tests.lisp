@@ -272,9 +272,11 @@ The caller owns termination. Keep startup stderr beside READY-PATH for failures.
                 (test-assert (equal (test-telemetry--attribute span "autolith.verification.scope")
                                     (and (eq kind ':check)
                                          (case scope (:none
-                                                      "none") (:focused
-                                                               "focused") (:full
-                                                                           "full"))))
+                                                      "none")
+                                                     (:focused
+                                                      "focused")
+                                                     (:full
+                                                      "full"))))
                              "Missing and invalid scopes are omitted; explicit scopes survive.")
                 (test-assert (equal (test-telemetry--attribute span "autolith.repair.attempt.id") attempt-id)
                              "Check spans carry the valid attempt linkage required by the collector."))

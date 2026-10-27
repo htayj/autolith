@@ -191,9 +191,11 @@
            (debug--fail ':invalid-arguments "Step kind must be in, over or out."))
          (apply #'daphne:session-step session (debug--number arguments "thread")
                 (cond ((equal kind "in")
-                       ':in) ((equal kind "over")
-                              ':over) (t
-                                       ':out)) options)))
+                       ':in)
+                      ((equal kind "over")
+                       ':over)
+                      (t
+                       ':out)) options)))
       ((equal operation "terminate")
        (apply #'daphne:session-terminate session :disconnect t
               :terminate-debuggee                            (tool-boolean-argument arguments "terminate-debuggee" :default t :tool-name "debug.terminate") options)

@@ -166,8 +166,9 @@
       ((member value '("@slow" "@designer") :test #'string=)
        "gpt-6.1-terra")
       ((member alias *supported-models* :test #'string=)
-       alias) (t
-               nil))))
+       alias)
+      (t
+       nil))))
 
 (defparameter *task-default-reasoning-effort* "medium"
   "The effort of child roles that leave their reasoning effort unspecified or :auto.

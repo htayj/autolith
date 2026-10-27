@@ -271,9 +271,11 @@
          (state         (or (getf terminal :state)
                             (case (getf result :status)
                               (:success
-                               ':completed) (:failed
-                                             ':failed) (:aborted
-                                                        ':aborted)
+                               ':completed)
+                              (:failed
+                               ':failed)
+                              (:aborted
+                               ':aborted)
                               (otherwise
                                ':unknown))))
          (metadata      (task-completion--metadata record :directory directory :result result :state state)))

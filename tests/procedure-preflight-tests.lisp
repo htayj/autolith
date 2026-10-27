@@ -170,9 +170,11 @@
                                                          :conversation (conversation-create configuration)))
              (count         (if (member case '(:guard-false :future-guard-false)) 2 4))
              (amount        (case case (:computed-mismatch
-                                        6) (:future-guard-false
-                                            5) (otherwise
-                                                (1+ count))))
+                                        6)
+                                       (:future-guard-false
+                                        5)
+                                       (otherwise
+                                        (1+ count))))
              (future-p      (member case '(:future-count :future-guard-false)))
              (refused-p     (member case '(:computed-mismatch :guard-false)))
              (build         (learning-tests--tool registry "report.build"

@@ -81,8 +81,9 @@
     (:escape
      (setf (application-async-lisp-output-stream-escape-state stream)
            (case character (#\[
-                            ':csi) (#\]
-                                    ':osc))))
+                            ':csi)
+                           (#\]
+                            ':osc))))
     (:csi
      (when (<= 64 (char-code character) 126)
        (setf (application-async-lisp-output-stream-escape-state stream) nil)))

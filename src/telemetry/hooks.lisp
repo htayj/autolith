@@ -207,8 +207,9 @@
                                 (if (provider-result-tool-calls result) ':tool-calls
                                     (case (provider-result-turn-completion result)
                                       (:end
-                                       ':stop) (:continue
-                                                ':continue)))))
+                                       ':stop)
+                                      (:continue
+                                       ':continue)))))
           :usage          normalized
           :duration-ms    (telemetry--elapsed-milliseconds start))))))
   nil)

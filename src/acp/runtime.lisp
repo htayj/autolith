@@ -238,9 +238,11 @@
          (start-sequence               nil)
          (observer                     nil)
          (source                       (cond (queued-p
-                                              "queue") (automatic-p
-                                                        "completion") (t
-                                                                       "prompt")))
+                                              "queue")
+                                             (automatic-p
+                                              "completion")
+                                             (t
+                                              "prompt")))
          (outcome                      ':condition)
          (claimed-p                    nil))
     (acp-service--call-with-operation
