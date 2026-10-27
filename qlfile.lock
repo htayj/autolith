@@ -196,8 +196,8 @@
   :version "git-4d38e6544d87412d99acef9f097272df41359eff"))
 ("sophisticated-clipboard" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/sophisticated-clipboard.git" :ref "756b65f4f8be18c786e2331de89708729df42bd4")
-  :version "git-756b65f4f8be18c786e2331de89708729df42bd4"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/sophisticated-clipboard.git" :ref "b933a913481bdcdc0ca0895f053d19eca314eac5")
+  :version "git-b933a913481bdcdc0ca0895f053d19eca314eac5"))
 ("sbcl-workers" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/sbcl-workers.git" :ref "cded09d0c0d2a3c889f6fbb3414342b957978d74")
