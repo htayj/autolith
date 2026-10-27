@@ -156,8 +156,8 @@
   :version "git-a8d229ae99dcd630bb4b32942e12791a7ea67a4d"))
 ("parenchek" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/parenchek.git" :ref "17cad0bea89953974a7081150333bb964b4769ff")
-  :version "git-17cad0bea89953974a7081150333bb964b4769ff"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/parenchek.git" :ref "ff5281cdb0be79fd6368b26c837cf7c9a4ea26f6")
+  :version "git-ff5281cdb0be79fd6368b26c837cf7c9a4ea26f6"))
 ("org-templater" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/org-templater.git" :ref "918d456528474e880014fe8377e4810e4a55e6a9")
