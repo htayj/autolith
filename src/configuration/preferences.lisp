@@ -71,7 +71,7 @@ name; unknown keys survive rewrites so releases can share one file.")
   (declare (ignore store))
   (preferences-load-values configuration))
 
-(defmethod store-write-value ((store preferences-store) configuration name value)
+(defmethod store-write-value ((store preferences-store) configuration name &key value)
   "Merge NAME and VALUE into CONFIGURATION's preferences file."
   (declare (ignore store))
   (preferences-store configuration name value))
