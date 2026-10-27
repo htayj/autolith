@@ -68,8 +68,8 @@
   :version "git-2120a9df287731bf3a39edf7fabb02a5406494ff"))
 ("fetch-gist" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/fetch-gist.git" :ref "0adb33b6801d1218ce6249d2a751b05f88b98c40")
-  :version "git-0adb33b6801d1218ce6249d2a751b05f88b98c40"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/fetch-gist.git" :ref "082f4d45d4cf0076c0c891f00e05d71957de6009")
+  :version "git-082f4d45d4cf0076c0c891f00e05d71957de6009"))
 ("cl-colorist" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/cl-colorist.git" :ref "a70749493fbdbe79d6766f254a664119042102b9")
