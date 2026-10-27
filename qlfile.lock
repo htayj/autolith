@@ -140,8 +140,8 @@
   :version "git-684e840c7f6de632048e38dcf63279da19ebc2fe"))
 ("cl-hashline" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-hashline.git" :ref "9a989dc73bf46ff3f8e8c6921126612e2451a8a8")
-  :version "git-9a989dc73bf46ff3f8e8c6921126612e2451a8a8"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-hashline.git" :ref "582986f8ccbd0bd206dde022f9f65837ae82357c")
+  :version "git-582986f8ccbd0bd206dde022f9f65837ae82357c"))
 ("clifff" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/clifff.git" :ref "c575f108ef497f113f87901ac91fd6dcce2a59cf")
