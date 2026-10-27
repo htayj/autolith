@@ -212,8 +212,8 @@
   :version "git-66bbfbe947b69f3105f71f5e4293637decc91746"))
 ("argo" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/argo.git" :ref "3658b947372fb19ae07aca65a439b63b0685ae47")
-  :version "git-3658b947372fb19ae07aca65a439b63b0685ae47"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/argo.git" :ref "c8034c208f43436b19af2858bfb6112ac7e66e1f")
+  :version "git-c8034c208f43436b19af2858bfb6112ac7e66e1f"))
 ("setinka" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/setinka.git" :ref "f1a7e186ad217e08cf4045c938398a0860126851")
