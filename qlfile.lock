@@ -172,8 +172,8 @@
   :version "git-cd7ea1588586d3ee77ccd064c98531483da6f52e"))
 ("ls-flock" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/ls-flock.git" :ref "0e3e0ada0f5b693cb3f32f46aefbb8dbebcc20f2")
-  :version "git-0e3e0ada0f5b693cb3f32f46aefbb8dbebcc20f2"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/ls-flock.git" :ref "ee9fc57a46a396e6386d61f81a6df926ca9f9906")
+  :version "git-ee9fc57a46a396e6386d61f81a6df926ca9f9906"))
 ("idsmall" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/idsmall.git" :ref "3f4b8e067a1e41b5388f7c5af58585e8c9ab51b9")
