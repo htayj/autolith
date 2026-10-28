@@ -10,8 +10,10 @@
           (configuration-copy configuration :working-directory root :onboarding-p t
                               :fullscreen-p fullscreen-p :boot-screen-seconds 0
                               :boot-screen-tip-seconds 1))
-    (let* ((terminal (make-instance 'queued-recording-terminal :columns 100 :rows 32))
-           (ui       (terminal-ui-create :terminal terminal :fullscreen-p fullscreen-p))
+    (let* ((*terminal-theme*       *terminal-theme*)
+           (*terminal-style-table* *terminal-style-table*)
+           (terminal               (make-instance 'queued-recording-terminal :columns 100 :rows 32))
+           (ui                     (terminal-ui-create :terminal terminal :fullscreen-p fullscreen-p))
            (application
              (make-instance 'application :configuration configuration
                             :conversation               (conversation-create configuration :identifier "onboarding-test")
