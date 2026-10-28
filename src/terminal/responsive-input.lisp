@@ -531,9 +531,9 @@ second reports whether shutdown was prepared."
 
 (-> application-input-controller--follow-up-work-p (t) boolean)
 (defun application-input-controller--follow-up-work-p (work)
-  "Return true when WORK is an editable queued message, command, or Lisp form."
+  "Return true for editable queued messages, commands, or interactive or scheduled Lisp."
   (and (consp work)
-       (member (first work) '(:message :command :lisp) :test #'eq)
+       (member (first work) '(:message :command :lisp :native-lisp) :test #'eq)
        (consp (rest work))
        (typep (second work) '(or string user-message-input))))
 
@@ -700,7 +700,7 @@ lock."
 (defun application-input-controller--restore-work-item (form)
   "Return one validated in-memory work item restored from durable FORM."
   (when (and (listp form)
-             (member (first form) '(:message :command :lisp) :test #'eq))
+             (member (first form) '(:message :command :lisp :native-lisp) :test #'eq))
     (let ((input (application-input--restore-pending-form (second form))))
       (when input
         (list (first form) input)))))
@@ -4095,6 +4095,10 @@ reader stays alive in interrupt-only mode until FUNCTION returns or unwinds."
                :tool-restriction-p        t
                :goal-continuations-p      nil
                :fatal-agent-loop-errors-p nil)))
+            (:native-lisp
+             (application-input-controller--record-prompt-result
+              controller
+              (application-run-lisp-input application (second work) :interactive-p nil)))
             (:lisp
              (let ((result
                      (if (terminal-ui--async-lisp-draft-p (second work))

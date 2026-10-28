@@ -272,7 +272,8 @@
                           (error "The hosted scheduler did not enqueue its deadline."))
                         (sleep 0.01)))
              (let ((work (application-input-controller--next-work controller)))
-               (test-assert (eq (first work) ':lisp) "timer work uses the ordinary durable Lisp input queue")
+               (test-assert (eq (first work) ':native-lisp)
+                            "timer work uses the noninteractive durable Lisp queue")
                (application-input-controller--run-work controller work))
              (test-assert (= 1 (getf (application-goal application) :turns-used))
                           "the scheduled command enters ordinary mission provider admission")
@@ -285,5 +286,153 @@
                           "ordinary command completion settles the durable occurrence"))
         (image-daemon:daemon-runtime-stop runtime)
         (remhash application *mission-schedule-services*)
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+
+;;;; -- Noninteractive Scheduled Wakeups --
+
+(-> mission-schedule-test--run-finished-work (application-input-controller list) t)
+(defun mission-schedule-test--run-finished-work (controller work)
+  "Dispatch work and reset the prompt even when dispatch unwinds."
+  (unwind-protect
+       (application-input-controller--run-work controller work)
+    (application-input-controller--finish-work controller)))
+
+(-> test-mission-schedule-native-wakeup-stale-claim-process () null)
+(defun test-mission-schedule-native-wakeup-stale-claim-process ()
+  "Contain a recovered hosted wakeup and accept subsequent input in a real worker."
+  ;; Finish cold-cache presentation setup before bounding controller dispatch.
+  (application-lisp--source-entry "(+ 1 2)")
+  (with-test-configuration (configuration root)
+    (let* ((application (mission-test--application configuration))
+           (controller  (application-input-controller-create
+                         application :load-pending-p nil
+                         :pending-persistence-enabled-p t :start-reader-p nil))
+           (runtime     (image-daemon:daemon-runtime-create
+                         :directory  root
+                         :identifier (conversation-identifier
+                                      (application-conversation application))
+                         :publish-p nil :request-function
+                         (lambda (host request &key socket stream)
+                           (declare (ignore host request socket stream))
+                           (list :ok))))
+           (count       0))
+      (unwind-protect
+           (progn
+             (application-mission-start application (mission-test--specification))
+             (image-daemon:daemon-runtime-start runtime)
+             (application-mission-schedules-host application runtime)
+             (application-mission-schedule-add
+              application :id "stale-wakeup" :content "Must not reach provider."
+              :at (+ (get-universal-time) 1))
+             (let ((deadline (+ (get-internal-real-time)
+                                (* 4 internal-time-units-per-second))))
+               (loop until (with-lock-held ((application-input-controller-lock controller))
+                             (not (deque-empty-p
+                                   (application-input-controller-work-items controller))))
+                     do (when (> (get-internal-real-time) deadline)
+                          (error "The hosted scheduler did not enqueue its deadline."))
+                        (sleep 0.01)))
+             ;; Recovery retires the claim while the controller still owns the ticket.
+             (application-mission-schedules-recover application)
+             (test-call-with-function-replacements
+              (list (list 'application-lisp--select-restart
+                          (lambda (&rest arguments)
+                            (declare (ignore arguments))
+                            (incf count)
+                            nil)))
+              (lambda ()
+                (sb-ext:with-timeout 10
+                  (mission-schedule-test--run-finished-work
+                   controller (application-input-controller--next-work controller)))))
+             (test-assert (zerop count) "stale wakeups never select an interactive restart")
+             (let ((record (rest (first (last (conversation-user-operation-snapshot
+                                               (application-conversation application)))))))
+               (test-assert (member (getf record :status) '(:error :aborted))
+                            "the stale wakeup records a durable failure")
+               (test-assert (search "stale or requires explicit recovery" (getf record :result))
+                            "the stale claim retains its recovery condition"))
+             (application-input-controller--enqueue controller ':lisp "(+ 1 2)")
+             (sb-ext:with-timeout 10
+               (mission-schedule-test--run-finished-work
+                controller (application-input-controller--next-work controller)))
+             (test-assert (eq (getf (rest (first (last (conversation-user-operation-snapshot
+                                                        (application-conversation application)))))
+                                    :status)
+                              ':ok)
+                          "ordinary input progresses after the failed wakeup")
+             (test-assert (null (scripted-provider-input-snapshots
+                                 (application-provider application)))
+                          "the stale claim never reaches the provider"))
+        (application-input-controller-stop controller)
+        (image-daemon:daemon-runtime-stop runtime)
+        (remhash application *mission-schedule-services*)
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> test-mission-schedule-lisp-restart-policy () null)
+(defun test-mission-schedule-lisp-restart-policy ()
+  "Keep the selector for interactive failures only."
+  ;; Finish cold-cache presentation setup before bounding controller dispatch.
+  (application-lisp--source-entry "(+ 1 2)")
+  (dolist (kind '(:lisp :native-lisp))
+    (dolist (entry '((:ok "(+ 1 2)")
+                     (:stale "(mission-wakeup '(:id (1) :token 1))")
+                     (:malformed "(mission-wakeup '(:bogus 1))")))
+      (destructuring-bind (outcome source) entry
+        (with-test-configuration (configuration root)
+          (declare (ignore root))
+          (let* ((application (mission-test--application configuration))
+                 (controller  (application-input-controller-create
+                               application :load-pending-p nil :start-reader-p nil))
+                 (count       0))
+            (unwind-protect
+                 (progn
+                   (application-mission-start application (mission-test--specification))
+                   (test-call-with-function-replacements
+                    (list (list 'application-lisp--select-restart
+                                (lambda (&rest arguments)
+                                  (declare (ignore arguments))
+                                  (incf count)
+                                  nil)))
+                    (lambda ()
+                      (sb-ext:with-timeout 10
+                        (mission-schedule-test--run-finished-work controller (list kind source)))))
+                   (test-assert (= count (if (and (eq kind ':lisp) (not (eq outcome ':ok))) 1 0))
+                                "only interactive failures select restarts"))
+              (remhash application *mission-schedule-services*)
+              (terminal-ui-stop (application-ui application))))))))
+  nil)
+
+(-> test-vault-edit-accepts-native-lisp () null)
+(defun test-vault-edit-accepts-native-lisp ()
+  "Accept native work durably while rejecting unknown work kinds before publication."
+  (with-test-configuration (configuration root)
+    (declare (ignore root))
+    (let* ((application          (mission-test--application configuration))
+           (controller           (application-input-controller-create
+                                  application :load-pending-p nil
+                                  :pending-persistence-enabled-p t :start-reader-p nil))
+           (*active-application* application)
+           (entries              '((:native-lisp "(mission-wakeup '(:bogus 1))")))
+           (accepted             nil)
+           (rejected             nil))
+      (unwind-protect
+           (progn
+             ;; No dispatch of :NATIVE-LISP: exercise the durable codec boundary.
+             (handler-case
+                 (progn (setf (vault-contents) entries)
+                        (setf accepted (equal (vault-contents) entries)))
+               (recovery-input-vault-error () nil))
+             (let ((before (vault-contents)))
+               (handler-case (setf (vault-contents) '((:other "(+ 1 2)")))
+                 (recovery-input-vault-error (condition)
+                  (setf rejected (eq (recovery-input-vault-error-operation condition) ':edit))))
+               (test-assert accepted "vault editing accepts and reads back native Lisp entries")
+               (test-assert rejected "vault editing rejects an unknown kind as typed :edit failure")
+               (test-assert (equal (vault-contents) before)
+                            "rejected unknown-kind edit does not publish replacement work")))
+        (application-input-controller-stop controller)
         (terminal-ui-stop (application-ui application)))))
   nil)

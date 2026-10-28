@@ -53,9 +53,9 @@
 
 (-> mission-schedule--queue (application string) boolean)
 (defun mission-schedule--queue (application form)
-  "Admit a native wakeup FORM through the primary Lisp input queue without steering."
+  "Admit a native wakeup FORM noninteractively through the primary input queue."
   (let ((controller (application-input-controller application)))
-    (when (and controller (application-input-controller--enqueue controller ':lisp form))
+    (when (and controller (application-input-controller--enqueue controller ':native-lisp form))
       (application-input-controller--persist-pending controller)
       t)))
 
