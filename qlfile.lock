@@ -132,8 +132,8 @@
   :version "git-88abe646dc5b05ccda0b8b0a8229ae4b79a029f5"))
 ("cl-worktree" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-worktree.git" :ref "cd180c2b8f9cb4731be05c39320bbf91b0e2e63d")
-  :version "git-cd180c2b8f9cb4731be05c39320bbf91b0e2e63d"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/cl-worktree.git" :ref "203c6eaab4cf74ccfaee110c692b62c2359979f9")
+  :version "git-203c6eaab4cf74ccfaee110c692b62c2359979f9"))
 ("cl-exec-sandbox" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/cl-exec-sandbox.git" :ref "2eee22e33a4d4c6df6019e44ee7fe353454ce175")
