@@ -221,7 +221,6 @@
    (grok-provider-create (grok-provider-test--configuration))
    (make-instance 'test-character-input-stream
                   :source (grok-provider-test--doom-loop-stream triggers))
-   nil
    (lambda (event)
      (declare (ignore event)))))
 

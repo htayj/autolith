@@ -23,8 +23,8 @@
          provider
          (make-string-input-stream
           (format nil "data: ~A~%~%" (json-encode event)))
-         headers
-         (lambda (provider-event) (declare (ignore provider-event))))
+         (lambda (provider-event) (declare (ignore provider-event)))
+         :headers headers)
         (error "The Gemini stream fixture did not signal a provider failure."))
     (provider-error (condition)
       condition)))
@@ -164,7 +164,7 @@
          (events    nil)
          (result
            (provider-consume-stream
-            provider stream nil
+            provider stream
             (lambda (provider-event) (push provider-event events)))))
     (test-assert
      (string= (provider-result-response-id result) "trace-1")

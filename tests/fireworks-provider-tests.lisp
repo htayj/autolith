@@ -138,7 +138,7 @@
              "Consume SOURCE through PROVIDER and return its result or typed condition."
              (handler-case
                  (provider-consume-stream
-                  provider (make-string-input-stream source) nil #'identity)
+                  provider (make-string-input-stream source) #'identity)
                (provider-error (condition)
                  condition)))
 
@@ -278,7 +278,7 @@
                      (with-input-from-string (stream source)
                        (provider-consume-stream
                         (allocate-instance (find-class 'nous-messages-provider))
-                        stream nil #'identity))
+                        stream #'identity))
                    (provider-error (condition) condition))))
           (test-assert
            (typep outcome expected-type)

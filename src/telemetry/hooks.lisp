@@ -9,12 +9,12 @@
   "The latest public metadata snapshot for the current provider attempt.")
 
 (defmethod provider-consume-stream :around
-    ((provider model-provider) stream headers event-callback)
+    ((provider model-provider) stream event-callback &key headers)
   "Observe public response metadata without changing parser or callback failures."
   (if (null *telemetry-run*)
       (call-next-method)
       (call-next-method
-       provider stream headers
+       provider stream
        (lambda (event)
          (telemetry--call-safely
           (lambda ()
@@ -22,7 +22,8 @@
               (setf *telemetry-response-metadata*
                     (provider-response-metadata-event-metadata event)))))
          (when event-callback
-           (funcall event-callback event))))))
+           (funcall event-callback event)))
+       :headers headers)))
 
 (defmethod agent-run-user-turn :around
     ((agent agent) (content user-message-input) &rest arguments &key &allow-other-keys)
