@@ -379,6 +379,85 @@
           (terminal-ui-stop (application-ui application))))))
   nil)
 
+(-> test-job-completion-controller-after-terminal-mission () null)
+(defun test-job-completion-controller-after-terminal-mission ()
+  "Resume real missionless completions without reopening a retained terminal mission."
+  (with-test-configuration (configuration root)
+    (setf configuration (configuration-copy configuration :working-directory root))
+    (let* ((*task-completion-coalescing-seconds* 0)
+           (application                          (mission-test--application configuration :results (list (mission-test--result "integrated"))))
+           (parent                               (application-agent application))
+           (registry                             (task-augment-tool-registry (application-tool-registry application)))
+           (runtime                              (task-completion--runtime parent))
+           (controller                           (application-input-controller-create application :start-reader-p nil :load-pending-p nil)))
+      (declare (ignore registry))
+      (unwind-protect
+           (progn
+             (application-mission-start application (mission-test--specification))
+             (job-completion-tests--start parent runtime)
+             (setf (getf (application-goal application) :status) ':verified)
+             (application--record-goal application)
+             (test-assert (null (application-job-completions--take-work controller))
+                          "a terminal mission's old completion cannot resume inference")
+             (let* ((before (copy-tree (application-goal application)))
+                    (job    (job-completion-tests--start parent runtime))
+                    (notice (find (session-job-identifier job) (task-completion-pending parent)
+                                  :key (lambda (entry) (getf entry :job-id)) :test #'equal))
+                    (work   (handler-case
+                                (sb-ext:with-timeout 5
+                                  (application-input-controller--next-work controller))
+                              (sb-ext:timeout () nil))))
+               (test-assert (null (session-job-completion-mission-id job))
+                            "new work after the terminal mission has no mission authority")
+               (test-assert (eq (first work) ':job-completion)
+                            "the controller admits the missionless completion")
+               (when work
+                 (application-input-controller--run-work controller work))
+               (test-assert (= 1 (length (scripted-provider-input-snapshots (application-provider application))))
+                            "the completion starts exactly one ordinary provider turn")
+               (test-assert (member (format nil "completion:~A" (getf notice :id))
+                                    (conversation-pending-input-identifiers (application-conversation application))
+                                    :test #'equal)
+                            "the completion has a durable receipt before inference")
+               (test-assert (equal before (application-goal application))
+                            "missionless inference does not mutate the retained mission")
+               (when work
+                 (application-job-completions-run controller (second work)))
+               (test-assert (= 1 (length (scripted-provider-input-snapshots (application-provider application))))
+                            "a consumed ticket cannot spend another provider turn")))
+        (application-input-controller-stop controller)
+        (setf (application-input-controller application) nil)
+        (task-orchestrator-close runtime)
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> test-job-completion-terminal-mission-authority () null)
+(defun test-job-completion-terminal-mission-authority ()
+  "Separate missionless wakeups from stale mission authority across retained states."
+  (job-completion-controller-tests--fixture
+   (lambda (application controller notices)
+     (application-mission-start application (mission-test--specification))
+     (let ((current-id (task-completion-mission-identifier (application-agent application))))
+       (dolist (status '(:active :paused :verified :failed :cancelled :exhausted :blocked))
+         (setf (getf (application-goal application) :status) status)
+         (dolist (row (list (list nil ':continue nil (not (eq status ':active)))
+                            (list current-id ':continue nil (eq status ':active))
+                            (list "another-mission" ':continue nil nil)
+                            (list nil ':notify nil nil)
+                            (list nil ':continue t nil)))
+           (destructuring-bind (mission-id policy foreign-p expected) row
+             (let ((notice (job-completion-controller-tests--notice
+                            application "authority" :mission-id mission-id :policy policy)))
+               (when foreign-p
+                 (setf (getf notice :owner-conversation) "another-conversation"))
+               (test-assert (eq expected (application-job-completions--notice-admissible-p application notice))
+                            "only current owned completion authority permits a wakeup")))))
+       (funcall notices (list (job-completion-controller-tests--notice application "paused")))
+       (setf (application-input-controller-queued-work-paused-p controller) t)
+       (test-assert (null (application-job-completions--take-work controller))
+                    "completion authority cannot clear a controller pause"))))
+  nil)
+
 
 ;;;; -- Empty-Turn Presentation --
 
