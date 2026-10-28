@@ -172,7 +172,10 @@
   test-mission-schedule-recovery
   test-mission-schedule-events-and-authority
   test-mission-schedule-live-retry-exclusion
-  test-mission-schedule-hosted-admission)
+  test-mission-schedule-hosted-admission
+  test-mission-schedule-native-wakeup-stale-claim-process
+  test-mission-schedule-lisp-restart-policy
+  test-vault-edit-accepts-native-lisp)
 
 (define-test-suite peer-message
   test-peer-message-authority

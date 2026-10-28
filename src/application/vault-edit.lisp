@@ -155,7 +155,7 @@ copy before reconstructing input. No filesystem I/O holds the controller lock."
 
 (-> vault-contents (&optional t) list)
 (defun vault-contents (&optional (index nil index-p))
-  "Return parked (:MESSAGE INPUT), (:COMMAND TEXT), or (:LISP SOURCE) entries.
+  "Return parked :MESSAGE, :COMMAND, :LISP, or :NATIVE-LISP input entries.
 
 With INDEX return one zero-based entry. Values are detached snapshots. Use
 SETF of this place to publish a replacement, rather than mutating a returned list."
@@ -185,12 +185,12 @@ SETF of this place to publish a replacement, rather than mutating a returned lis
   (let ((pathname (application-recovery-input-vault--path application)))
     (labels ((invalid ()
                (application-recovery-input-vault--signal
-                pathname ':edit :message "Vault entries must be (:message INPUT), (:command TEXT), or (:lisp SOURCE).")))
+                pathname ':edit :message "Vault entries must be (:message INPUT), (:command TEXT), (:lisp SOURCE), or (:native-lisp SOURCE).")))
       (unless (proper-list-p value) (invalid))
       (mapcar (lambda (entry)
                 (unless (and (proper-list-p entry)
                              (= (length entry) 2)
-                             (member (first entry) '(:message :command :lisp))
+                             (member (first entry) '(:message :command :lisp :native-lisp))
                              (typep (second entry) '(or string user-message-input))
                              (or (eq (first entry) ':message) (stringp (second entry))))
                   (invalid))
