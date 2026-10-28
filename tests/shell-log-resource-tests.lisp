@@ -586,4 +586,161 @@
              (test-assert (not (probe-file directory))
                           "Interrupted manifest staging is reclaimed before the next allocation")
           (shell-log-release-artifact artifact)))))
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-capture-byte-limit*    32)
+           (*shell-log-retention-byte-limit*  32)
+           (*shell-log-retention-count-limit* 1)
+           (*shell-log-tombstone-count-limit* 0)
+           (context                           (shell-log-tests--context configuration "shell-update-staging"))
+           (original                          (shell-log-allocate context))
+           (directory                         (shell-log-capture-directory original)))
+      (shell-log-tests--finish original (utf8-string-to-octets "published"))
+      (with-open-file (stream (merge-pathnames ".sexp-store-A1.staging" directory) :direction ':output)
+        (write-string "interrupted later update" stream))
+      (let ((replacement (shell-log-allocate context)))
+        (unwind-protect
+             (test-assert (not (probe-file directory))
+                          "A published manifest's abandoned staging does not block tombstone expiry")
+          (shell-log-release-artifact replacement)))))
+  (with-test-configuration (configuration root)
+    (let* ((*shell-log-capture-byte-limit*    32)
+           (*shell-log-retention-byte-limit*  32)
+           (*shell-log-retention-count-limit* 1)
+           (*shell-log-tombstone-count-limit* 0)
+           (context                           (shell-log-tests--context configuration "shell-staging-refusal"))
+           (original                          (shell-log-allocate context))
+           (directory                         (shell-log-capture-directory original))
+           (staging                           (merge-pathnames ".sexp-store-A1.staging" directory)))
+      (shell-log-tests--finish original (utf8-string-to-octets "published"))
+      (dolist (name '("foreign.bin" ".sexp-store-a1.staging" ".sexp-store-A1.staging.extra"))
+        (let ((path (merge-pathnames name directory)))
+          (with-open-file (stream path :direction ':output)
+            (write-string "unexpected file" stream))
+          (test-assert
+           (handler-case
+               (let ((artifact (shell-log-allocate context)))
+                 (shell-log-release-artifact artifact)
+                 nil)
+             (shell-log-error () t))
+           "Tombstone expiry refuses unexpected names instead of deleting them")
+          (test-assert (probe-file path) "Refused files are preserved")
+          (platform-delete-file *platform* path)))
+      (with-test-fixture (':symbolic-links "shell manifest staging substitution")
+        (let ((target (merge-pathnames "staging-target.bin" root)))
+          (with-open-file (stream target :direction ':output)
+            (write-string "foreign contents" stream))
+          (test-fixture-make-symbolic-link *platform* (namestring target) (namestring staging))
+          (test-assert
+           (handler-case
+               (let ((artifact (shell-log-allocate context)))
+                 (shell-log-release-artifact artifact)
+                 nil)
+             (shell-log-error () t))
+           "A staging-shaped symbolic link cannot authorize tombstone deletion")
+          (test-assert (and (probe-file target)
+                            (platform-path-status *platform* staging :follow-links-p nil))
+                       "Refused staging links and their targets are preserved")
+          (platform-delete-file *platform* staging)))))
+  nil)
+
+(-> test-shell-log-concurrent-allocation () null)
+(defun test-shell-log-concurrent-allocation ()
+  "Pause one process after its quota scan and contend from another process."
+  (with-test-configuration (configuration)
+    (let ((first-worker  nil)
+          (second-worker nil))
+      (flet ((evaluate (worker form)
+               (let ((response (lisp-worker-request worker ':eval (list :forms (list form)))))
+                 (test-assert (eq (getf (rest response) :status) ':ok)
+                              (format nil "Contention worker completed: ~S" response)))))
+        (unwind-protect
+             (progn
+               (multiple-value-bind (rendered worker)
+                   (test-conversation--worker-eval
+                    configuration
+                    (format nil
+                            "(let* ((configuration ~A)
+          (scanned (sb-thread:make-semaphore))
+          (resume (sb-thread:make-semaphore))
+          (done (sb-thread:make-semaphore))
+          (hold (sb-thread:make-semaphore))
+          (state (list :resume resume :done done :hold hold :result nil))
+          (prune (symbol-function 'shell-log--prune)))
+     (defparameter *shell-log-contention-fixture* state)
+     (setf (symbol-function 'shell-log--prune)
+           (lambda (configuration &key (reservation 0))
+             (funcall prune configuration :reservation reservation)
+             (sb-thread:signal-semaphore scanned)
+             (unless (sb-thread:wait-on-semaphore resume :timeout 30)
+               (error \"Allocation was never resumed\"))))
+     (sb-thread:make-thread
+      (lambda ()
+        (let ((*shell-log-capture-byte-limit* 32)
+              (*shell-log-retention-byte-limit* 32)
+              (*shell-log-retention-count-limit* 1))
+          (unwind-protect
+               (handler-case
+                   (setf (getf state :result)
+                         (shell-log-allocate
+                          (make-instance 'tool-context :configuration configuration :worker nil
+                           :conversation (conversation-create configuration :identifier \"shell-race-first\"))))
+                 (error (condition) (setf (getf state :result) condition)))
+            (setf (symbol-function 'shell-log--prune) prune)
+            (sb-thread:signal-semaphore done))
+          (sb-thread:wait-on-semaphore hold :timeout 30))))
+     (unless (sb-thread:wait-on-semaphore scanned :timeout 30)
+       (error \"First allocation never completed its scan\")))"
+                            (test-conversation--child-configuration-form configuration)))
+                 (declare (ignore rendered))
+                 (setf first-worker worker))
+               (multiple-value-bind (rendered worker)
+                   (test-conversation--worker-eval
+                    configuration
+                    (format nil
+                            "(let* ((configuration ~A)
+          (entered (sb-thread:make-semaphore))
+          (done (sb-thread:make-semaphore))
+          (state (list :done done :result nil)))
+     (defparameter *shell-log-contention-fixture* state)
+     (handler-case
+         (let ((lease (lease-acquire (merge-pathnames \"tasks/shell-log.lock\" (config :data-root configuration)))))
+           (lease-release lease)
+           (error \"Quota scan did not hold the cross-process allocation lock\"))
+       (file-lock-busy () t))
+     (sb-thread:make-thread
+      (lambda ()
+        (let ((*shell-log-capture-byte-limit* 32)
+              (*shell-log-retention-byte-limit* 32)
+              (*shell-log-retention-count-limit* 1))
+          (sb-thread:signal-semaphore entered)
+          (unwind-protect
+               (setf (getf state :result)
+                     (handler-case
+                         (shell-log-allocate
+                          (make-instance 'tool-context :configuration configuration :worker nil
+                           :conversation (conversation-create configuration :identifier \"shell-race-second\")))
+                       (shell-log-error () :quota-refused)))
+            (sb-thread:signal-semaphore done)))))
+     (unless (sb-thread:wait-on-semaphore entered :timeout 30)
+       (error \"Second allocator never started\"))
+     (when (sb-thread:wait-on-semaphore done :timeout 0.1)
+       (error \"Second allocation bypassed the paused quota scan\")))"
+                            (test-conversation--child-configuration-form configuration)))
+                 (declare (ignore rendered))
+                 (setf second-worker worker))
+               (evaluate first-worker
+                         "(progn
+    (sb-thread:signal-semaphore (getf *shell-log-contention-fixture* :resume))
+    (unless (sb-thread:wait-on-semaphore (getf *shell-log-contention-fixture* :done) :timeout 30)
+      (error \"First allocation did not publish\"))
+    (unless (typep (getf *shell-log-contention-fixture* :result) 'shell-log-artifact)
+      (error \"First allocation failed: ~S\" (getf *shell-log-contention-fixture* :result))))")
+               (evaluate second-worker
+                         "(progn
+    (unless (sb-thread:wait-on-semaphore (getf *shell-log-contention-fixture* :done) :timeout 30)
+      (error \"Second allocation did not finish\"))
+    (unless (eq :quota-refused (getf *shell-log-contention-fixture* :result))
+      (error \"Concurrent allocators overcommitted the single reservation\")))"))
+          (when second-worker (lisp-worker-stop second-worker))
+          (when first-worker (lisp-worker-stop first-worker))))))
   nil)
