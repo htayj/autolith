@@ -13,8 +13,8 @@
                   (conversation-identifier (application-conversation application)))
            (eq (getf notice :completion-policy) ':continue)
            (cond
-             ((mission-goal-p goal)
-              (and mission-id
+             (mission-id
+              (and (mission-goal-p goal)
                    (equal mission-id (getf goal :completion-id))
                    (eq (getf goal :status) ':active)
                    (zerop (getf goal :unknown-usage 0))
@@ -22,8 +22,8 @@
                    (< (+ (getf goal :tokens-used) (getf goal :tokens-reserved 0))
                       (getf goal :token-limit))
                    (> (getf goal :deadline) (get-universal-time))))
-             (mission-id
-              nil)
+             ((mission-goal-p goal)
+              (not (eq (getf goal :status) ':active)))
              (goal
               (and (eq (getf goal :status) ':active)
                    (< (getf goal :continuations 0) *application-goal-continuation-limit*)))
@@ -176,20 +176,24 @@ snapshot cannot change the meaning of an already finalized transcript entry."
 (-> application-job-completions-run (application-input-controller list) null)
 (defun application-job-completions-run (controller ticket)
   "Recheck TICKET, deliver its batch durably, then run one ordinary automatic turn."
-  (let* ((application (application-input-controller-application controller))
-         (agent       (application-agent application))
+  (let* ((application          (application-input-controller-application controller))
+         (agent                (application-agent application))
          (admitted-p
            (with-lock-held ((application-input-controller-lock controller))
              (and (application-job-completions--controller-admissible-p controller)
                   (equal (getf ticket :conversation)
-                         (conversation-identifier (application-conversation application)))))))
-    (when (and admitted-p
-               (some (lambda (notice)
-                       (and (member (getf notice :id) (getf ticket :events) :test #'equal)
-                            (application-job-completions--notice-admissible-p application notice)))
-                     (task-completion-pending agent :continuation-only-p t)))
-      (let ((context (mission-context-find (application-conversation application))))
-        (when (mission-goal-p (application-goal application))
+                         (conversation-identifier (application-conversation application))))))
+         (notices
+           (when admitted-p
+             (remove-if-not
+              (lambda (notice)
+                (and (member (getf notice :id) (getf ticket :events) :test #'equal)
+                     (application-job-completions--notice-admissible-p application notice)))
+              (task-completion-pending agent :continuation-only-p t))))
+         (mission-authorized-p (some (lambda (notice) (getf notice :mission-id)) notices)))
+    (when notices
+      (when mission-authorized-p
+        (let ((context (mission-context-find (application-conversation application))))
           (unless context
             (mission--reject ':completion-mission "The completion's mission authority is unavailable."))
           (mission--admit context)))
@@ -198,7 +202,7 @@ snapshot cannot change the meaning of an already finalized transcript entry."
                     (application-job-completions--notice-admissible-p application notice))
                   (task-completion-deliver agent))
         (let ((goal (application-goal application)))
-          (when goal
+          (when (and goal (or (not (mission-goal-p goal)) mission-authorized-p))
             (incf (getf goal :continuations 0))
             (application--record-goal application)))
         (application-input-controller-call-with-primary-steering

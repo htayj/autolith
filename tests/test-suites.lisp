@@ -332,6 +332,8 @@
   test-job-completion-controller-pause-and-switch
   test-job-completion-controller-mission-admission
   test-job-completion-controller-real-runtime
+  test-job-completion-controller-after-terminal-mission
+  test-job-completion-terminal-mission-authority
   test-job-completion-controller-goal-awaits-jobs
   test-job-completion-controller-mixed-overflow)
 
