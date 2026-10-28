@@ -392,6 +392,13 @@ jobs:
       - name: Bootstrap with shared caches
         uses: ./.github/actions/windows-bootstrap
 
+      - name: Check ColorLisp packaging in Windows PowerShell 5.1
+        shell: powershell
+        run: script\check-windows-colorlisp.ps1
+      - name: Check ColorLisp packaging in PowerShell 7
+        shell: pwsh
+        run: script\check-windows-colorlisp.ps1
+
       - name: Package Windows release
         shell: pwsh
         run: script\package-windows-release.ps1 -OutputDirectory dist -Tag $env:GITHUB_REF_NAME

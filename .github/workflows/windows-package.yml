@@ -93,6 +93,12 @@ jobs:
       - name: Check native bundle publication and ACLs
         shell: pwsh
         run: script\check-windows-sandbox-bundle.ps1 -Root (Join-Path $env:RUNNER_TEMP 'bundle-check')
+      - name: Check ColorLisp packaging in Windows PowerShell 5.1
+        shell: powershell
+        run: script\check-windows-colorlisp.ps1
+      - name: Check ColorLisp packaging in PowerShell 7
+        shell: pwsh
+        run: script\check-windows-colorlisp.ps1
       - name: Package Windows release
         shell: pwsh
         run: |

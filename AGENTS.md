@@ -417,6 +417,13 @@ powershell -NoProfile -File script/check-windows-qlot-cleanup.ps1
 pwsh -NoProfile -File script/check-windows-qlot-cleanup.ps1
 ```
 
+After bootstrap, run the Windows ColorLisp packaging fixtures with:
+
+```powershell
+powershell -NoProfile -File script/check-windows-colorlisp.ps1
+pwsh -NoProfile -File script/check-windows-colorlisp.ps1
+```
+
 Rebuild only the installed pristine recovery image with:
 
 ```sh
