@@ -156,7 +156,8 @@
   test-shell-log-byte-windows-and-search
   test-shell-log-resource-authority
   test-shell-log-reopen-and-pruning
-  test-shell-log-capture-failure-metadata)
+  test-shell-log-capture-failure-metadata
+  test-shell-log-cross-process-lifecycle)
 
 (define-test-suite shell-log-job
   test-shell-log-job-results

@@ -64,7 +64,7 @@
 (defun shell-log--capture-file-p (value)
   "Accept only the executor's plain basename, never a path or manifest name."
   (and (stringp value) (<= 1 (length value) 240)
-       (not (member value '("." ".." "manifest.sexp") :test #'string=))
+       (not (member value '("." ".." "manifest.sexp" "owner.lock") :test #'string=))
        (every (lambda (character)
                 (or (find character "-." :test #'char=)
                     (find character "_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -94,11 +94,46 @@
   "Return the private portable manifest in DIRECTORY."
   (merge-pathnames "manifest.sexp" directory))
 
+(defmacro with-shell-log-lock ((configuration) &body body)
+  "Serialize lifecycle changes in this image and across processes sharing storage."
+  (let ((path     (gensym "PATH"))
+        (settings (gensym "CONFIGURATION")))
+    `(let* ((,settings ,configuration)
+            (,path (merge-pathnames "tasks/shell-log.lock" (config :data-root ,settings))))
+       (with-lock-held (*shell-log-lock*)
+         (shell-log--safe-path ,settings ,path)
+         (ensure-directories-exist ,path)
+         (call-with-file-lock ,path
+           (lambda ()
+             (platform-make-private *platform* ,path)
+             ,@body))))))
+
+(-> shell-log--release-owner (pathname) null)
+(defun shell-log--release-owner (capture-directory)
+  "Release the process lease and remove its local thread pin."
+  (let ((entry (gethash (namestring capture-directory) *shell-log-active*)))
+    (when (consp entry) (lease-release (rest entry)))
+    (remhash (namestring capture-directory) *shell-log-active*))
+  nil)
+
 (-> shell-log--active-p (pathname) boolean)
 (defun shell-log--active-p (directory)
-  "Test the live owning thread, not a pin restored from a stopped image."
-  (let ((thread (gethash (namestring directory) *shell-log-active*)))
-    (and thread (thread-alive-p thread) t)))
+  "Test a live local thread or a foreign process lease, never a stale heap pin."
+  (let ((entry (gethash (namestring directory) *shell-log-active*))
+        (path  (merge-pathnames "owner.lock" directory)))
+    (when entry
+      (if (and (consp entry) (thread-alive-p (first entry)) (lease-held-p (rest entry)))
+          (return-from shell-log--active-p t)
+          (shell-log--release-owner directory)))
+    (let ((status (platform-path-status *platform* path :follow-links-p nil)))
+      (when status
+        (unless (eq (platform-file-status-kind status) ':file)
+          (shell-log--fail "Unsafe shell log owner lock." path))
+        (handler-case
+            (let ((lease (lease-acquire path)))
+              (lease-release lease)
+              nil)
+          (file-lock-busy () t))))))
 
 (-> shell-log--measure-captures (configuration pathname list) integer)
 (defun shell-log--measure-captures (configuration directory metadata)
@@ -282,12 +317,28 @@ Disable measurement until resource resolution has checked ancestor ownership."
                nil)))
        t))
 
+(-> shell-log--scan-manifest (configuration pathname) list)
+(defun shell-log--scan-manifest (configuration capture-directory)
+  "Read a published manifest, reclaiming empty failed allocations under the lock."
+  (if (probe-file (shell-log--safe-path configuration (shell-log--manifest-path capture-directory)))
+      (shell-log--read-manifest configuration capture-directory)
+      (progn
+        (unless (shell-log--active-p capture-directory)
+          (unless (and (null (uiop:subdirectories capture-directory))
+                       (every (lambda (file)
+                                (and (string= "owner.lock" (file-namestring file))
+                                     (shell-log--safe-path configuration file)))
+                              (uiop:directory-files capture-directory)))
+            (shell-log--fail "Unpublished shell log contains unexpected files." capture-directory))
+          (platform-delete-directory-tree *platform* capture-directory :validate t))
+        nil)))
+
 (-> shell-log--trim-tombstones (configuration) null)
 (defun shell-log--trim-tombstones (configuration)
   "Bound tombstone metadata separately, deleting only already-pruned artifacts."
   (let* ((entries
            (loop for directory in (shell-log--directories configuration)
-                 for metadata = (shell-log--read-manifest configuration directory)
+                 for metadata = (shell-log--scan-manifest configuration directory)
                  when (eq (getf metadata :state) ':pruned)
                    collect (list directory metadata)))
          (count (length entries)))
@@ -298,7 +349,7 @@ Disable measurement until resource resolution has checked ancestor ownership."
                      *shell-log-tombstone-age*))
           (unless (and (null (uiop:subdirectories directory))
                        (every (lambda (file)
-                                (and (string= "manifest.sexp" (file-namestring file))
+                                (and (member (file-namestring file) '("manifest.sexp" "owner.lock") :test #'string=)
                                      (shell-log--safe-path configuration file)))
                               (uiop:directory-files directory)))
             (shell-log--fail "Pruned shell log directory contains unexpected files." directory))
@@ -312,8 +363,8 @@ Disable measurement until resource resolution has checked ancestor ownership."
 Keep manifests as tombstones so old references have truthful diagnostics."
   (let* ((entries
            (loop for directory in (shell-log--directories configuration)
-                 for metadata = (shell-log--read-manifest configuration directory)
-                 unless (eq (getf metadata :state) ':pruned)
+                 for metadata = (shell-log--scan-manifest configuration directory)
+                 when (and metadata (not (eq (getf metadata :state) ':pruned)))
                    collect (list directory metadata (getf metadata :accounted-bytes 0))))
          (total (loop for entry in entries sum (third entry)))
          (count (length entries)))
@@ -346,7 +397,7 @@ Keep manifests as tombstones so old references have truthful diagnostics."
 (-> shell-log-allocate (tool-context &key (:job t) (:merge-output-p boolean)) shell-log-artifact)
 (defun shell-log-allocate (context &key job (merge-output-p t))
   "Allocate private execution-owned storage and persist ownership BEFORE launch."
-  (with-lock-held (*shell-log-lock*)
+  (with-shell-log-lock ((tool-context-configuration context))
     (let* ((configuration        (tool-context-configuration context))
            (agent                (tool-context-agent context))
            (parent-job           (and (typep agent 'task-child-agent) (task-child-agent-job agent)))
@@ -359,7 +410,8 @@ Keep manifests as tombstones so old references have truthful diagnostics."
            (directory            (merge-pathnames (format nil "~A/shell-log/~A/" execution identifier)
                                                   (task--artifact-group-root configuration root)))
            (allocation-started-p nil)
-           (published-p          nil))
+           (published-p          nil)
+           (lease                nil))
       (unless (every #'shell-log--component-p (list root execution identifier))
         (shell-log--fail "Invalid private shell log execution identity."))
       (unwind-protect
@@ -395,8 +447,10 @@ Keep manifests as tombstones so old references have truthful diagnostics."
                                               :merge-output-p     merge-output-p
                                               :capture-byte-limit *shell-log-capture-byte-limit*
                                               :reserved-bytes     reservation))))
+                   (setf lease (lease-acquire (merge-pathnames "owner.lock" directory)))
+                   (platform-make-private *platform* (merge-pathnames "owner.lock" directory))
                    (shell-log--write-manifest artifact)
-                   (setf (gethash (namestring directory) *shell-log-active*) (current-thread)
+                   (setf (gethash (namestring directory) *shell-log-active*) (cons (current-thread) lease)
                          published-p t)
                    artifact))
              (shell-log-error (condition)
@@ -405,6 +459,7 @@ Keep manifests as tombstones so old references have truthful diagnostics."
                (shell-log--fail (format nil "Could not allocate private shell capture: ~A" condition)
                                 directory)))
         (unless published-p
+          (when lease (lease-release lease))
           (remhash (namestring directory) *shell-log-active*)
           (when allocation-started-p
             (sb-sys:without-interrupts
@@ -434,7 +489,7 @@ Keep manifests as tombstones so old references have truthful diagnostics."
 (defun shell-log-record-capture (artifact result &key (closed-p t))
   "Persist allocated filenames before launch or closed evidence on every unwind.
 With CLOSED-P false, retain the active reservation and prevent pruning."
-  (with-lock-held (*shell-log-lock*)
+  (with-shell-log-lock ((shell-log-artifact-configuration artifact))
     (unwind-protect
          (let ((metadata (copy-tree (shell-log-artifact-metadata artifact))))
            (setf (getf metadata :state) (if closed-p ':closed ':active)
@@ -455,14 +510,14 @@ With CLOSED-P false, retain the active reservation and prevent pruning."
            (shell-log--write-manifest artifact)
            (copy-tree metadata))
       (when closed-p
-        (remhash (namestring (shell-log-capture-directory artifact)) *shell-log-active*)))))
+        (shell-log--release-owner (shell-log-capture-directory artifact))))))
 
 (-> shell-log-release-artifact (shell-log-artifact) null)
 (defun shell-log-release-artifact (artifact)
   "Idempotently close an abandoned allocation without fabricating capture data.
 Always release the active pin, including when manifest publication fails. Callers
 handling another condition may ignore this logging failure to preserve that cause."
-  (with-lock-held (*shell-log-lock*)
+  (with-shell-log-lock ((shell-log-artifact-configuration artifact))
     (let ((directory (shell-log-capture-directory artifact)))
       (when (or (gethash (namestring directory) *shell-log-active*)
                 (eq (getf (shell-log-artifact-metadata artifact) :state) ':active))
@@ -481,7 +536,7 @@ handling another condition may ignore this logging failure to preserve that caus
                              (getf metadata :captures)))
                (setf (shell-log-artifact-metadata artifact) metadata)
                (shell-log--write-manifest artifact))
-          (remhash (namestring directory) *shell-log-active*)))))
+          (shell-log--release-owner directory)))))
   nil)
 
 (-> shell-log--public-metadata (list) list)
