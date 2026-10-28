@@ -363,8 +363,11 @@ Disable measurement until resource resolution has checked ancestor ownership."
                      *shell-log-tombstone-age*))
           (unless (and (null (uiop:subdirectories directory))
                        (every (lambda (file)
-                                (and (member (file-namestring file) '("manifest.sexp" "owner.lock") :test #'string=)
-                                     (shell-log--safe-path configuration file)))
+                                (and (or (member (file-namestring file) '("manifest.sexp" "owner.lock") :test #'string=)
+                                         (shell-log--manifest-staging-p file))
+                                     (shell-log--safe-path configuration file)
+                                     (eq ':file (platform-file-status-kind
+                                                 (platform-path-status *platform* file :follow-links-p nil)))))
                               (uiop:directory-files directory)))
             (shell-log--fail "Pruned shell log directory contains unexpected files." directory))
           (platform-delete-directory-tree *platform* directory :validate t)

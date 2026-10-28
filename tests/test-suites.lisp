@@ -157,7 +157,8 @@
   test-shell-log-resource-authority
   test-shell-log-reopen-and-pruning
   test-shell-log-capture-failure-metadata
-  test-shell-log-cross-process-lifecycle)
+  test-shell-log-cross-process-lifecycle
+  test-shell-log-concurrent-allocation)
 
 (define-test-suite shell-log-job
   test-shell-log-job-results
