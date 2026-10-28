@@ -75,7 +75,8 @@ an authorized file elsewhere, as an editor opening that file would search."
                (json-object "server" (getf row :server)
                             "root" (namestring (getf row :root))
                             "result" (getf row :result))))
-         (lsp-manager-map-file manager path (lsp-tool--root-boundary context path) function))))
+         (lsp-manager-map-file manager path function
+                               :boundary (lsp-tool--root-boundary context path)))))
 
 (-> lsp-tool--bounded-value
     (t &key (:string-limit integer) (:item-limit integer) (:node-limit integer))
