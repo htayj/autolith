@@ -432,10 +432,7 @@
         (test-assert (tool-result-success-p
                       (shell-log-tests--read (shell-log-tests--resolve artifact context) context (json-object)))
                      "Tombstones produce a diagnostic, not a failed session")
-        (remhash (namestring (shell-log-capture-directory replacement)) *shell-log-active*)
-        (test-assert (eq ':interrupted (getf (shell-log--read-manifest
-                                              configuration (shell-log-capture-directory replacement)) :state))
-                     "Abandoned prelaunch manifests never claim completion"))))
+        (shell-log-release-artifact replacement))))
   (with-test-configuration (configuration)
     (let* ((*shell-log-active*                (make-hash-table :test #'equal))
            (*shell-log-capture-byte-limit*    32)
@@ -477,4 +474,103 @@
                              (= 100 (getf record :observed-byte-count))
                              (not (getf record :complete-p)) (getf record :truncated-p))
                          "Portable manifests preserve storage loss separately from execution failure"))))))
+  nil)
+
+(-> test-shell-log-cross-process-lifecycle () null)
+(defun test-shell-log-cross-process-lifecycle ()
+  "Keep live foreign captures readable and reserved, then reclaim after owner exit."
+  (with-test-configuration (configuration root)
+    (let* ((*shell-log-capture-byte-limit*    32)
+           (*shell-log-retention-byte-limit*  32)
+           (*shell-log-retention-count-limit* 1)
+           (context                           (shell-log-tests--context configuration "shell-process"))
+           (ready                             (merge-pathnames "capture.sexp" root))
+           (worker                            nil)
+           (replacement                       nil))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (rendered child)
+                 (test-conversation--worker-eval
+                  configuration
+                  (format nil
+                          "(let* ((configuration ~A)
+         (*shell-log-capture-byte-limit* 32)
+         (*shell-log-retention-byte-limit* 32)
+         (*shell-log-retention-count-limit* 1)
+         (context (make-instance 'tool-context :configuration configuration :worker nil
+                    :conversation (conversation-create configuration :identifier \"shell-process\")))
+         (artifact (shell-log-allocate context))
+         (path (merge-pathnames \"output.bin\" (shell-log-capture-directory artifact)))
+         (capture (make-instance 'cl-exec-sandbox:sandbox-capture :path path)))
+    (with-open-file (output path :direction ':output :element-type '(unsigned-byte 8))
+      (write-sequence (utf8-string-to-octets \"live bytes\") output))
+    (shell-log-record-capture artifact
+      (make-instance 'cl-exec-sandbox:sandbox-result :output-capture capture
+                     :exit-code nil :timed-out-p nil :cancelled-p nil :status ':running)
+      :closed-p nil)
+    (task-continuity--write ~S
+      (list :reference (shell-log-reference artifact) :directory (namestring (shell-log-capture-directory artifact)))))"
+                          (test-conversation--child-configuration-form configuration) ready))
+               (declare (ignore rendered))
+               (setf worker child))
+             (let* ((published         (task-continuity--read ready))
+                    (reference         (getf published :reference))
+                    (capture-directory (getf published :directory)))
+               (flet ((resolve ()
+                        (resource-resolver-resolve (make-instance 'shell-log-resolver :scheme "shell-log")
+                                                   (subseq reference 10) context)))
+                 (let ((resource (resolve)))
+                   (test-assert (eq ':active (getf (shell-log-resource-metadata resource) :state))
+                                "Another process's live capture is not interrupted")
+                   (test-assert
+                    (search "live bytes" (tool-result-content
+                                              (shell-log-tests--read resource context (json-object))))
+                    "A live foreign capture can be read through its authorized reference"))
+                 (test-assert (handler-case
+                                 (let ((unexpected (shell-log-allocate context)))
+                                   (shell-log-release-artifact unexpected)
+                                   nil)
+                                (shell-log-error () t))
+                              "A foreign owner's reservation prevents quota overcommit and pruning")
+                 (test-assert (probe-file (merge-pathnames "output.bin" capture-directory))
+                              "Quota pressure preserves the live capture file")
+                 (lisp-worker-stop worker)
+                 (setf worker nil)
+                 (test-assert (eq ':interrupted (getf (shell-log-resource-metadata (resolve)) :state))
+                              "Owner exit releases the kernel lease and exposes interruption")
+                 (setf replacement (shell-log-allocate context))
+                 (test-assert (eq ':pruned (getf (shell-log-resource-metadata (resolve)) :state))
+                              "Quota pressure reclaims the dead owner's capture with a truthful tombstone")
+                 (shell-log-release-artifact replacement)
+                 (setf replacement nil)
+                 (let ((*shell-log-tombstone-count-limit* 0))
+                   (setf replacement (shell-log-allocate context)))
+                 (test-assert (not (probe-file capture-directory))
+                              "Tombstone expiry removes lease files along with expired metadata")))
+             (shell-log-release-artifact replacement)
+             (setf replacement nil)
+             (multiple-value-bind (rendered child)
+                 (test-conversation--worker-eval
+                  configuration
+                  (format nil
+                          "(let* ((configuration ~A)
+         (*shell-log-capture-byte-limit* 32)
+         (*shell-log-retention-byte-limit* 32)
+         (*shell-log-retention-count-limit* 1)
+         (context (make-instance 'tool-context :configuration configuration :worker nil
+                    :conversation (conversation-create configuration :identifier \"shell-orphan\")))
+         (artifact (shell-log-allocate context)))
+    (platform-delete-file *platform* (shell-log--manifest-path (shell-log-capture-directory artifact)))
+    (task-continuity--write ~S (list :directory (namestring (shell-log-capture-directory artifact)))))"
+                          (test-conversation--child-configuration-form configuration) ready))
+               (declare (ignore rendered))
+               (setf worker child))
+             (let ((capture-directory (getf (task-continuity--read ready) :directory)))
+               (lisp-worker-stop worker)
+               (setf worker nil
+                     replacement (shell-log-allocate context))
+               (test-assert (not (probe-file capture-directory))
+                            "A dead unpublished allocation does not block future shell commands")))
+        (when worker (lisp-worker-stop worker))
+        (when replacement (shell-log-release-artifact replacement)))))
   nil)
