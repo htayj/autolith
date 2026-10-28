@@ -677,7 +677,12 @@ guarantee."
       (when (or (job-cancellation-requested-p parent-job)
                 (job-terminal-p parent-job))
         (task-orchestrator--refuse-cancelled-parent parent-job))))
-  (let* ((mission-context           (mission--agent-context parent-agent))
+  (let* ((mission-context
+           (let ((context (mission--agent-context parent-agent)))
+             ;; Refuse new work before consuming any session or pool identity.
+             (when context
+               (mission--admit context :inference-p nil :new-work-p t))
+             context))
          (count                     (length entries))
          (session-orders
            (task-orchestrator-reserve-session-orders orchestrator count))

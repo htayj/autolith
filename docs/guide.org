@@ -162,7 +162,8 @@ divides those tokens among the remaining turns; an explicit provider output cap
 replaces that division. Reviewer requests reserve from both allowances. Settlement
 releases the ceiling and charges reported input and output usage, so a request
 can exhaust the token allowance. Missing usage is recorded as unknown and blocks
-further inference. Install a new explicit budget to proceed after unknown usage.
+new mission work. Already-running children may finish within the existing hard
+budgets. Install a new explicit budget to admit new work after unknown usage.
 
 The wall-clock deadline includes gate execution, delegated tools, pauses and
 time away. Work runs under cl-jobpond supervision. Use =(goal :pause)= and

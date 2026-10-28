@@ -119,16 +119,16 @@
           (last entries (min (length entries) *mission-evidence-count-limit*))))
   nil)
 
-(-> mission--transition (mission-context keyword t) null)
-(defun mission--transition (context status evidence)
-  "Persist a mission STATUS with EVIDENCE and stop its admitted operations."
+(-> mission--transition (mission-context keyword t &key (:cancel-p boolean)) null)
+(defun mission--transition (context status evidence &key (cancel-p t))
+  "Persist STATUS and EVIDENCE; cancel admitted operations when CANCEL-P is true."
   (with-recursive-lock-held ((mission-context-lock context))
     (let ((goal (mission-context-goal context)))
       (setf (getf goal :status) status)
       (mission--evidence context status evidence)
       (mission--record context)))
   (mission-knowledge-record-status context status)
-  (when (member status '(:blocked :exhausted :cancelled :failed))
+  (when (and cancel-p (member status '(:blocked :exhausted :cancelled :failed)))
     (let ((jobs
             (with-recursive-lock-held ((mission-context-lock context))
               (remove-if (lambda (job)
@@ -143,15 +143,31 @@
   (* 1000 (- (getf (mission-context-goal context) :deadline)
              (get-universal-time))))
 
-(-> mission--admit (mission-context &key (:inference-p boolean)) null)
-(defun mission--admit (context &key (inference-p t))
-  "Reject terminal, replaced or exhausted missions before admitting work.
-Verification may use the final model turn's evidence without another inference."
+(-> mission--operation-draining-p (mission-context t) boolean)
+(defun mission--operation-draining-p (context job)
+  "Recognize a live, uncancelled admitted child of this exact quarantined mission."
+  (with-recursive-lock-held ((mission-context-lock context))
+    (let ((goal (mission-context-goal context)))
+      (not (null
+            (and (eq (getf goal :status) ':blocked)
+                 (eq goal (application-goal (mission-context-application context)))
+                 (typep job 'task-job)
+                 (eq (task-job-mission-context job) context)
+                 (not (job-terminal-p job))
+                 (not (job-cancellation-requested-p job))
+                 (not (task-job--cancelled-ancestor-reason job))))))))
+
+(-> mission--admit (mission-context &key (:inference-p boolean) (:new-work-p boolean)) null)
+(defun mission--admit (context &key (inference-p t) new-work-p)
+  "Admit active work or bounded continuation of an already started quarantined child.
+NEW-WORK-P always requires an active mission. Hard budgets apply to both paths."
   (let* ((goal        (mission-context-goal context))
          (application (mission-context-application context)))
     (unless (eq goal (application-goal application))
       (mission--reject ':replaced "The mission was replaced."))
-    (unless (eq (getf goal :status) ':active)
+    (unless (or (eq (getf goal :status) ':active)
+                (and (not new-work-p)
+                     (mission--operation-draining-p context *mission-admitted-operation*)))
       (mission--reject (getf goal :status) "The mission is not active."))
     (unless (plusp (mission--remaining-milliseconds context))
       (mission--transition context ':exhausted "Mission-wide wall-clock budget exhausted.")
@@ -186,7 +202,10 @@ The calling thread preserves provider bindings and authorization callbacks."
              ;; Register before releasing state so cancellation cannot miss this job.
              (mission--admit context :inference-p nil)
              (push job (mission-context-jobs context))
-             (setf (gethash job (mission-context-threads context)) (current-thread)))
+             (setf (gethash job (mission-context-threads context)) (current-thread))
+             (when (and (typep *mission-admitted-operation* 'task-job)
+                        (job-cancellation-requested-p *mission-admitted-operation*))
+               (job-cancel job :reason (job-cancellation-reason *mission-admitted-operation*))))
            (job-run-inline job)
            (let ((snapshot (job-await job)))
             (cond
@@ -367,12 +386,16 @@ The calling thread preserves provider bindings and authorization callbacks."
 
 (-> mission-agent-terminal-p (agent) boolean)
 (defun mission-agent-terminal-p (agent)
-  "Return true when AGENT's exact mission no longer permits a model continuation."
+  "Return true when AGENT's exact mission no longer permits it to continue.
+A quarantined child with live admitted identity may finish its bounded task."
   (let ((context (mission-context-find agent)))
     (and context
          (or (not (eq (mission-context-goal context)
                       (application-goal (mission-context-application context))))
-             (not (eq (getf (mission-context-goal context) :status) ':active))))))
+             (and (not (eq (getf (mission-context-goal context) :status) ':active))
+                  (not (and (typep agent 'task-child-agent)
+                            (mission--operation-draining-p
+                             context (task-child-agent-job agent)))))))))
 
 (defmethod tool-execution-invoke :around
     ((runtime task-orchestrator) parent
@@ -389,8 +412,12 @@ The calling thread preserves provider bindings and authorization callbacks."
          :completion-policy completion-policy
          :operation-function
          (lambda ()
-           (mission--admit context :inference-p nil)
-           (mission--supervise context (format nil "Mission ~A" tool-name) operation-function))))))
+           (let ((*mission-admitted-operation*
+                   (and (typep parent 'task-child-agent)
+                        (let ((job (task-child-agent-job parent)))
+                          (and (eq (task-job-mission-context job) context) job)))))
+             (mission--admit context :inference-p nil)
+             (mission--supervise context (format nil "Mission ~A" tool-name) operation-function)))))))
 
 (-> mission--request-owned-p (mission-context conversation) boolean)
 (defun mission--request-owned-p (context conversation)
@@ -448,8 +475,9 @@ The calling thread preserves provider bindings and authorization callbacks."
   (let ((context (task-job-mission-context job)))
     (if context
         (progn
-          (mission--admit context :inference-p nil)
-          (mission--supervise context "Mission child" (lambda () (task-job--run job))))
+          (mission--admit context :inference-p nil :new-work-p t)
+          (let ((*mission-admitted-operation* job))
+            (mission--supervise context "Mission child" (lambda () (task-job--run job)))))
         (task-job--run job))))
 
 (defmethod initialize-instance :after ((job session-job) &key mission-context &allow-other-keys)
