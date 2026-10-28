@@ -2231,7 +2231,7 @@ re-emitting untrusted serialized JSON."
 
 (-> application--job-cancel-widget (list t) list)
 (defun application--job-cancel-widget (spans identifier)
-  "Make the job.cancel call in SPANS insert its readable form when clicked.
+  "Highlight the complete job.cancel call and make every token insert its readable form.
 
 Only a call shown in full becomes clickable; a detail cut at the terminal edge
 stays plain. The header stays an ordinary span, so the entry keeps its group."
@@ -2242,11 +2242,17 @@ stays plain. The header stays an ordinary span, so the entry keeps its group."
               for content = (and (not (termdown:widget-p span)) (terminal-span-text span))
               for position = (and content (search text content :from-end t))
               if (and position (= (+ position (length text)) (length content)))
-                append (list (terminal-span (terminal-span-style span) (subseq content 0 position))
-                             (termdown:make-widget ':code text
-                                                   (list ':insert
-                                                         (format nil "(job.cancel :id ~S)"
-                                                                 identifier))))
+                append
+                (cons
+                 (terminal-span (terminal-span-style span) (subseq content 0 position))
+                 (let ((action (list ':insert (format nil "(job.cancel :id ~S)" identifier))))
+                   (mapcar (lambda (token)
+                             (termdown:make-widget (terminal-span-style token)
+                                                  (terminal-span-text token)
+                                                  action))
+                           (or (syntax--highlight-spans
+                                text :language *application-common-lisp-language*)
+                               (list (terminal-span ':code text))))))
               else
                 collect span))))
 
