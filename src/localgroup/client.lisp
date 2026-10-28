@@ -37,7 +37,7 @@
                 (localgroup--record-port record)
                 (localgroup--record-token record)
                 operation
-                arguments)
+                :arguments arguments)
              (error (condition)
                (localgroup--remove-stale-record pathname record)
                (error 'localgroup-error

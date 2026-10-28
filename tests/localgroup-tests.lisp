@@ -293,7 +293,7 @@
          (list
           (list 'localgroup--client-configuration (lambda () configuration))
           (list 'daemon-call
-                (lambda (port token operation &optional arguments)
+                (lambda (port token operation &key arguments)
                   (declare (ignore token))
                   (when (eq operation ':status) (push port probes))
                   (unless (member port live-ports)
@@ -629,7 +629,7 @@
             "checkpoint quiescence preserves the active conversation identity"))
          (daemon-call (image-daemon:daemon-runtime-port session)
                       (image-daemon:daemon-runtime-token session) ':tell
-                      (list :message "remote input"))
+                      :arguments (list :message "remote input"))
          (with-lock-held ((application-input-controller-lock controller))
            (test-assert
             (equal (application-input-controller--state controller :work-items)
@@ -651,7 +651,7 @@
           "localgroup pause holds queued primary work")
          (daemon-call (image-daemon:daemon-runtime-port session)
                       (image-daemon:daemon-runtime-token session) ':tell
-                      (list :message "resume input"))
+                      :arguments (list :message "resume input"))
          (test-assert (not (application-localgroup-paused-p application))
           "new localgroup input resumes a paused session")
          (let ((kill-response-state nil)
