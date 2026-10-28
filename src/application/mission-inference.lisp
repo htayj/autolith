@@ -62,15 +62,16 @@
           (decf (getf limit :tokens-reserved) reservation)
           (when (integerp tokens)
             (incf (getf limit :tokens-used) tokens)))
+        (when failure
+          (mission--evidence context :inference-failure (princ-to-string failure)))
         (unless (integerp tokens)
           (incf (getf goal :unknown-usage))
           (when (eq (getf goal :status) ':active)
-            (if failure
-                (mission--transition context ':failed failure)
-                (mission--transition
-                 context ':blocked
-                 "Provider omitted billable usage; the remaining token budget is unknown."))))
-        (when (and (eq (getf goal :status) ':active)
+            (mission--transition
+             context ':blocked
+             "An inference request settled without reported usage; started children may finish, new work needs a new budget."
+             :cancel-p nil)))
+        (when (and (member (getf goal :status) '(:active :blocked))
                    (> (getf goal :tokens-used) (getf goal :token-limit)))
           (mission--transition context ':exhausted "Mission token budget exhausted."))
         (mission--record context))))

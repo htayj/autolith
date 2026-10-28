@@ -284,8 +284,8 @@
       (setf context (mission-context-find (application-conversation application)))
       (catch ':test-interrupted
         (mission--account-inference context (lambda () (throw ':test-interrupted t)) #'identity))
-      (test-assert (eq ':failed (getf (mission-context-goal context) :status))
-                   "a caught nonlocal provider exit fails the mission")
+      (test-assert (eq ':blocked (getf (mission-context-goal context) :status))
+                   "a caught nonlocal provider exit blocks the mission")
       (application-mission-start application (mission-test--specification))
       (setf context (mission-context-find (application-conversation application)))
       (handler-case
@@ -349,3 +349,116 @@
       (application--load-goal application)
       (test-assert (= 2 (getf (application-goal application) :unknown-usage))
                    "a second replay does not charge interrupted requests twice"))))
+
+(defclass mission-inference-test-child-provider (task-test-provider) ()
+  (:documentation "Use the task script without forwarding through a second request boundary."))
+
+(defmethod provider-with-configuration
+    ((provider mission-inference-test-child-provider) (configuration configuration))
+  "Keep one provider invocation per actual child request."
+  (declare (ignore configuration))
+  provider)
+
+(defclass mission-inference-test-drain-tool (task-test-child-safe-tool)
+  ((entered :initform (bt:make-semaphore :count 0) :reader mission-inference-test-drain-entered
+            :documentation "Signals entry into the child tool.")
+   (release :initform (bt:make-semaphore :count 0) :reader mission-inference-test-drain-release
+            :documentation "Permits the child tool to finish.")
+   (agent :accessor      mission-inference-test-drain-agent
+          :documentation "The executing child for testing further admission."))
+  (:documentation "Hold a real child tool across an unrelated unknown settlement."))
+
+(defmethod tool-execute ((tool mission-inference-test-drain-tool)
+                         (context tool-context) (arguments hash-table))
+  "Release the child only after its sibling request has settled."
+  (declare (ignore arguments))
+  (setf (mission-inference-test-drain-agent tool) (tool-context-agent context))
+  (bt:signal-semaphore (mission-inference-test-drain-entered tool))
+  (unless (bt:wait-on-semaphore (mission-inference-test-drain-release tool) :timeout 10)
+    (error "Timed out releasing the draining child."))
+  (tool-success "released"))
+
+(-> test-mission-inference-unknown-drains-child () null)
+(defun test-mission-inference-unknown-drains-child ()
+  "Unknown request usage blocks admissions while an admitted child finishes."
+  (with-test-configuration (configuration root)
+    (setf configuration (configuration-copy configuration :working-directory root))
+    (let* ((application  (mission-test--application configuration))
+           (registry     (application-tool-registry application))
+           (provider     (make-instance 'mission-inference-test-child-provider :mode ':blocking-tool))
+           (tool         (make-instance 'mission-inference-test-drain-tool
+                                        :namespace "test" :name "block"
+                                        :description "Hold the admitted child."
+                                        :parameters  (tool-object-schema (json-object) nil)))
+           (orchestrator (task-orchestrator-create))
+           (definition   (task-agent-definition-create
+                          :name "mission-child" :description "Finish admitted work"
+                          :instructions "Call the blocking tool, then submit success."
+                          :tools ':all :source ':test))
+           (entry        (list :definition definition :detached t
+                               :item (list :agent "mission-child" :task "Finish admitted work.")))
+           (job          nil))
+      (setf (agent-provider (application-agent application)) provider)
+      (tool-registry-register registry tool)
+      (task-augment-tool-registry registry)
+      (tool-registry-bind-runtime registry 'task-orchestrator orchestrator)
+      (application-mission-start application (mission-test--specification))
+      (unwind-protect
+           (progn
+             (setf job (first (task-orchestrator-start-jobs
+                               orchestrator (application-agent application) (list entry))))
+             (test-assert (bt:wait-on-semaphore (mission-inference-test-drain-entered tool)
+                                                :timeout 10)
+                          "child reaches a real tool before usage becomes unknown")
+             (let ((failure (make-instance 'simple-error :format-control "provider disconnected")))
+               (test-assert
+                (search "provider disconnected"
+                    (handler-case
+                        (mission-inference-test--call
+                         (make-instance 'mission-inference-test-provider
+                                        :entered (bt:make-semaphore :count 0)
+                                        :release (bt:make-semaphore :count 0)
+                                        :blocked-p nil :result (mission-test--result "unused")
+                                        :failure (lambda () (error failure)))
+                         (application-conversation application))
+                      (error (condition) (princ-to-string condition))))
+                "the original provider failure report reaches its caller"))
+             (test-assert (eq :blocked (getf (application-goal application) :status))
+                          "unknown usage blocks rather than fails the mission")
+             (test-assert (not (job-cancellation-requested-p job))
+                          "the already-running child is not cancelled")
+             (let ((order (task-orchestrator-next-session-order orchestrator)))
+               (test-assert
+                (handler-case
+                    (progn (task-orchestrator-start-jobs
+                            orchestrator (mission-inference-test-drain-agent tool) (list entry)) nil)
+                  (mission-error (condition) (eq :blocked (mission-error-reason condition))))
+                "a bound child cannot admit new mission work")
+               (test-assert (= order (task-orchestrator-next-session-order orchestrator))
+                            "refusal consumes no session identity"))
+             (bt:signal-semaphore (mission-inference-test-drain-release tool))
+             (task-job-await job nil)
+             (let* ((snapshot (task-job-snapshot job))
+                    (result   (getf snapshot :result)))
+               (test-assert (and (eq :completed (getf snapshot :state))
+                                 (eq :success (getf result :status))
+                                 (getf result :yielded-p))
+                            "the child continues inference and yields success after the block"))
+             (let ((goal (application-goal application)))
+               (test-assert (eq :blocked (getf goal :status)) "draining does not reactivate the mission")
+               (test-assert (= 1 (getf goal :unknown-usage)) "unknown spend is retained")
+               (test-assert
+                (search "provider disconnected"
+                        (or (getf (find :inference-failure (getf goal :evidence)
+                                        :key               (lambda (entry) (getf entry :kind))) :text) ""))
+                "failure evidence retains the provider report")
+               (test-assert (= 4 (getf goal :tokens-used))
+                            (format nil "both child requests settle known usage: ~D" (getf goal :tokens-used)))
+               (test-assert (= 3 (getf goal :turns-used))
+                            (format nil "requests are charged once: ~D" (getf goal :turns-used)))
+               (test-assert (and (zerop (getf goal :tokens-reserved))
+                                 (zerop (getf goal :requests-outstanding)))
+                            "all reservations and outstanding requests settle")))
+        (bt:signal-semaphore (mission-inference-test-drain-release tool))
+        (when job (task-job-await job nil))
+        (task-orchestrator-close orchestrator)))))
