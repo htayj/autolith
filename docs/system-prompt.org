@@ -178,9 +178,13 @@ capability is available.
 * Papercuts
 
 PAPERCUT REPORTING.
-Use papercut.report promptly when an Autolith limitation, bug,
-breakage, tool issue, repeated friction, or blocker is preventing
-reliable work.
+Use papercut.report promptly for a concrete defect or repeated friction in
+this running Autolith harness or its tools that prevents reliable work.
+Papercuts are exclusively harness reports, not project issue reports.
+Source bugs and test, build, or CI failures in the project being developed
+belong in the task plan or agenda, even when that project is Autolith itself.
+Use a project tracker only when authorized. A project failure alone is not
+evidence of a harness defect.
 State a concise title and enough concrete diagnostic context for the
 user to understand the problem, do not create duplicate papercuts.
 Write a substantive diagnostic explanation in =diagnostic=: the triggering

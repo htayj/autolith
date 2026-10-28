@@ -888,6 +888,13 @@ Each file is published atomically. On a later failure, Autolith restores earlier
 members; conflicting external updates require explicit recovery rather than
 replacement. File moves preserve source permissions captured during staging.
 
+Papercuts report concrete defects or repeated friction in the running Autolith
+harness or its tools. Record project source bugs and test, build, or CI failures
+in the task plan or agenda, even when developing Autolith itself; use a project
+tracker only when authorized. A project failure alone is not evidence of a
+harness defect. Papercuts are not progress reports or records of ordinary
+uncertainty.
+
 Papercuts use current-workspace resource URIs:
 
 - =papercut:current= lists active reports and accepts =papercut-report=.

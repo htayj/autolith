@@ -139,7 +139,7 @@
 (defmethod resource-resolver-edit-documentation ((resolver papercut-resolver))
   "Document papercut: edits."
   (declare (ignore resolver))
-  "papercut:current accepts papercut-report, and canonical exact papercut:id/<percent-encoded-stable-id> resources accept papercut-assess or papercut-close.")
+  "papercut:current accepts papercut-report, and canonical exact papercut:id/<percent-encoded-stable-id> resources accept papercut-assess or papercut-close. Papercuts are exclusively for concrete defects or repeated friction in the running Autolith harness or its tools. Project source bugs and test, build, or CI failures belong in the task plan or agenda, even when developing Autolith itself; use a project tracker only when authorized. A project failure alone is not evidence of a harness defect. Do not report routine progress or ordinary uncertainty as papercuts.")
 
 (defmethod resource-resolver-resolve
     ((resolver papercut-resolver) identifier (context tool-context))

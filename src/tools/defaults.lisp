@@ -642,7 +642,7 @@ KNOWLEDGE-P offers structured knowledge through memory: resources."
    (list
     'papercut-report-tool
     "papercut" "report"
-    "Report a concrete Autolith limitation, broken behavior, repeated friction, or blocker to the user. Use this only for a real problem that deserves prominent user attention, not routine progress or ordinary uncertainty. Include enough diagnostic context for the user to understand and reproduce the problem. Report each problem once: Autolith compares the report with the active papercuts of this workspace and answers with the existing report instead of recording a repeat, and the acknowledgement stays in the conversation."
+    "Report a concrete defect or repeated friction in the running Autolith harness or its tools that prevents reliable work. Not for project source bugs or test, build, or CI failures, even when developing Autolith itself: record those in the task plan or agenda, or a project tracker only when authorized. A project failure alone is not evidence of a harness defect. Do not use this for routine progress or ordinary uncertainty. Include enough diagnostic context for the user to understand and reproduce the problem. Report each problem once: Autolith compares the report with the active papercuts of this workspace and answers with the existing report instead of recording a repeat, and the acknowledgement stays in the conversation."
     (tool-object-schema
      (json-object
       "title" (tool-string-property
