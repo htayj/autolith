@@ -1544,8 +1544,10 @@
   (test-application-typed-settings)
   (let* ((configuration (test-configuration))
          (root          (test-configuration-root configuration))
-         (ui            (terminal-ui-create
-                         :terminal (make-instance 'recording-terminal :columns 200)))
+         (terminal      (make-instance 'recording-terminal :columns 200
+                                                          :interactive-p nil :styled-p nil))
+         (ui            (terminal-ui-create :terminal terminal))
+         (finalize      (symbol-function 'terminal-ui-append-finalized))
          (application   (make-instance 'application
                                        :configuration configuration
                                        :ui            ui))
@@ -1556,9 +1558,8 @@
           (list
            (list 'terminal-ui-append-finalized
                  (lambda (candidate identifier entry)
-                   (declare (ignore candidate identifier))
                    (push entry presented)
-                   t))
+                   (funcall finalize candidate identifier entry)))
            (list 'application--pick-identifier
                  (lambda (candidate &rest arguments)
                    (declare (ignore candidate arguments))
@@ -1629,6 +1630,7 @@
                (null picks)
                "the page loops until the picker is cancelled")
               (setf presented nil
+                    (recording-terminal-chunks terminal) nil
                     picks (list "turn-timestamps-p" "off" "cache-miss-notices-p" "off" nil))
               (application-command--call-with-presentation
                (application-command-invocation-parse "/settings")
@@ -1636,8 +1638,9 @@
                  (application--builtin-settings-command application)
                  (test-assert (null *application-command-presentation-pending-p*)
                               "inline settings supply their own command headings")))
-              (test-assert (= (length presented) 2)
-                           "two picker changes produce two feedback entries")
+              (test-assert (and (= (length presented) 2)
+                                (= (count #\Newline (recording-terminal-output terminal)) 2))
+                           "two picker changes produce exactly two consecutive output rows")
               (loop for entry in (reverse presented)
                     for name in '(:turn-timestamps-p :cache-miss-notices-p)
                     do (test-application--setting-value-entry configuration entry name)))))

@@ -408,10 +408,10 @@ mutation passes through TERMINAL-SET-DIMENSIONS.")
    (compact-tail-group
     :initform nil
     :accessor terminal-ui-compact-tail-group
-    :type     (or null (member :success :call) string)
+    :type     (or null (member :success :call :lisp-result) string)
     :documentation
     "Pending separator group: :SUCCESS, an exact call tool name, :CALL after a
-multi-row call, or NIL.")
+multi-row call, :LISP-RESULT for inline getter/value rows, or NIL.")
    (finalized-identifiers
     :initform      (make-hash-table :test #'equal)
     :reader        terminal-ui-finalized-identifiers

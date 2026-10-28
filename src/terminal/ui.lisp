@@ -2949,8 +2949,8 @@ REGIONS only matter to the fullscreen viewport, which owns mouse reporting."
   nil)
 
 (-> terminal-ui--separated-p
-    ((or null (member :success :call :attached) string)
-     (or null (member :success :call :attached) string))
+    ((or null (member :success :call :attached :lisp-result) string)
+     (or null (member :success :call :attached :lisp-result) string))
     boolean)
 (defun terminal-ui--separated-p (previous next)
   "Return true when a blank row belongs between groups PREVIOUS and NEXT."
