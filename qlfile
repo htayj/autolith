@@ -42,7 +42,7 @@ git org-templater https://github.com/lambda-symbolics/org-templater.git :ref 918
 git image-daemon https://github.com/lambda-symbolics/image-daemon.git :ref ab548aef1b5e16aaa9701fad197276537a43cb37
 git ls-compat https://github.com/lambda-symbolics/ls-compat.git :ref cd7ea1588586d3ee77ccd064c98531483da6f52e
 git ls-flock https://github.com/lambda-symbolics/ls-flock.git :ref ee9fc57a46a396e6386d61f81a6df926ca9f9906
-git idsmall https://github.com/lambda-symbolics/idsmall.git :ref 3f4b8e067a1e41b5388f7c5af58585e8c9ab51b9
+git idsmall https://github.com/lambda-symbolics/idsmall.git :ref 51032ca6799956bf267857332495c0b6696cc0bb
 git mcparen https://github.com/lambda-symbolics/mcparen.git :ref 2c2289c8ee3079ea907f0a003ca7526d944ecd64
 git sbcl-generations https://github.com/lambda-symbolics/sbcl-generations.git :ref 7c19962ffd402355bcc32586c880c5975e126ae0
 git sexp-config https://github.com/lambda-symbolics/sexp-config.git :ref 9280b5bf0dc056dee49dcf8c9940f30c049015f9
