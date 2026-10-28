@@ -2439,13 +2439,24 @@ A call's header spans may be widgets inserting its invocation when clicked."
 
 (-> terminal-ui--compact-entry-group
     ((or string list))
-    (or null (eql :success) string))
+    (or null (member :success :lisp-result) string))
 (defun terminal-ui--compact-entry-group (entry)
-  "Group single-line successes, calls, and handoffs by kind and tool."
+  "Group single-line successes, calls, handoffs, and inline Lisp results."
   (if (terminal-ui--compact-success-p entry)
       ':success
       (or (terminal-ui--compact-call-tool entry)
-          (terminal-ui--compact-handoff-group entry))))
+          (terminal-ui--compact-handoff-group entry)
+          (when (and (consp entry)
+                     (not (termdown:widget-p (first entry)))
+                     (eq (terminal-span-style (first entry)) ':lisp-prompt)
+                     (some (lambda (span)
+                             (and (not (termdown:widget-p span))
+                                  (eq (terminal-span-style span) ':success)
+                                  (string= (terminal-span-text span) " => ")))
+                           entry)
+                     (let ((text (terminal--spans-text entry)))
+                       (not (or (find #\Newline text) (find #\Return text)))))
+            ':lisp-result))))
 
 (-> terminal-ui--attached-entry-p ((or string list)) boolean)
 (defun terminal-ui--attached-entry-p (entry)
@@ -2467,7 +2478,7 @@ A call's header spans may be widgets inserting its invocation when clicked."
 
 (-> terminal-ui--separation-group
     ((or string list))
-    (or null (member :success :call :attached) string))
+    (or null (member :success :lisp-result :call :attached) string))
 (defun terminal-ui--separation-group (entry)
   "Return the group deciding the blank rows around ENTRY, or NIL for a plain block.
 

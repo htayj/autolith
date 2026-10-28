@@ -2655,6 +2655,17 @@ The current value and its source sit in aligned columns of their own."
                 (application--setting-source-text configuration setting)
                 (setting-documentation setting))))))
 
+(-> application--setting-value-entry (application keyword) list)
+(defun application--setting-value-entry (application name)
+  "Return the real getter and current setting value as one highlighted Lisp row."
+  (append
+   (application-lisp--source-entry (format nil "(config :~(~A~))" name))
+   (list (terminal-span ':success " => "))
+   (application-lisp--value-spans
+    (application-lisp-render-value
+     (config name (application-configuration application))
+     :columns 16000))))
+
 (-> application--settings-page (application) null)
 (defun application--settings-page (application)
   "Let the user browse settings and change adjustable ones until they cancel."
@@ -2697,8 +2708,7 @@ The current value and its source sit in aligned columns of their own."
                 application name
                 (setting-parse setting option (application-configuration application)))
                (application-present
-                application
-                (format nil "~A is now ~A." (setting-label setting) option)))))
+                application (application--setting-value-entry application name)))))
           (t
            (application-present
             application
@@ -2753,15 +2763,10 @@ The current value and its source sit in aligned columns of their own."
                 (application--setting-source-text configuration setting)
                 (setting-documentation setting)))))
     (t
-     (let* ((key     (application--setting-name name))
-            (setting (configuration-setting (application-configuration application) key)))
+     (let ((key (application--setting-name name)))
        (application-apply-setting application key value)
        (application-present
-        application
-        (format nil "~A is now ~A~:[~; and saved~]."
-                (setting-label setting)
-                (setting-render-value setting (config key (application-configuration application)))
-                (eq (setting-scope setting) ':durable))))))
+        application (application--setting-value-entry application key)))))
   nil)
 
 (define-application-command application--builtin-settings-command
