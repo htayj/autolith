@@ -84,10 +84,13 @@
 
 ALLOWANCE optionally charges the same request to an independent reviewer policy.
 Provider-reported billable usage includes input tokens; output reservations are
-ceilings, not estimates of that usage. Preserve all provider return values."
-  (let ((reservation nil)
-        (settled-p   nil)
-        (failure     nil))
+ceilings, not estimates of that usage. Preserve all provider return values.
+A request refused before invoking FUNCTION has known zero usage. Once FUNCTION
+starts, missing usage is conservatively unknown, including interrupted dispatch."
+  (let ((reservation  nil)
+        (dispatched-p nil)
+        (settled-p    nil)
+        (failure      nil))
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
@@ -96,7 +99,9 @@ ceilings, not estimates of that usage. Preserve all provider return values."
                (let* ((*provider-maximum-output-tokens* reservation)
                       (results                          (mission--supervise
                                                          context "Mission inference"
-                                                         (lambda () (multiple-value-list (funcall function)))))
+                                                         (lambda ()
+                                                           (setf dispatched-p t)
+                                                           (multiple-value-list (funcall function)))))
                       (tokens                           (rlm-usage-billable-tokens
                                                          (provider-usage-normalize (funcall usage-function results)))))
                  (sb-sys:without-interrupts
@@ -114,5 +119,6 @@ ceilings, not estimates of that usage. Preserve all provider return values."
         (sb-sys:without-interrupts
           (setf settled-p t)
           (mission--settle-inference
-           context reservation nil :allowance allowance
-           :failure                           (or failure "Inference interrupted before usage settlement.")))))))
+           context reservation (if dispatched-p nil 0)
+           :allowance allowance
+           :failure   (or failure "Inference interrupted before usage settlement.")))))))
