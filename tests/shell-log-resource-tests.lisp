@@ -573,4 +573,17 @@
                             "A dead unpublished allocation does not block future shell commands")))
         (when worker (lisp-worker-stop worker))
         (when replacement (shell-log-release-artifact replacement)))))
+  (with-test-configuration (configuration)
+    (let* ((context   (shell-log-tests--context configuration "shell-staging"))
+           (directory (merge-pathnames "tasks/shell-staging/interrupted/shell-log/unpublished/"
+                                       (config :data-root configuration))))
+      (ensure-directories-exist directory)
+      (dolist (name '("owner.lock" ".sexp-store-A1.staging"))
+        (with-open-file (stream (merge-pathnames name directory) :direction :output)
+          (write-string "interrupted publication" stream)))
+      (let ((artifact (shell-log-allocate context)))
+        (unwind-protect
+             (test-assert (not (probe-file directory))
+                          "Interrupted manifest staging is reclaimed before the next allocation")
+          (shell-log-release-artifact artifact)))))
   nil)

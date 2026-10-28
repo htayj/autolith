@@ -317,17 +317,31 @@ Disable measurement until resource resolution has checked ancestor ownership."
                nil)))
        t))
 
+(-> shell-log--manifest-staging-p (pathname) boolean)
+(defun shell-log--manifest-staging-p (file)
+  "Recognize the private staging names used by sexp-store snapshot publication."
+  (let ((name (pathname-name file)))
+    (and (equal "staging" (pathname-type file))
+         (stringp name) (<= 13 (length name) 24)
+         (uiop:string-prefix-p ".sexp-store-" name)
+         (every (lambda (character) (find character "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                (subseq name 12))
+         t)))
+
 (-> shell-log--scan-manifest (configuration pathname) list)
 (defun shell-log--scan-manifest (configuration capture-directory)
-  "Read a published manifest, reclaiming empty failed allocations under the lock."
+  "Read a manifest, reclaiming interrupted unpublished allocations under the lock."
   (if (probe-file (shell-log--safe-path configuration (shell-log--manifest-path capture-directory)))
       (shell-log--read-manifest configuration capture-directory)
       (progn
         (unless (shell-log--active-p capture-directory)
           (unless (and (null (uiop:subdirectories capture-directory))
                        (every (lambda (file)
-                                (and (string= "owner.lock" (file-namestring file))
-                                     (shell-log--safe-path configuration file)))
+                                (and (or (string= "owner.lock" (file-namestring file))
+                                         (shell-log--manifest-staging-p file))
+                                     (shell-log--safe-path configuration file)
+                                     (eq ':file (platform-file-status-kind
+                                                 (platform-path-status *platform* file :follow-links-p nil)))))
                               (uiop:directory-files capture-directory)))
             (shell-log--fail "Unpublished shell log contains unexpected files." capture-directory))
           (platform-delete-directory-tree *platform* capture-directory :validate t))
