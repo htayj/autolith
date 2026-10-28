@@ -462,3 +462,37 @@
         (bt:signal-semaphore (mission-inference-test-drain-release tool))
         (when job (task-job-await job nil))
         (task-orchestrator-close orchestrator)))))
+
+(-> test-mission-inference-cancel-before-dispatch () null)
+(defun test-mission-inference-cancel-before-dispatch ()
+  "Cancel the real inline inference job before it can invoke its provider."
+  (with-test-configuration (configuration)
+    (let* ((provider    (make-instance 'mission-inference-test-provider
+                                    :entered (bt:make-semaphore :count 0)
+                                    :release (bt:make-semaphore :count 0)
+                                    :blocked-p nil :result (mission-test--result "unused")))
+           (application (mission-inference-test--application configuration provider))
+           (run-inline  (symbol-function 'job-run-inline)))
+      (application-mission-start application (mission-test--specification))
+      (test-call-with-function-replacements
+       (list (list 'job-run-inline
+                   (lambda (job)
+                     (job-cancel job :reason ':test-before-dispatch)
+                     (funcall run-inline job))))
+       (lambda ()
+         (test-assert
+          (handler-case
+              (progn (mission-inference-test--call provider (application-conversation application)) nil)
+            (mission-error () t))
+          "the cancelled inline request is refused")))
+      (let ((goal (application-goal application)))
+        (test-assert (null (mission-inference-test-provider-seen-output-cap provider))
+                     "the provider was never dispatched")
+        (test-assert (eq :active (getf goal :status)) "pre-dispatch cancellation leaves the mission active")
+        (test-assert (and (zerop (getf goal :unknown-usage))
+                          (zerop (getf goal :tokens-used)))
+                     "an undispatched request has known zero usage")
+        (test-assert (and (= 1 (getf goal :turns-used))
+                          (zerop (getf goal :tokens-reserved))
+                          (zerop (getf goal :requests-outstanding)))
+                     "the admitted request settles exactly once")))))
