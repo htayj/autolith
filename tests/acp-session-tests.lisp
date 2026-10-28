@@ -15,7 +15,7 @@
   (:documentation "A deterministic ACP client for session lifecycle tests."))
 
 (defmethod agentcomms:client-session-update
-    ((client acp-session-test-client) session-id update params)
+    ((client acp-session-test-client) session-id update &key params)
   "Record UPDATE as both a received update and an ordered wire event."
   (declare (ignore session-id params))
   (push update (acp-session-test-updates client))
@@ -65,7 +65,7 @@
   nil)
 
 (defmethod agentcomms:client-request-permission
-    ((client acp-session-test-client) session-id tool-call options params)
+    ((client acp-session-test-client) session-id tool-call &key options params)
   "Record the permission request for TOOL-CALL and allow it once."
   (declare (ignore session-id options params))
   (push (cons ':permission tool-call) (acp-session-test-wire-events client))
@@ -528,7 +528,7 @@
                  (handler-case
                      (progn
                        (agentcomms:agent-prompt service identifier
-                                               (list (agentcomms:acp-text-content "turn")) nil)
+                                               (list (agentcomms:acp-text-content "turn")))
                        (test-assert nil "the original turn fails"))
                    (serious-condition (condition)
                      (test-assert (eq original condition)

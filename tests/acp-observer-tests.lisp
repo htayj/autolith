@@ -16,14 +16,14 @@
   (:documentation "A minimal ACP client used by observer protocol tests."))
 
 (defmethod agentcomms:client-session-update
-    ((client acp-observer-test-client) session-id update params)
+    ((client acp-observer-test-client) session-id update &key params)
   "Record UPDATE so tests can inspect the notifications the client received."
   (declare (ignore session-id params))
   (push update (acp-observer-test-client-updates client))
   nil)
 
 (defmethod agentcomms:client-request-permission
-    ((client acp-observer-test-client) session-id tool-call options params)
+    ((client acp-observer-test-client) session-id tool-call &key options params)
   "Snapshot the updates seen so far and select the client's configured permission choice."
   (declare (ignore session-id tool-call options params))
   (setf (acp-observer-test-client-permission-updates client)

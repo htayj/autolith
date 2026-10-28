@@ -64,8 +64,8 @@
   :version "ql-2025-06-22"))
 ("agentcomms" .
  (:class qlot/source/git:source-git
-  :initargs (:remote-url "https://github.com/lambda-symbolics/agentcomms.git" :ref "2120a9df287731bf3a39edf7fabb02a5406494ff")
-  :version "git-2120a9df287731bf3a39edf7fabb02a5406494ff"))
+  :initargs (:remote-url "https://github.com/lambda-symbolics/agentcomms.git" :ref "18676b8de2b773e521f3af4473e2877878ae3f22")
+  :version "git-18676b8de2b773e521f3af4473e2877878ae3f22"))
 ("fetch-gist" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/fetch-gist.git" :ref "082f4d45d4cf0076c0c891f00e05d71957de6009")

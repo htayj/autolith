@@ -256,7 +256,7 @@ fragments that providers interleave with empty content deltas."
                (multiple-value-bind (outcome identifier)
                    (agentcomms:agent-request-permission
                     (acp-session-service session) (acp-session-identifier session)
-                    report options :timeout *acp-permission-timeout-seconds*)
+                    report :options options :timeout *acp-permission-timeout-seconds*)
                  (when (and (eq outcome ':selected)
                             (find identifier options :test #'equal
                                   :key                     (lambda (option) (agentcomms:json-get option "optionId"))))
