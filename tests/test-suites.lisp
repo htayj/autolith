@@ -326,6 +326,7 @@
 (define-test-suite job-completion-controller
   test-job-completion-controller-coalescing
   test-job-completion-controller-continuation-notice
+  test-job-completion-controller-ticket-delivery
   test-job-completion-yield-presentation
   test-automatic-work-provider-failure
   test-job-completion-controller-notify-and-busy

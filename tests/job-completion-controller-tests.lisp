@@ -35,14 +35,19 @@
                             (eq (getf notice :completion-policy) ':continue)))
                       notices)))
              (list 'task-completion-deliver
-                   (lambda (agent)
-                     (let ((delivered notices))
+                    (lambda (agent &key (identifiers nil identifiers-p))
+                      (let ((delivered (if identifiers-p
+                                           (remove-if-not
+                                            (lambda (notice)
+                                              (member (getf notice :id) identifiers :test #'equal))
+                                            notices)
+                                           notices)))
                        (dolist (notice delivered)
                          (conversation-append-user-message
                           (agent-conversation agent) (getf notice :summary)
                           :automatic-p              t
                           :pending-input-identifier (format nil "completion:~A" (getf notice :id))))
-                       (setf notices nil)
+                       (setf notices (set-difference notices delivered :test #'eq))
                        delivered)))
              (list 'task-completion-disconnect (lambda (agent) (declare (ignore agent)) nil)))
             (lambda ()
@@ -102,6 +107,46 @@
                            (search "continuing with job results" replayed)
                            (not (search "Continue the current work" replayed)))
                       "the replayed wakeup shows the same notice instead of its prompt"))))))
+
+(-> test-job-completion-controller-ticket-delivery () null)
+(defun test-job-completion-controller-ticket-delivery ()
+  "Deliver exact admitted ticket identities despite stale backlog and busy-boundary races."
+  (dolist (busy-p '(nil t))
+    (job-completion-controller-tests--fixture
+     (lambda (application controller notices)
+       (application-mission-start application (mission-test--specification))
+       (setf (getf (application-goal application) :status) ':verified)
+       (let* ((stale  (job-completion-controller-tests--notice application "stale" :mission-id "retired"))
+              (owned  (job-completion-controller-tests--notice application "owned"))
+              (new    (job-completion-controller-tests--notice application "new"))
+              (before (copy-tree (application-goal application))))
+         (funcall notices (list stale owned))
+         (let ((ticket  (second (application-job-completions--take-work controller)))
+               (deliver (symbol-function 'task-completion-deliver)))
+           (test-call-with-function-replacements
+            (list (list 'task-completion-deliver
+                        (lambda (agent &rest arguments)
+                          (when busy-p
+                            ;; A busy request consumes the ticket's event as new work arrives.
+                            (funcall deliver agent :identifiers (list "owned"))
+                            (funcall notices (append (funcall notices) (list new))))
+                          (apply deliver agent arguments))))
+            (lambda () (application-job-completions-run controller ticket)))
+           (test-assert (= (if busy-p 0 1)
+                           (length (scripted-provider-input-snapshots (application-provider application))))
+                        "a consumed ticket cannot borrow a new completion's turn authority")
+           (when busy-p
+             (test-assert (member stale (funcall notices))
+                          "a consumed ticket cannot drain unrelated mission work")
+             (test-assert (member new (funcall notices))
+                          "new completion waits for its own admitted ticket")
+             (application-job-completions-run
+              controller (second (application-job-completions--take-work controller)))
+             (test-assert (= 1 (length (scripted-provider-input-snapshots (application-provider application))))
+                          "the new completion starts exactly one turn under its own ticket"))
+           (test-assert (equal before (application-goal application))
+                        "ticket delivery preserves terminal mission state and accounting"))))))
+  nil)
 
 (-> test-automatic-work-provider-failure () null)
 (defun test-automatic-work-provider-failure ()

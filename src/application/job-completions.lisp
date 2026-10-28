@@ -200,7 +200,8 @@ snapshot cannot change the meaning of an already finalized transcript entry."
       ;; Delivery may have won a busy request boundary after ticket construction.
       (when (some (lambda (notice)
                     (application-job-completions--notice-admissible-p application notice))
-                  (task-completion-deliver agent))
+                  (task-completion-deliver
+                   agent :identifiers (mapcar (lambda (notice) (getf notice :id)) notices)))
         (let ((goal (application-goal application)))
           (when (and goal (or (not (mission-goal-p goal)) mission-authorized-p))
             (incf (getf goal :continuations 0))
