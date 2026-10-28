@@ -74,6 +74,16 @@ mutation passes through TERMINAL-SET-DIMENSIONS.")
     :reader        terminal-ui-live-region
     :type          live-region
     :documentation "Clinedi region anchoring unfinished content below scrollback.")
+   (default-color-theme
+    :initform      nil
+    :accessor      terminal-ui-default-color-theme
+    :type          (option terminal-theme)
+    :documentation "The default-color channels this UI may need to restore, recorded as a theme.")
+   (theme-defaults-current-p
+    :initform      nil
+    :accessor      terminal-ui-theme-defaults-current-p
+    :type          boolean
+    :documentation "Whether the selected default colors were completely written to this terminal.")
    (prompt
     :initarg       :prompt
     :reader        terminal-ui-prompt

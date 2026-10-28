@@ -59,27 +59,28 @@
 
 Any epilogue set through TERMINAL-UI-SET-EPILOGUE follows the restore
 sequence, so it lands in the normal screen where it stays readable."
-  (when (fullscreen-terminal-ui-active-p ui)
-    (unwind-protect
-         (let ((terminal (terminal-ui-terminal ui))
-               (epilogue (shiftf (fullscreen-terminal-ui-epilogue ui) nil)))
-           (terminal--write
-            terminal
-            (concatenate
-             'string
-             (terminal-theme-leave-sequence *terminal-theme*)
-             (format nil "~C[0m~C[?7h~C[?25h" #\Escape #\Escape #\Escape)
-             (mouse-reporting-disable-sequence)
-             (terminal-keyboard-enhancement-disable-sequence)
-             (alternate-screen-leave-sequence)))
-           (when epilogue
-             (terminal--write-safe-text terminal (format nil "~A~%" epilogue)))
-           (terminal-flush terminal))
-      (let ((token (fullscreen-terminal-ui-platform-token ui)))
-        (setf (fullscreen-terminal-ui-active-p ui) nil
-              (fullscreen-terminal-ui-platform-token ui) nil)
-        (terminal-ui-fullscreen-invalidate ui)
-        (platform-terminal-restore-fullscreen *platform* token))))
+  (unwind-protect
+       (terminal-ui--leave-theme ui)
+    (when (fullscreen-terminal-ui-active-p ui)
+      (unwind-protect
+           (let ((terminal (terminal-ui-terminal ui))
+                 (epilogue (shiftf (fullscreen-terminal-ui-epilogue ui) nil)))
+             (terminal--write
+              terminal
+              (concatenate
+               'string
+               (format nil "~C[0m~C[?7h~C[?25h" #\Escape #\Escape #\Escape)
+               (mouse-reporting-disable-sequence)
+               (terminal-keyboard-enhancement-disable-sequence)
+               (alternate-screen-leave-sequence)))
+             (when epilogue
+               (terminal--write-safe-text terminal (format nil "~A~%" epilogue)))
+             (terminal-flush terminal))
+        (let ((token (fullscreen-terminal-ui-platform-token ui)))
+          (setf (fullscreen-terminal-ui-active-p ui) nil
+                (fullscreen-terminal-ui-platform-token ui) nil)
+          (terminal-ui-fullscreen-invalidate ui)
+          (platform-terminal-restore-fullscreen *platform* token)))))
   nil)
 
 (-> terminal-ui-fullscreen-enter (fullscreen-terminal-ui) null)
@@ -100,8 +101,8 @@ sequence, so it lands in the normal screen where it stays readable."
                (alternate-screen-enter-sequence)
                (terminal-keyboard-enhancement-enable-sequence)
                (format nil "~C[2J~C[H" #\Escape #\Escape)
-               (mouse-reporting-enable-sequence)
-               (terminal-theme-enter-sequence *terminal-theme*)))
+               (mouse-reporting-enable-sequence)))
+             (terminal-ui--enter-theme ui)
              (terminal-flush (terminal-ui-terminal ui))
              (terminal-ui-fullscreen-invalidate ui)
              (setf completed-p t))
@@ -442,6 +443,8 @@ lock, because copying and browser launches present notices of their own."
                    (if (terminal-interactive-p terminal)
                        (progn
                          (terminal-ui-fullscreen-enter ui)
+                         (unless (terminal-ui-theme-defaults-current-p ui)
+                           (terminal-ui--enter-theme ui))
                          (let ((now (or status-now (funcall (terminal-ui-clock-function ui)))))
                            (terminal-ui--expire-notice-at ui now)
                            (setf (terminal-ui-status-rendered-signature ui)

@@ -275,8 +275,8 @@ secondary, and quiet text the soft blue."
             (:copier nil))
   "A named presentation of semantic styles plus optional terminal default colors.
 
-FOREGROUND and BACKGROUND are 24-bit colors imposed on the terminal while the
-fullscreen viewport is active, or NIL to leave the terminal's own defaults."
+FOREGROUND and BACKGROUND are 24-bit colors imposed on a styled interactive
+terminal while its UI is active, or NIL to leave the terminal's own defaults."
   (name        ':autolith :type keyword :read-only t)
   (style-table nil :type list :read-only t)
   (foreground  nil :type (option color) :read-only t)

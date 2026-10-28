@@ -1467,7 +1467,9 @@
   (test-call-with-typed-control-application
    (lambda (application root observations)
      (declare (ignore root observations))
-     (let ((configuration (application-configuration application)))
+     (let ((configuration          (application-configuration application))
+           (*terminal-theme*       *terminal-theme*)
+           (*terminal-style-table* *terminal-style-table*))
        (application-operation-call application 'settings ':onboarding-p t)
        (let ((evaluation
               (application-lisp-evaluate

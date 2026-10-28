@@ -250,6 +250,9 @@
   test-terminal-fullscreen-new-conversation
   test-terminal-fullscreen-small-windows
   test-terminal-fullscreen-flush-wrap-cursor
+  test-terminal-live-theme
+  test-terminal-theme-defaults
+  test-terminal-theme-write-failure
   test-terminal-fullscreen-failure-and-lifecycle
   test-terminal-style-tables-cover-every-name
   test-terminal-style-sequence-unthemed

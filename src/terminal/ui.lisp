@@ -2344,6 +2344,8 @@ while output is deferred and otherwise dropped."
               (and status-now
                    (terminal-ui--animation-signature-at ui status-now)))
         (when (terminal-interactive-p terminal)
+          (unless (terminal-ui-theme-defaults-current-p ui)
+            (terminal-ui--enter-theme ui))
           (let ((painted-command-activities
                   (terminal-ui--command-visible-activities ui)))
             (multiple-value-bind (text display cursor)
@@ -2774,6 +2776,62 @@ readiness polling, resize coordination and lifecycle cleanup belong to Clinedi."
 
 ;;;; -- Public UI Lifecycle and Events --
 
+(-> terminal-ui--enter-theme (terminal-ui) null)
+(defun terminal-ui--enter-theme (ui)
+  "Apply the installed theme's defaults, retaining ownership across failed writes."
+  (let* ((terminal (terminal-ui-terminal ui))
+         (previous (terminal-ui-default-color-theme ui))
+         (theme    *terminal-theme*))
+    (setf (terminal-ui-theme-defaults-current-p ui) nil)
+    (when (and (terminal-interactive-p terminal) (terminal-styled-p terminal))
+      ;; A partial transition can leave either palette's defaults imposed.
+      (setf (terminal-ui-default-color-theme ui)
+            (make-terminal-theme
+             :name       ':pending-defaults
+             :foreground (or (terminal-theme-foreground theme)
+                             (and previous (terminal-theme-foreground previous)))
+             :background (or (terminal-theme-background theme)
+                             (and previous (terminal-theme-background previous)))))
+      (let ((controls (concatenate 'string
+                                   (if previous (terminal-theme-leave-sequence previous) "")
+                                   (terminal-theme-enter-sequence theme))))
+        (when (plusp (length controls))
+          (terminal--write terminal controls)
+          (terminal-flush terminal)))
+      (setf (terminal-ui-default-color-theme ui) theme
+            (terminal-ui-theme-defaults-current-p ui) t)))
+  nil)
+
+(-> terminal-ui--leave-theme (terminal-ui) null)
+(defun terminal-ui--leave-theme (ui)
+  "Restore the terminal defaults owned by UI, retaining ownership on failure."
+  (setf (terminal-ui-theme-defaults-current-p ui) nil)
+  (let ((theme (terminal-ui-default-color-theme ui)))
+    (when theme
+      (let ((controls (terminal-theme-leave-sequence theme)))
+        (when (plusp (length controls))
+          (terminal--write (terminal-ui-terminal ui) controls)
+          (terminal-flush (terminal-ui-terminal ui))))
+      (setf (terminal-ui-default-color-theme ui) nil)))
+  nil)
+
+(-> terminal-ui-set-theme (terminal-ui keyword) null)
+(defun terminal-ui-set-theme (ui name)
+  "Install NAME and redraw UI's live content without rewriting committed scrollback.
+
+The caller persists the setting first. A failed terminal write leaves the new
+logical theme installed and the physical frame invalid for the next repaint."
+  (with-terminal-ui-locked (ui)
+    (terminal-theme-install name)
+    (setf (terminal-ui-prompt-render-cache ui) nil
+          (terminal-ui-theme-defaults-current-p ui) nil)
+    (when (terminal-ui-fullscreen-p ui)
+      (terminal-ui-fullscreen-invalidate ui))
+    (when (terminal-ui-started-p ui)
+      (terminal-ui--enter-theme ui)
+      (terminal-ui--paint-live ui)))
+  nil)
+
 (-> terminal-ui-start (terminal-ui) terminal-ui)
 (defun terminal-ui-start (ui)
   "Start UI's transport and selected presentation mode."
@@ -2784,8 +2842,9 @@ readiness polling, resize coordination and lifecycle cleanup belong to Clinedi."
       (terminal-ui-report-program-status
        ui (first (terminal-ui-program-status ui))
        :kind (second (terminal-ui-program-status ui)))
-      (when (terminal-ui-fullscreen-p ui)
-        (terminal-ui-fullscreen-enter ui))
+      (if (terminal-ui-fullscreen-p ui)
+          (terminal-ui-fullscreen-enter ui)
+          (terminal-ui--enter-theme ui))
       (terminal-ui--paint-live ui)))
   ui)
 
@@ -2796,7 +2855,9 @@ readiness polling, resize coordination and lifecycle cleanup belong to Clinedi."
     (when (terminal-ui-started-p ui)
       (if (terminal-ui-fullscreen-p ui)
           (terminal-ui-fullscreen-leave ui)
-          (live-region-suspend (terminal-ui-live-region ui)))))
+          (progn
+            (live-region-suspend (terminal-ui-live-region ui))
+            (terminal-ui--leave-theme ui)))))
   ui)
 
 (-> terminal-ui-stop (terminal-ui) terminal-ui)
@@ -2821,8 +2882,9 @@ readiness polling, resize coordination and lifecycle cleanup belong to Clinedi."
             (terminal-ui-notice-deadline ui) nil
             (terminal-ui-live-output-suspended-p ui) nil)
       (unwind-protect
-           (when (terminal-ui-fullscreen-p ui)
-             (terminal-ui-fullscreen-leave ui))
+           (if (terminal-ui-fullscreen-p ui)
+               (terminal-ui-fullscreen-leave ui)
+               (terminal-ui--leave-theme ui))
         (terminal-stop (terminal-ui-terminal ui)))))
   ui)
 

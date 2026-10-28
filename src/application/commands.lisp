@@ -2538,6 +2538,16 @@ are forwarded to TERMINAL-UI-SELECT."
        (t
         "default")))))
 
+(-> application-set-terminal-theme (application keyword) null)
+(defun application-set-terminal-theme (application name)
+  "Persist NAME before installing its styles and repainting the running terminal."
+  (terminal-theme-find name)
+  (setf (config :terminal-theme (application-configuration application)) name)
+  (if (and (slot-boundp application 'ui) (application-ui application))
+      (terminal-ui-set-theme (application-ui application) name)
+      (terminal-theme-install name))
+  nil)
+
 (-> application-apply-setting (application keyword t) null)
 (defun application-apply-setting (application name value)
   "Set NAME to VALUE for APPLICATION and apply the runtime side effects.
@@ -2584,6 +2594,8 @@ the settings page and the slash commands behave identically."
        (application-set-hurry-up application value))
       (:relax-p
        (application-set-relax application value))
+      (:terminal-theme
+       (application-set-terminal-theme application value))
       (:permission-mode
        (if value
            (application--set-durable-permission-mode application value)
