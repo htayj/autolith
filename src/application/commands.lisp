@@ -2666,6 +2666,14 @@ The current value and its source sit in aligned columns of their own."
      (config name (application-configuration application))
      :columns 16000))))
 
+(-> application--present-setting-value (application keyword) null)
+(defun application--present-setting-value (application name)
+  "Present a compact setting row with its getter as the command heading."
+  (let ((entry (application--setting-value-entry application name)))
+    (setf *application-command-presentation-pending-p* nil)
+    (application-present application entry))
+  nil)
+
 (-> application--settings-page (application) null)
 (defun application--settings-page (application)
   "Let the user browse settings and change adjustable ones until they cancel."
@@ -2707,8 +2715,7 @@ The current value and its source sit in aligned columns of their own."
                (application-apply-setting
                 application name
                 (setting-parse setting option (application-configuration application)))
-               (application-present
-                application (application--setting-value-entry application name)))))
+               (application--present-setting-value application name))))
           (t
            (application-present
             application
@@ -2765,8 +2772,7 @@ The current value and its source sit in aligned columns of their own."
     (t
      (let ((key (application--setting-name name)))
        (application-apply-setting application key value)
-       (application-present
-        application (application--setting-value-entry application key)))))
+       (application--present-setting-value application key))))
   nil)
 
 (define-application-command application--builtin-settings-command

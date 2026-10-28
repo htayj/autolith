@@ -1511,9 +1511,9 @@
 (-> test-application--setting-value-entry (configuration list keyword) null)
 (defun test-application--setting-value-entry (configuration entry name)
   "Check feedback contains an executable getter, its native value, and one output row."
-  (let* ((text                     (terminal--spans-text entry))
-         (*read-eval*              nil)
-         (*package*                (find-package '#:autolith))
+  (let* ((text                    (terminal--spans-text entry))
+         (*read-eval*             nil)
+         (*package*               (find-package '#:autolith))
          (setinka:*configuration* configuration))
     (multiple-value-bind (query end)
         (read-from-string text nil nil :start 2 :preserve-whitespace t)
@@ -1542,16 +1542,19 @@
   (test-application-typed-settings)
   (let* ((configuration (test-configuration))
          (root          (test-configuration-root configuration))
+         (ui            (terminal-ui-create
+                         :terminal (make-instance 'recording-terminal :columns 200)))
          (application   (make-instance 'application
-                                       :configuration configuration))
+                                       :configuration configuration
+                                       :ui            ui))
          (presented     nil)
          (picks         nil))
     (unwind-protect
          (test-call-with-function-replacements
           (list
-           (list 'application-present
-                 (lambda (candidate entry)
-                   (declare (ignore candidate))
+           (list 'terminal-ui-append-finalized
+                 (lambda (candidate identifier entry)
+                   (declare (ignore candidate identifier))
                    (push entry presented)
                    t))
            (list 'application--pick-identifier
@@ -1572,14 +1575,14 @@
                   (not (search "provider-endpoint" (first presented))))
              "the listing shows visible settings with values and sources")
             (application--builtin-settings-command application "cache-miss-notices-p" t)
-             (test-assert
-              (application-cache-miss-notices-p application)
-              "a named setting changes through the command")
-             (test-application--setting-value-entry
-              configuration (first presented) ':cache-miss-notices-p)
-             (dolist (name '(:relax-p :model :boot-screen-seconds :terminal-theme))
-               (test-application--setting-value-entry
-                configuration (application--setting-value-entry application name) name))
+            (test-assert
+             (application-cache-miss-notices-p application)
+             "a named setting changes through the command")
+            (test-application--setting-value-entry
+             configuration (first presented) ':cache-miss-notices-p)
+            (dolist (name '(:relax-p :model :boot-screen-seconds :terminal-theme))
+              (test-application--setting-value-entry
+               configuration (application--setting-value-entry application name) name))
             (test-assert
              (eq (configuration-setting-source configuration :cache-miss-notices-p) ':session)
              "an interactive change records the session source")
@@ -1615,14 +1618,27 @@
               (test-assert
                (application-turn-timestamps-p application)
                "the page applies a picked option")
-               (test-application--setting-value-entry
-                configuration (second presented) ':turn-timestamps-p)
-               (test-assert
-                (search "read-only" (first presented))
-                "the page explains why a read-only setting cannot change")
+              (test-application--setting-value-entry
+               configuration (second presented) ':turn-timestamps-p)
+              (test-assert
+               (search "read-only" (first presented))
+               "the page explains why a read-only setting cannot change")
               (test-assert
                (null picks)
-               "the page loops until the picker is cancelled"))))
+               "the page loops until the picker is cancelled")
+              (setf presented nil
+                    picks (list "turn-timestamps-p" "off" "cache-miss-notices-p" "off" nil))
+              (application-command--call-with-presentation
+               (application-command-invocation-parse "/settings")
+               (lambda ()
+                 (application--builtin-settings-command application)
+                 (test-assert (null *application-command-presentation-pending-p*)
+                              "inline settings supply their own command headings")))
+              (test-assert (= (length presented) 2)
+                           "two picker changes produce two feedback entries")
+              (loop for entry in (reverse presented)
+                    for name in '(:turn-timestamps-p :cache-miss-notices-p)
+                    do (test-application--setting-value-entry configuration entry name)))))
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
 
 
