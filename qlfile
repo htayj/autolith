@@ -32,7 +32,7 @@ git daphne https://github.com/lambda-symbolics/daphne.git :ref 65f68216152c70110
 git cl-skills https://github.com/lambda-symbolics/cl-skills.git :ref 21a09a7b7195f6c0e1b36d843c518c5c7bee6ac0
 git cl-termdown https://github.com/lambda-symbolics/cl-termdown.git :ref 88abe646dc5b05ccda0b8b0a8229ae4b79a029f5
 git cl-worktree https://github.com/lambda-symbolics/cl-worktree.git :ref cd180c2b8f9cb4731be05c39320bbf91b0e2e63d
-git cl-exec-sandbox https://github.com/lambda-symbolics/cl-exec-sandbox.git :ref 684e840c7f6de632048e38dcf63279da19ebc2fe
+git cl-exec-sandbox https://github.com/lambda-symbolics/cl-exec-sandbox.git :ref 2eee22e33a4d4c6df6019e44ee7fe353454ce175
 git cl-hashline https://github.com/lambda-symbolics/cl-hashline.git :ref 582986f8ccbd0bd206dde022f9f65837ae82357c
 git clifff https://github.com/lambda-symbolics/clifff.git :ref c575f108ef497f113f87901ac91fd6dcce2a59cf
 git colorlisp https://github.com/lambda-symbolics/colorlisp.git :ref b6fdb68ae22ab997bb818c486983129ec7ac6177
