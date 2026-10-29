@@ -76,11 +76,20 @@ address goes in brackets, as in [::1]:8737."
 
 (-> acp-endpoint-loopback-p (acp-endpoint) boolean)
 (defun acp-endpoint-loopback-p (endpoint)
-  "Return whether ENDPOINT listens only on this machine's loopback interface."
-  (let ((host (string-downcase (acp-endpoint-host endpoint))))
+  "Recognize loopback literals and localhost, warning for other hostnames."
+  (let* ((host   (string-downcase (acp-endpoint-host endpoint)))
+         (octets (uiop:split-string host :separator '(#\.))))
     (and (or (string= host "localhost")
              (string= host "::1")
-             (eql 0 (search "127." host)))
+             (and (= (length octets) 4)
+                  (string= (first octets) "127")
+                  (every (lambda (octet)
+                           (and (<= 1 (length octet) 3)
+                                (every #'digit-char-p octet)
+                                (or (= (length octet) 1)
+                                    (char/= (char octet 0) #\0))
+                                (<= (parse-integer octet) 255)))
+                         octets)))
          t)))
 
 (-> acp-endpoint-warning (acp-endpoint string) (or null string))

@@ -13,7 +13,11 @@
                   ("[::1]:8080" "::1" 8080 t)
                   ("0.0.0.0:8737" "0.0.0.0" 8737 nil)
                   ("[::]:8737" "::" 8737 nil)
-                  ("192.168.1.20:65535" "192.168.1.20" 65535 nil)))
+                  ("192.168.1.20:65535" "192.168.1.20" 65535 nil)
+                  ("127.example.com:8080" "127.example.com" 8080 nil)
+                  ("127.0.0.256:8080" "127.0.0.256" 8080 nil)
+                  ("127.0.0.01:8080" "127.0.0.01" 8080 nil)
+                  ("127.0.0.1.example.com:8080" "127.0.0.1.example.com" 8080 nil)))
     (destructuring-bind (text host port loopback-p) case
       (let ((endpoint (acp-endpoint-parse ':websocket text)))
         (test-assert (equal host (acp-endpoint-host endpoint)) "the endpoint host is parsed")
