@@ -463,6 +463,78 @@
         (when job (task-job-await job nil))
         (task-orchestrator-close orchestrator)))))
 
+(-> test-mission-inference-cancelling-block-refuses-continuation () null)
+(defun test-mission-inference-cancelling-block-refuses-continuation ()
+  "Refuse child continuation as soon as a cancelling block publishes its status."
+  (dolist (quarantined-p '(nil t))
+    (with-test-configuration (configuration root)
+      (setf configuration (configuration-copy configuration :working-directory root))
+      (let* ((application   (mission-test--application configuration))
+             (registry      (application-tool-registry application))
+             (provider      (make-instance 'mission-inference-test-child-provider :mode ':blocking-tool))
+             (tool          (make-instance 'mission-inference-test-drain-tool
+                                           :namespace "test" :name "block"
+                                           :description "Hold the admitted child."
+                                           :parameters  (tool-object-schema (json-object) nil)))
+             (orchestrator  (task-orchestrator-create))
+             (definition    (task-agent-definition-create
+                             :name "mission-child" :description "Finish admitted work"
+                             :instructions "Call the blocking tool, then submit success."
+                             :tools ':all :source ':test))
+             (entry         (list :definition definition :detached t
+                                  :item (list :agent "mission-child" :task "Finish admitted work.")))
+             (record-status (symbol-function 'mission-knowledge-record-status))
+             (published-p   nil)
+             (job           nil))
+        (setf (agent-provider (application-agent application)) provider)
+        (tool-registry-register registry tool)
+        (task-augment-tool-registry registry)
+        (tool-registry-bind-runtime registry 'task-orchestrator orchestrator)
+        (application-mission-start application (mission-test--specification))
+        (unwind-protect
+             (progn
+               (setf job (first (task-orchestrator-start-jobs
+                                 orchestrator (application-agent application) (list entry))))
+               (test-assert (bt:wait-on-semaphore (mission-inference-test-drain-entered tool)
+                                                :timeout 10)
+                            "child reaches a real tool before the cancelling block")
+               (let ((context (mission-context-find (application-conversation application))))
+                 (when quarantined-p
+                   (mission--transition context ':blocked "Unknown usage." :cancel-p nil))
+                 (test-call-with-function-replacements
+                  (list (list 'mission-knowledge-record-status
+                              (lambda (published-context status)
+                                (when (and (eq published-context context) (eq status ':blocked))
+                                  (setf published-p t)
+                                  (test-assert (eq :blocked (getf (application-goal application) :status))
+                                               "the cancelling status is already published")
+                                  (test-assert (not (job-cancellation-requested-p job))
+                                               "continuation is tested before job cancellation")
+                                  (test-assert (mission-agent-terminal-p
+                                                (mission-inference-test-drain-agent tool))
+                                               "the child is terminal before cancellation reaches its job")
+                                  (let ((*mission-admitted-operation* job))
+                                    (dolist (inference-p '(nil t))
+                                      (test-assert
+                                       (handler-case
+                                           (progn (mission--admit context :inference-p inference-p) nil)
+                                         (mission-error (condition)
+                                           (eq :blocked (mission-error-reason condition))))
+                                       "both tool and inference continuation refuse the cancelling block")))
+                                  (bt:signal-semaphore (mission-inference-test-drain-release tool))
+                                  (task-job-await job nil)
+                                  (test-assert (= 1 (getf (application-goal application) :turns-used))
+                                               "the released child cannot admit another provider request")
+                                  (test-assert (not (getf (getf (task-job-snapshot job) :result) :yielded-p))
+                                               "the child cannot continue to yield success"))
+                                (funcall record-status published-context status))))
+                  (lambda ()
+                    (application-mission-stop application ':blocked "Explicit blocker."))))
+               (test-assert published-p "the test reached status publication before cancellation"))
+          (bt:signal-semaphore (mission-inference-test-drain-release tool))
+          (when job (task-job-await job nil))
+          (task-orchestrator-close orchestrator))))))
+
 (-> test-mission-inference-cancel-before-dispatch () null)
 (defun test-mission-inference-cancel-before-dispatch ()
   "Cancel the real inline inference job before it can invoke its provider."

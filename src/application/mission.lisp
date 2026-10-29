@@ -27,7 +27,9 @@
    (threads :initform (make-hash-table :test #'eq) :reader mission-context-threads
             :documentation "Thread identities for safe sibling cancellation.")
    (jobs :initform nil :accessor mission-context-jobs
-         :documentation "Supervised operations currently owned by the mission."))
+         :documentation "Supervised operations currently owned by the mission.")
+   (draining-p :initform nil :accessor mission-context-draining-p
+               :documentation "Permit admitted children to drain only after a noncancelling block."))
   (:documentation "Ephemeral synchronization for one durable session goal."))
 
 (define-condition mission-error (autolith-error)
@@ -124,7 +126,8 @@
   "Persist STATUS and EVIDENCE; cancel admitted operations when CANCEL-P is true."
   (with-recursive-lock-held ((mission-context-lock context))
     (let ((goal (mission-context-goal context)))
-      (setf (getf goal :status) status)
+      (setf (getf goal :status) status
+            (mission-context-draining-p context) (and (eq status ':blocked) (not cancel-p)))
       (mission--evidence context status evidence)
       (mission--record context)))
   (mission-knowledge-record-status context status)
@@ -149,7 +152,8 @@
   (with-recursive-lock-held ((mission-context-lock context))
     (let ((goal (mission-context-goal context)))
       (not (null
-            (and (eq (getf goal :status) ':blocked)
+            (and (mission-context-draining-p context)
+                 (eq (getf goal :status) ':blocked)
                  (eq goal (application-goal (mission-context-application context)))
                  (typep job 'task-job)
                  (eq (task-job-mission-context job) context)

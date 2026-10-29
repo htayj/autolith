@@ -1355,6 +1355,7 @@
 
 (define-test-suite mission-inference
   test-mission-inference-unknown-drains-child
+  test-mission-inference-cancelling-block-refuses-continuation
   test-mission-inference-cancel-before-dispatch
   test-mission-inference-overlap-and-settlement
   test-mission-inference-turn-contention
