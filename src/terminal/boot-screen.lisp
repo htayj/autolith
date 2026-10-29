@@ -57,7 +57,7 @@
 (defparameter *terminal-ui-boot-linger-p* nil
   "Whether the boot screen currently advertises Space to start the session.")
 
-(defparameter *terminal-ui-boot-linger-prompt* "PRESS SPACE TO START | Esc or typing: listener"
+(defparameter *terminal-ui-boot-linger-prompt* "PRESS SPACE TO START"
   "The call to action shown below the tip while the boot screen waits.")
 
 (defparameter *terminal-ui-boot-start-label* "start"
