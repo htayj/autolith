@@ -82,3 +82,6 @@ try {
   if ((Split-Path -Parent $temporary) -ne $temporaryRoot) { throw 'Unexpected fixture cleanup path.' }
   if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
 }
+
+# Expected native failures must not become the GitHub Actions step's exit code.
+exit 0
