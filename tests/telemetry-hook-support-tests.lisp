@@ -78,6 +78,10 @@
                  (lambda (&rest arguments) (declare (ignore arguments)) application))
            (list 'run-job--resolve-definition
                  (lambda (&rest arguments) (declare (ignore arguments)) definition))
+           ;; Keep deadline coverage independent of installed user skills.
+           (list 'skill-roots
+                 (lambda (configuration)
+                   (list (merge-pathnames "skills/" (config :config-root configuration)))))
            (list 'telemetry--process
                  (lambda (run request)
                    (declare (ignore run))

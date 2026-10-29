@@ -102,6 +102,10 @@
                           (lambda (&rest arguments) (declare (ignore arguments)) application))
                     (list 'run-job--resolve-definition
                           (lambda (&rest arguments) (declare (ignore arguments)) definition))
+                    ;; Keep deadline coverage independent of installed user skills.
+                    (list 'skill-roots
+                          (lambda (configuration)
+                            (list (merge-pathnames "skills/" (config :config-root configuration)))))
                     (list 'task-job--compact-result
                           (lambda (result &key artifact-available-p)
                             (let ((compact (funcall compact-result-function result
