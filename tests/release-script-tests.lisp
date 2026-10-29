@@ -21,6 +21,13 @@
     (write-string content stream))
   pathname)
 
+(-> release-script-tests--host-command (string) string)
+(defun release-script-tests--host-command (name)
+  "Resolve and shell-quote host command NAME before fixture PATH overrides."
+  (test-fixture-shell-quote
+   *platform*
+   (namestring (release-archive--command-pathname name))))
+
 (-> test-build-sandbox-packaged-helpers () null)
 (defun test-build-sandbox-packaged-helpers ()
   "Build required helpers and export the selected Windows bundle to workers."
@@ -265,7 +272,9 @@ printf '~A\\n'
     (release-script-tests--write-file bwrap "#!/bin/sh
 exit 0
 ")
-    (release-script-tests--write-file chmod "#!/bin/sh
+    (release-script-tests--write-file
+     chmod
+     (format nil "#!/bin/sh
 recursive=
 if [ \"${1:-}\" = -R ]; then
   recursive=-R
@@ -277,12 +286,16 @@ if [ \"${1:-}\" = -- ]; then
   shift
 fi
 if [ -n \"$recursive\" ]; then
-  exec /bin/chmod \"$recursive\" \"$mode\" \"$@\"
+  exec ~A \"$recursive\" \"$mode\" \"$@\"
 else
-  exec /bin/chmod \"$mode\" \"$@\"
+  exec ~A \"$mode\" \"$@\"
 fi
-")
-    (release-script-tests--write-file move "#!/bin/sh
+"
+             (release-script-tests--host-command "chmod")
+             (release-script-tests--host-command "chmod")))
+    (release-script-tests--write-file
+     move
+     (format nil "#!/bin/sh
 force=
 no_target=false
 case ${1:-} in
@@ -294,14 +307,17 @@ if [ \"${1:-}\" = -- ]; then
   shift
 fi
 if [ \"$no_target\" = true ]; then
-  /bin/rm -f \"$2\"
+  ~A -f \"$2\"
 fi
 if [ -n \"$force\" ]; then
-  exec /bin/mv -f \"$@\"
+  exec ~A -f \"$@\"
 else
-  exec /bin/mv \"$@\"
+  exec ~A \"$@\"
 fi
-")
+"
+             (release-script-tests--host-command "rm")
+             (release-script-tests--host-command "mv")
+             (release-script-tests--host-command "mv")))
     (dolist (pathname (list uname ldd bwrap chmod move))
       (release-script-tests--chmod "755" pathname))
     directory))
@@ -1524,7 +1540,9 @@ esac
      uname
      (format nil "#!/bin/sh~%case ${1:-} in~%  -s) printf 'Darwin\\n' ;;~%  -m) printf '~A\\n' ;;~%  *) exit 64 ;;~%esac~%"
              architecture))
-    (release-script-tests--write-file chmod "#!/bin/sh
+    (release-script-tests--write-file
+     chmod
+     (format nil "#!/bin/sh
 recursive=
 if [ \"${1:-}\" = -R ]; then
   recursive=-R
@@ -1536,12 +1554,16 @@ if [ \"${1:-}\" = -- ]; then
   shift
 fi
 if [ -n \"$recursive\" ]; then
-  exec /bin/chmod \"$recursive\" \"$mode\" \"$@\"
+  exec ~A \"$recursive\" \"$mode\" \"$@\"
 else
-  exec /bin/chmod \"$mode\" \"$@\"
+  exec ~A \"$mode\" \"$@\"
 fi
-")
-    (release-script-tests--write-file move "#!/bin/sh
+"
+             (release-script-tests--host-command "chmod")
+             (release-script-tests--host-command "chmod")))
+    (release-script-tests--write-file
+     move
+     (format nil "#!/bin/sh
 force=
 if [ \"${1:-}\" = -f ]; then
   force=-f
@@ -1551,11 +1573,13 @@ if [ \"${1:-}\" = -- ]; then
   shift
 fi
 if [ -n \"$force\" ]; then
-  exec /bin/mv -f \"$@\"
+  exec ~A -f \"$@\"
 else
-  exec /bin/mv \"$@\"
+  exec ~A \"$@\"
 fi
-")
+"
+             (release-script-tests--host-command "mv")
+             (release-script-tests--host-command "mv")))
     (dolist (command (list uname chmod move))
       (release-script-tests--chmod "755" command))
     directory))
