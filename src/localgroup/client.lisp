@@ -924,6 +924,45 @@ controlling terminal."
             (localgroup-attach-record configuration entry mode)
             mode)))))))
 
+(defparameter *localgroup-kill-exit-timeout* 2
+  "Seconds to observe the selected PID after a successful localgroup kill response.")
+
+(-> localgroup--observe-kill-exit (t) (member :dead :alive :unknown))
+(defun localgroup--observe-kill-exit (pid)
+  "Observe PID until absence or a monotonic deadline; return its last state.
+PID liveness cannot establish process identity after PID reuse. Invalid PIDs
+and inspection failures yield :UNKNOWN, never confirmed exit."
+  (unless (typep pid '(integer 1 *))
+    (return-from localgroup--observe-kill-exit ':unknown))
+  (let ((deadline (+ (get-internal-real-time)
+                     (* (max 0 *localgroup-kill-exit-timeout*)
+                        internal-time-units-per-second))))
+    (loop
+      (let* ((state     (handler-case (ls-compat.posix:process-state pid)
+                          (error () ':unknown)))
+             (remaining (/ (- deadline (get-internal-real-time))
+                           internal-time-units-per-second)))
+        (when (or (eq state ':dead) (<= remaining 0))
+          (return state))
+        (sleep (min 0.05 remaining))))))
+
+(-> localgroup--check-kill-exit (t) null)
+(defun localgroup--check-kill-exit (pid)
+  "Report incomplete or uncertain exit using only the selected record's PID."
+  (case (localgroup--observe-kill-exit pid)
+    (:dead
+     nil)
+    (:alive
+     (error 'localgroup-error
+            :operation ':kill
+            :message   (format nil "Could not confirm session exit: recorded PID ~D is still present (possibly reused); its conversation may stay locked."
+                               pid)))
+    (otherwise
+     (error 'localgroup-error
+            :operation ':kill
+            :message   (format nil "Could not confirm session exit for recorded PID ~S; its conversation may stay locked."
+                               pid)))))
+
 (-> localgroup--operation-command (string string keyword) clingon:command)
 (defun localgroup--operation-command (name description operation)
   "Return a single-session localgroup OPERATION sub-command definition."
@@ -939,10 +978,12 @@ controlling terminal."
                 :message   (format nil "localgroup ~A accepts at most one session identifier." name)
                 :operation ':arguments))
        (let* ((configuration (localgroup--client-configuration))
-              (entry         (localgroup--session-record configuration (first arguments))))
-         (localgroup--print-response
-          (localgroup-query-record entry operation)
-          *standard-output*))))))
+              (entry         (localgroup--session-record configuration (first arguments)))
+              (pid           (getf (rest (rest entry)) :pid))
+              (response      (localgroup-query-record entry operation)))
+         (localgroup--print-response response *standard-output*)
+         (when (eq operation ':kill)
+           (localgroup--check-kill-exit pid)))))))
 
 (-> main-localgroup-command () clingon:command)
 (defun main-localgroup-command ()

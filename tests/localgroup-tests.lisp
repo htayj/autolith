@@ -292,6 +292,9 @@
         (test-call-with-function-replacements
          (list
           (list 'localgroup--client-configuration (lambda () configuration))
+          ;; Routing tests model already exited fixture processes.
+          (list 'ls-compat.posix:process-state
+                (lambda (pid) (declare (ignore pid)) ':dead))
           (list 'daemon-call
                 (lambda (port token operation &key arguments)
                   (declare (ignore token))
@@ -425,6 +428,9 @@
         (test-call-with-function-replacements
          (list
           (list 'localgroup--client-configuration (lambda () configuration))
+          ;; Prefix routing uses fixture records whose processes have exited.
+          (list 'ls-compat.posix:process-state
+                (lambda (pid) (declare (ignore pid)) ':dead))
           (list 'localgroup-query-record
                 (lambda (entry operation &optional arguments)
                   (let ((session-id (localgroup--record-session-id (rest entry))))
@@ -1294,4 +1300,132 @@
                                          '(:crash-capsule "/tmp/capsule.sexp")))
                      (format nil "a ~(~A~) exit relays ~:[no details~;its crash capsule~]"
                              kind (eq kind :fatal))))))
+  nil)
+
+(-> test-localgroup-kill-exit-observation () null)
+(defun test-localgroup-kill-exit-observation ()
+  "Observe bounded PID snapshots without inferring identity or treating errors as exit."
+  (let ((calls                          0)
+        (state                          ':alive)
+        (*localgroup-kill-exit-timeout* 0))
+    (test-call-with-function-replacements
+     (list (list 'ls-compat.posix:process-state
+                 (lambda (pid)
+                   (test-assert (= pid 42) "only the positive recorded PID is probed")
+                   (incf calls)
+                   (cond
+                     ((eq state ':error)
+                      (error "Inspection failed."))
+                     ((eq state ':exiting)
+                      (if (< calls 3) ':unknown ':dead))
+                     (t
+                      state)))))
+     (lambda ()
+       (dolist (pid '(nil 0 -1 "42" 1/2))
+         (test-assert (eq ':unknown (localgroup--observe-kill-exit pid))
+                      "invalid PIDs yield uncertainty"))
+       (test-assert (zerop calls) "invalid PIDs never reach the process probe")
+       (dolist (case '((:alive :alive) (:dead :dead) (:unknown :unknown)
+                       (:error :unknown)))
+         (setf state (first case) calls 0)
+         (test-assert (eq (second case) (localgroup--observe-kill-exit 42))
+                      "zero budget returns one immediate observation, including uncertainty")
+         (test-assert (= 1 calls) "zero budget never polls again"))
+       (let ((*localgroup-kill-exit-timeout* 1)
+             (start                          (get-internal-real-time)))
+         (setf state ':dead calls 0)
+         (test-assert (eq ':dead (localgroup--observe-kill-exit 42))
+                      "confirmed exit completes immediately")
+         (test-assert (and (= calls 1)
+                           (< (/ (- (get-internal-real-time) start)
+                                 internal-time-units-per-second) 0.5))
+                      "confirmed exit does not consume the observation budget"))
+       (let ((*localgroup-kill-exit-timeout* 1))
+         (setf state ':exiting calls 0)
+         (test-assert (eq ':dead (localgroup--observe-kill-exit 42))
+                      "uncertain observations may resolve to confirmed absence")
+         (test-assert (= calls 3) "observation stops at the first confirmed absence"))
+       (let ((*localgroup-kill-exit-timeout* 0.02)
+             (start                          (get-internal-real-time)))
+         (setf state ':alive calls 0)
+         (test-assert (eq ':alive (localgroup--observe-kill-exit 42))
+                      "a live PID remains a snapshot, including possible PID reuse")
+         (test-assert (>= calls 2) "the PID is observed again at the deadline")
+         (test-assert (< (/ (- (get-internal-real-time) start)
+                            internal-time-units-per-second) 0.5)
+                      "a short budget caps sleep rather than using a full default interval")))))
+  nil)
+
+(-> test-localgroup-kill-cli-outcomes () null)
+(defun test-localgroup-kill-cli-outcomes ()
+  "Dispatch real kill CLI/protocol handling and report incomplete or uncertain outcomes."
+  (with-test-configuration (configuration root)
+    (declare (ignore root))
+    (let ((pid                            42)
+          (state                          ':alive)
+          (reply                          ':ok)
+          (probes                         nil)
+          (*localgroup-kill-exit-timeout* 0)
+          (*standard-output*              (make-string-output-stream))
+          (*error-output*                 (make-string-output-stream)))
+      (test-call-with-function-replacements
+       (list
+        (list 'uiop:quit (lambda (status &optional finish-output-p)
+                          (declare (ignore finish-output-p))
+                          (throw 'kill-cli-exit status)))
+        (list 'localgroup--client-configuration (lambda () configuration))
+        (list 'localgroup--session-record
+              (lambda (client selector)
+                (declare (ignore client selector))
+                (cons #P"unused.sexp"
+                      (list :localgroup-endpoint :session-id "abcdef012345"
+                            :pid pid :port 1234 :token "test"))))
+        (list 'daemon-call
+              (lambda (port token operation &key arguments)
+                (declare (ignore port token arguments))
+                (if (eq reply ':transport-error)
+                    (error "Transport failed.")
+                    (list reply :operation operation :session-id "abcdef012345"
+                          :message "Rejected."))))
+        (list 'localgroup--remove-stale-record
+              (lambda (path record) (declare (ignore path record)) nil))
+        (list 'ls-compat.posix:process-state
+              (lambda (actual-pid)
+                (push actual-pid probes)
+                (if (eq state ':error) (error "Inspection failed.") state))))
+       (lambda ()
+         (labels ((invoke ()
+                    "Return the structured failure, or NIL on confirmed exit."
+                    (let ((command (parse-command-line
+                                    (main--top-level-command) '("lg" "kill"))))
+                      (handler-case (progn (funcall (command-handler command) command) nil)
+                        (localgroup-error (condition) condition))))
+
+                  (invoke-main ()
+                    "Return the real CLI exit status without terminating the test worker."
+                    (catch 'kill-cli-exit
+                      (main '("lg" "kill"))
+                      0)))
+           (dolist (case '((42 :alive) (42 :unknown) (nil :alive) (0 :alive) (-1 :alive)))
+             (setf pid (first case) state (second case) probes nil)
+             (let ((condition (invoke)))
+               (test-assert (and condition (eq ':kill (daemon-error-operation condition)))
+                            "incomplete or uncertain exit fails through the CLI condition path")
+               (when condition
+                 (test-assert (search (write-to-string pid) (autolith-error-message condition))
+                              "the diagnostic names the selected record's actual PID"))
+               (test-assert (equal probes (and (typep pid '(integer 1 *)) (list pid)))
+                            "only positive recorded PIDs are inspected")))
+           (dolist (observed-state '(:alive :unknown :error))
+             (setf pid 42 state observed-state probes nil)
+             (test-assert (= 64 (invoke-main))
+                          "unconfirmed exit reaches the CLI's nonzero status"))
+           (setf pid 42 state ':dead probes nil)
+           (test-assert (null (invoke)) "confirmed absence permits the normal successful return")
+           (test-assert (equal probes '(42)) "successful exit requires process evidence")
+           (test-assert (zerop (invoke-main)) "confirmed absence reaches successful CLI return")
+           (dolist (response '(:error :transport-error))
+             (setf reply response probes nil)
+             (test-assert (invoke) "rejected or failed requests retain their failure path")
+             (test-assert (null probes) "failed kill responses do not start exit observation")))))))
   nil)
