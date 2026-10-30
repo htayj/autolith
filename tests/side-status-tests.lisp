@@ -153,6 +153,43 @@
                                         :if-does-not-exist        ':ignore))))
   nil)
 
+(-> test-side-status-computed-arguments () null)
+(defun test-side-status-computed-arguments ()
+  "Retain ordinary Lisp effects when a status selector requires evaluation."
+  (multiple-value-bind (application root)
+      (lisp-machine-tests--application)
+    (unwind-protect
+         (let ((conversation (application-conversation application)))
+           (dolist (case '(("(btw (progn (write-line \"computed selector output\") :focus))"
+                            :continue :ok)
+                           ("(side (progn (write-line \"computed selector output\") :invalid))"
+                            :aborted :aborted)))
+             (destructuring-bind (source action status) case
+               (test-assert
+                (and (not (application-side-status-source-p application source))
+                     (eq (application-operation-source-active-turn-action application source)
+                         ':hold))
+                "computed selectors use the serialized ordinary Lisp path")
+               (test-assert
+                (eq (application-run-lisp-input application source :interactive-p nil) action)
+                "computed selectors execute with the ordinary Lisp outcome")
+               (let ((record (first (last (conversation-user-operation-snapshot conversation)))))
+                 (test-assert
+                  (and (equal (getf (rest record) :source) source)
+                       (eq (getf (rest record) :status) status)
+                       (search "computed selector output" (getf (rest record) :result)))
+                  "argument output and outcome are retained with their Lisp source"))))
+           (test-assert (= (length (side-status-tests--records conversation)) 1)
+                        "the successful computed call also retains its display-only status")
+           (test-assert
+            (equal (conversation-user-operation-snapshot conversation)
+                   (conversation-user-operation-snapshot
+                    (conversation-load (conversation-pathname conversation))))
+            "computed argument effects survive conversation reload"))
+      (platform-delete-directory-tree *platform* root :validate t
+                                      :if-does-not-exist        ':ignore)))
+  nil)
+
 (-> test-side-status-policies-and-validation () null)
 (defun test-side-status-policies-and-validation ()
   "Resolve native aliases and busy policy, and reject corrupt display records."

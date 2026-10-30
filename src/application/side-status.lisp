@@ -11,7 +11,7 @@
 
 (-> application-side-status-source-p (application string) boolean)
 (defun application-side-status-source-p (application source)
-  "Recognize a top-level status call without evaluating its argument forms."
+  "Recognize a top-level status call whose argument forms are immediate data."
   (handler-case
       (let* ((*package* (find-package '#:autolith))
              (form      (self-read-form source :read-eval nil))
@@ -19,6 +19,7 @@
                              (symbolp (first form))
                              (application-operation-find application (first form)))))
         (and (typep operation 'application-command-operation)
+             (application-operation-immediate-arguments-p operation (rest form))
              (application-side-status-command-p
               (application-operation-backend operation))))
     (error ()

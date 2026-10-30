@@ -1436,6 +1436,7 @@
 (define-test-suite side-status
   test-side-status-snapshot
   test-side-status-history-and-context
+  test-side-status-computed-arguments
   test-side-status-policies-and-validation
   test-side-status-message-jumps)
 
