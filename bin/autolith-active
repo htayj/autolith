@@ -34,6 +34,8 @@
                    (pushnew profile-library-directory
                             (symbol-value library-directories)
                             :test #'equal)))
+               ;; A runtime registry can also list a packaged Autolith; this checkout must win.
+               (push source-root asdf:*central-registry*)
                (asdf:load-asd (merge-pathnames "autolith.asd" source-root))
                (asdf:load-system :autolith)
                (setf main (list (symbol-function (find-symbol "MAIN" "AUTOLITH"))
