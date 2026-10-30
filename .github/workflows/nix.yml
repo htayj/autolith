@@ -27,7 +27,7 @@ jobs:
             runner: ubuntu-24.04
             architecture: x86_64
           - name: macOS arm64
-            runner: macos-14
+            runner: macos-15
             architecture: arm64
     steps:
       - uses: actions/checkout@v5
