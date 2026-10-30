@@ -496,3 +496,51 @@
                              (position ':job-state order)))
                      "the compaction status precedes reading job state"))))
   nil)
+
+(-> test-compaction-child-owner-receipts () null)
+(defun test-compaction-child-owner-receipts ()
+  "Read both child depths from task storage and reject a same-ID primary."
+  (with-test-configuration (configuration)
+    (let* ((root    (conversation-create configuration :identifier "sibling-root"))
+           (agent   (make-instance 'agent :configuration configuration :conversation root))
+           (runtime (task-orchestrator-create))
+           (parent  agent))
+      (unwind-protect
+           (dotimes (index 2)
+             (let* ((job         (task-tests--make-job runtime :identifier "sibling-child" :parent-agent parent
+                                                     :root-identifier (task-parent-root-conversation-identifier parent)))
+                    (owner       (task-job-execution-identifier job))
+                    (child       (conversation-create configuration :identifier owner
+                                                      :storage-root             (task--artifact-root configuration job)))
+                    (child-agent (make-instance 'task-child-agent :configuration configuration
+                                               :conversation child :job job :depth (1+ index)))
+                    (receipt     "completion:sibling-work"))
+               (conversation-append-user-message child "Completed." :pending-input-identifier receipt)
+               (test-assert (equal "sibling-root" (task-parent-root-conversation-identifier child-agent))
+                            "nested children retain original root identity")
+               (test-assert (member receipt (task-unfinished-work--owner-receipts child-agent owner) :test #'equal)
+                            "current child retains live receipt fast path")
+               (test-assert (member receipt (task-unfinished-work--owner-receipts agent owner) :test #'equal)
+                            "root viewer resolves child owner durable receipts at both depths")
+               (let ((foreign (conversation-create configuration :identifier owner)))
+                 (conversation-append-user-message foreign "Foreign." :pending-input-identifier "completion:foreign")
+                 (test-assert (not (member "completion:foreign" (task-unfinished-work--owner-receipts agent owner)
+                                          :test #'equal))
+                              "same-ID primary transcript cannot hide unfinished child work"))
+               (let* ((entry    (list :record (list :completion-owner-conversation owner :execution-id "sibling-work"
+                                                    :detached-p t :id "sibling-job")))
+                      (receipts (task-unfinished-work--owner-receipts agent owner)))
+                 (test-assert (null (task-unfinished-work--row entry :viewer "sibling-root" :receipts receipts))
+                              "delivered detached work disappears from unfinished projection"))
+               (with-open-file (s (conversation-log-pathname child) :direction :output :if-exists :append)
+                 (write-string "(:message :seq 2 :role)" s))
+               (test-assert (null (handler-case (task-unfinished-work--owner-receipts agent owner) (error () nil)))
+                            "invalid tail invalidates durable sibling evidence")
+               (test-assert (task-unfinished-work--row
+                             (list :record (list :completion-owner-conversation owner
+                                                 :execution-id "unknown-work" :detached-p t))
+                             :viewer "sibling-root" :receipts nil)
+                            "unknown detached work stays in unfinished projection")
+               (setf parent child-agent)))
+        (task-orchestrator-close runtime))))
+  nil)

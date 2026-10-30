@@ -394,6 +394,82 @@ matches signal a TASK-ERROR naming the candidates."
                "conversation"))
    (config :data-root configuration)))
 
+(-> task--owner-component-p (t) boolean)
+(defun task--owner-component-p (value)
+  "Accept finite opaque task owner identifiers before constructing storage paths."
+  (and (stringp value) (<= 1 (length value) 128)
+       (every (lambda (character)
+                (find character "-_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                      :test #'char=)) value)
+       t))
+
+(-> task--safe-owner-path (configuration pathname) pathname)
+(defun task--safe-owner-path (configuration path)
+  "Reject links and special-file ancestors within configured private storage."
+  (let ((root (uiop:ensure-directory-pathname (config :data-root configuration))))
+    (unless (uiop:subpathp path root)
+      (error 'task-error :message "Task owner path escaped private storage."))
+    (loop for current = path then (uiop:pathname-parent-directory-pathname current)
+          while (and current (uiop:subpathp current root))
+          for status = (platform-path-status *platform* current :follow-links-p nil)
+          when (and status
+                    (not (eq (platform-file-status-kind status)
+                             (if (and (equal current path)
+                                      (not (uiop:directory-pathname-p path)))
+                                 :file :directory))))
+            do (error 'task-error :message "Task owner storage contains a link or special file.")
+          when (equal current root) do (return)))
+  path)
+
+(-> task--owner-conversation-identity (configuration t t) pathname)
+(defun task--owner-conversation-identity (configuration root owner)
+  "Resolve exact OWNER storage under ROOT, without falling back from task to primary storage."
+  (unless (every #'task--owner-component-p (list root owner))
+    (error 'task-error :message "Invalid task owner conversation identifier."))
+  (task--safe-owner-path
+   configuration
+   (if (equal owner root)
+       (conversation-pathname-for-id configuration owner)
+       (merge-pathnames (make-pathname :name owner :type "sexp")
+                        (merge-pathnames (format nil "~A/" owner)
+                                         (task--artifact-group-root configuration root))))))
+
+(-> task--owner-receipts (configuration t t &key (:cache (option hash-table))) list)
+(defun task--owner-receipts (configuration root owner &key cache)
+  "Read detached receipts from one fully validated physical owner segment.
+Version-2 checkpoint headers restate all preceding identifiers; v1 uses its
+identity file. Publish nothing until the complete selected segment validates.
+CACHE, when supplied, belongs to one caller snapshot, including negative reads."
+  (handler-case
+      (let* ((identity (task--owner-conversation-identity configuration root owner))
+             (key      (namestring identity)))
+        (multiple-value-bind (receipts present-p) (and cache (gethash key cache))
+          (if present-p
+              receipts
+              (let ((result
+                      (handler-case
+                          (progn
+                            (task--safe-owner-path configuration
+                                                  (conversation-storage-directory-pathname identity))
+                            (let ((active (conversation-storage-active-pathname identity)))
+                              (when active
+                                (task--safe-owner-path configuration active)
+                                (let* ((header       (conversation--peek-segment-header active))
+                                       (conversation (conversation--from-header identity active header))
+                                       (found        (copy-list (conversation-pending-input-identifiers conversation))))
+                                  (conversation--map-segment-records
+                                   identity active
+                                   (lambda (record)
+                                     (when (eq (first record) :message)
+                                       (let ((receipt (getf (rest record) :pending-input-identifier)))
+                                         (when (non-empty-string-p receipt)
+                                           (pushnew receipt found :test #'equal))))))
+                                  found))))
+                        (error () nil))))
+                (when cache (setf (gethash key cache) result))
+                result))))
+    (error () nil)))
+
 (-> task--artifact-field
     (t keyword &key (:preview-limit integer)
                     (:artifact-available-p boolean))
