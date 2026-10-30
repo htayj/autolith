@@ -152,7 +152,7 @@
                            (json-encode (json-object "version" 1 "source" "https://private.invalid/"
                                                      "fetched_at" 0 "body" body))
                            (json-encode (json-object "version" 1 "source" *model-catalog-source*
-                                                     "fetched_at" (1+ (get-universal-time)) "body" body))
+                                                     "fetched_at" (+ (get-universal-time) 86400) "body" body))
                            (json-encode (json-object "version" 1 "source" *model-catalog-source*
                                                      "fetched_at" 0 "body" "{}"))))
          (telemetry-shutdown)
