@@ -311,11 +311,11 @@ Disable measurement until resource resolution has checked ancestor ownership."
        (or (null (getf metadata :job-id))
            (null (getf metadata :captures))
            (shell-log--sync-delivered-p configuration metadata)
-           (member (task-completion--receipt (getf metadata :execution-id))
-                   (task--owner-receipts configuration (getf metadata :root-conversation)
-                                         (getf metadata :completion-owner-conversation)
-                                         :cache *shell-log-receipt-cache*)
-                   :test #'equal))
+           (let ((receipts (task--owner-receipts configuration (getf metadata :root-conversation)
+                                                (getf metadata :completion-owner-conversation)
+                                                :cache *shell-log-receipt-cache*)))
+             (and receipts
+                  (gethash (task-completion--receipt (getf metadata :execution-id)) receipts))))
        t))
 
 (-> shell-log--manifest-staging-p (pathname) boolean)

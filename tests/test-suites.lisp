@@ -158,6 +158,7 @@
   test-shell-log-receipt-rotation
   test-shell-log-receipt-validation
   test-shell-log-receipt-pressure
+  test-shell-log-receipt-large-history
   test-shell-log-private-allocation
   test-shell-log-child-delivery
   test-shell-log-byte-windows-and-search
