@@ -300,6 +300,9 @@ Disable measurement until resource resolution has checked ancestor ownership."
                nil))
            t))))
 
+(defparameter *shell-log-receipt-cache* nil
+  "Exact owner receipt snapshots, freshly bound for each prune; NIL means uncached.")
+
 (-> shell-log--prunable-p (configuration pathname list) boolean)
 (defun shell-log--prunable-p (configuration directory metadata)
   "Protect active captures and undelivered job completion evidence."
@@ -308,13 +311,11 @@ Disable measurement until resource resolution has checked ancestor ownership."
        (or (null (getf metadata :job-id))
            (null (getf metadata :captures))
            (shell-log--sync-delivered-p configuration metadata)
-           (handler-case
-               (let* ((owner        (getf metadata :completion-owner-conversation))
-                      (conversation (and owner (conversation-replay-load configuration owner))))
-                 (and conversation
-                      (task-completion--delivered-p conversation (getf metadata :execution-id))))
-             (error ()
-               nil)))
+           (member (task-completion--receipt (getf metadata :execution-id))
+                   (task--owner-receipts configuration (getf metadata :root-conversation)
+                                         (getf metadata :completion-owner-conversation)
+                                         :cache *shell-log-receipt-cache*)
+                   :test #'equal))
        t))
 
 (-> shell-log--manifest-staging-p (pathname) boolean)
@@ -355,7 +356,7 @@ Disable measurement until resource resolution has checked ancestor ownership."
                  for metadata = (shell-log--scan-manifest configuration directory)
                  when (eq (getf metadata :state) ':pruned)
                    collect (list directory metadata)))
-         (count (length entries)))
+         (count                     (length entries)))
     (dolist (entry (sort entries #'< :key (lambda (entry) (getf (second entry) :pruned-at 0))))
       (destructuring-bind (directory metadata) entry
         (when (or (> count *shell-log-tombstone-count-limit*)
@@ -378,13 +379,14 @@ Disable measurement until resource resolution has checked ancestor ownership."
 (defun shell-log--prune (configuration &key (reservation 0))
   "Reserve finite storage, pruning only closed receipt-backed captures.
 Keep manifests as tombstones so old references have truthful diagnostics."
-  (let* ((entries
+  (let* ((*shell-log-receipt-cache* (make-hash-table :test #'equal))
+         (entries
            (loop for directory in (shell-log--directories configuration)
                  for metadata = (shell-log--scan-manifest configuration directory)
                  when (and metadata (not (eq (getf metadata :state) ':pruned)))
                    collect (list directory metadata (getf metadata :accounted-bytes 0))))
-         (total (loop for entry in entries sum (third entry)))
-         (count (length entries)))
+         (total                     (loop for entry in entries sum (third entry)))
+         (count                     (length entries)))
     (dolist (entry (sort entries #'< :key (lambda (entry) (getf (second entry) :created-at 0))))
       (destructuring-bind (directory metadata accounted-bytes) entry
         (when (and (or (> (+ total reservation) *shell-log-retention-byte-limit*)

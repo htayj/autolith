@@ -80,21 +80,8 @@
   "Read exact OWNER receipts without loading, repairing or writing a conversation."
   (if (equal owner (conversation-identifier (agent-conversation agent)))
       (conversation-pending-input-identifiers (agent-conversation agent))
-      (let* ((identity (conversation-pathname-for-id (agent-configuration agent) owner))
-             (active   (conversation-storage-active-pathname identity))
-             (receipts nil))
-        (when active
-          (conversation--map-records
-           active
-           (lambda (record)
-             (case (first record)
-               (:conversation
-                (when (equal owner (getf (rest record) :id))
-                  (setf receipts (copy-list (getf (rest record) :pending-input-identifiers)))))
-               (:message
-                (let ((receipt (getf (rest record) :pending-input-identifier)))
-                  (when (stringp receipt) (pushnew receipt receipts :test #'equal))))))))
-        receipts)))
+      (task--owner-receipts (agent-configuration agent)
+                            (task-parent-root-conversation-identifier agent) owner)))
 
 (-> task-unfinished-work--row
     (list &key (:live (option session-job)) (:viewer string) (:receipts list)) (option list))

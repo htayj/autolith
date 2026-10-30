@@ -83,7 +83,10 @@
             (owner-job  (task-tests--make-job runtime :identifier "owner" :parent-agent parent
                                              :definition definition :item (list :task "fixture")))
             (child      (make-instance 'task-child-agent
-                                      :configuration configuration :conversation (conversation-create configuration)
+                                      :configuration configuration
+                                      :conversation  (conversation-create configuration
+                                                       :identifier   (task-job-execution-identifier owner-job)
+                                                       :storage-root (task--artifact-root configuration owner-job))
                                       :provider (agent-provider parent) :tool-registry (agent-tool-registry parent)
                                       :worker nil :definition definition :identity nil :depth 1
                                       :completion (make-instance 'task-completion) :orchestrator runtime :job owner-job)))

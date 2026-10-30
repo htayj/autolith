@@ -151,6 +151,13 @@
   test-shell-log-export-boundary)
 
 (define-test-suite shell-log-resource
+  test-shell-log-receipt-migration
+  test-shell-log-receipt-cache
+  test-shell-log-receipt-linked-segment
+  test-shell-log-receipt-owners
+  test-shell-log-receipt-rotation
+  test-shell-log-receipt-validation
+  test-shell-log-receipt-pressure
   test-shell-log-private-allocation
   test-shell-log-child-delivery
   test-shell-log-byte-windows-and-search
@@ -1419,6 +1426,7 @@
   test-async-lisp-output-concurrent-writes)
 
 (define-test-suite compaction-unfinished-work
+  test-compaction-child-owner-receipts
   test-compaction-job-state-bounds
   test-compaction-job-state-delivery
   test-compaction-job-state-exact-owner

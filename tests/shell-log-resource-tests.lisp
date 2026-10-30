@@ -744,3 +744,288 @@
           (when second-worker (lisp-worker-stop second-worker))
           (when first-worker (lisp-worker-stop first-worker))))))
   nil)
+
+
+;;;; -- Durable Completion Receipt Regressions --
+
+(-> shell-log-tests--receipt-append (conversation string) t)
+(defun shell-log-tests--receipt-append (conversation identifier)
+  "Persist a completion identifier through the production message boundary."
+  (conversation-append-user-message conversation "Completed."
+                                    :pending-input-identifier identifier :automatic-p t))
+
+(-> shell-log-tests--receipt-capture (configuration task-orchestrator conversation &key (:root string)) shell-log-artifact)
+(defun shell-log-tests--receipt-capture (configuration orchestrator conversation &key root)
+  "Publish one detached closed capture owned by CONVERSATION."
+  (let* ((job     (task-tests--make-job orchestrator :identifier "receipt-capture"
+                                                  :root-identifier root :detached-p t))
+         (context (make-instance 'tool-context :configuration configuration :worker nil
+                                             :conversation conversation)))
+    (setf (slot-value job 'completion-owner-conversation) (conversation-identifier conversation))
+    (let ((artifact (shell-log-allocate context :job job)))
+      (shell-log-tests--finish artifact #(65))
+      artifact)))
+
+(-> shell-log-tests--receipt-prunable (configuration shell-log-artifact) boolean)
+(defun shell-log-tests--receipt-prunable (configuration artifact)
+  "Query the production delivery disjunction for one closed fixture capture."
+  (shell-log--prunable-p configuration (shell-log-capture-directory artifact)
+                        (shell-log-artifact-metadata artifact)))
+
+(-> test-shell-log-receipt-owners () null)
+(defun test-shell-log-receipt-owners ()
+  "Recognize late root, child and nested-child receipts, never foreign authority."
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-active*             (make-hash-table :test #'equal))
+           (*shell-log-capture-byte-limit* 32)
+           (runtime                        (task-orchestrator-create))
+           (root                           (conversation-create configuration :identifier "receipt-root"))
+           (root-agent                     (make-instance 'agent :configuration configuration :conversation root))
+           (foreign                        (conversation-create configuration :identifier "receipt-foreign"))
+           (parent                         root-agent))
+      (unwind-protect
+           (dotimes (depth 3)
+             (let* ((job          (and (plusp depth)
+                                       (task-tests--make-job runtime :identifier "receipt-child"
+                                         :root-identifier "receipt-root" :parent-agent parent)))
+                    (owner        (if job (task-job-execution-identifier job) "receipt-root"))
+                    (conversation (if job
+                                      (conversation-create configuration :identifier owner
+                                        :storage-root                                (task--artifact-root configuration job)) root))
+                    (artifact     (shell-log-tests--receipt-capture configuration runtime conversation :root "receipt-root"))
+                    (receipt      (task-completion--receipt (getf (shell-log-artifact-metadata artifact) :execution-id))))
+               (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                            "unknown completion stays protected")
+               (shell-log-tests--receipt-append foreign receipt)
+               (when job
+                 (shell-log-tests--receipt-append (conversation-create configuration :identifier owner) receipt))
+               (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                            "foreign transcript including same-ID primary is not authority")
+               (shell-log-tests--receipt-append conversation "completion:wrong-execution")
+               (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                            "wrong execution receipt is not delivery")
+               (shell-log-tests--receipt-append conversation receipt)
+               (test-assert (shell-log-tests--receipt-prunable configuration artifact)
+                            "exact late receipt permits closed capture pruning at every depth")
+               (setf (getf (shell-log-artifact-metadata artifact) :state) :active)
+               (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                            "delivery never overrides active state")
+               (when job
+                 (setf parent (make-instance 'task-child-agent :configuration configuration
+                                            :conversation conversation :job job :depth depth)))))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> shell-log-tests--newest-receipts (pathname) list)
+(defun shell-log-tests--newest-receipts (identity)
+  "Independently verify the supported newest-segment persistence invariant."
+  (let* ((active   (conversation-storage-active-pathname identity))
+         (header   (conversation-peek-header active))
+         (receipts (copy-list (getf (rest header) :pending-input-identifiers))))
+    (conversation--from-header identity active header)
+    (conversation--map-segment-records
+     identity active
+     (lambda (record)
+       (when (eq (first record) :message)
+         (let ((receipt (getf (rest record) :pending-input-identifier)))
+           (when receipt (pushnew receipt receipts :test #'equal))))))
+    receipts))
+
+(-> test-shell-log-receipt-rotation () null)
+(defun test-shell-log-receipt-rotation ()
+  "Execute two real rotations with reloads for modern and genuine v1 storage."
+  (with-test-configuration (configuration)
+    (dolist (legacy-p '(nil t))
+      (let* ((conversation (conversation-create configuration :identifier (if legacy-p "legacy" "modern")))
+             (identity     (conversation-pathname conversation))
+             (receipts     '("completion:before" "completion:middle" "completion:after")))
+        (shell-log-tests--receipt-append conversation (first receipts))
+        (when legacy-p
+          (let ((forms (copy-tree (conversation--read-records (conversation-log-pathname conversation)))))
+            (setf (getf (rest (first forms)) :version) 1)
+            (remf (rest (first forms)) :pending-input-identifiers)
+            (conversation-identifier-migration--write-forms identity forms)
+            (platform-delete-directory-tree *platform* (conversation-storage-directory-pathname identity)
+                                            :validate t :if-does-not-exist :ignore))
+          (setf conversation (conversation-load identity))
+          (test-assert (member (first receipts) (conversation-pending-input-identifiers conversation) :test #'equal)
+                       "v1 reload accumulates receipts from messages")
+          (test-assert (member (first receipts) (shell-log-tests--newest-receipts identity) :test #'equal)
+                       "v1 identity segment contains accumulated message receipt"))
+        (loop for receipt in (rest receipts)
+              do (let ((old (conversation-storage-active-pathname identity)))
+                   (conversation-append-summary conversation "Real checkpoint")
+                   (test-assert (not (equal old (conversation-storage-active-pathname identity)))
+                                "production checkpoint rotates the physical segment")
+                   (test-assert
+                    (every (lambda (id) (member id (getf (rest (conversation-peek-header identity))
+                                                        :pending-input-identifiers) :test #'equal))
+                           (conversation-pending-input-identifiers conversation))
+                    "new checkpoint header restates every accumulated receipt")
+                   (setf conversation (conversation-load identity))
+                   (shell-log-tests--receipt-append conversation receipt)))
+        (test-assert (not (member (third receipts) (getf (rest (conversation-peek-header identity))
+                                                       :pending-input-identifiers) :test #'equal))
+                     "late receipt is deliberately absent from the header")
+        (test-assert (equal (sort (copy-list (conversation-pending-input-identifiers (conversation-load identity))) #'string<)
+                            (sort (shell-log-tests--newest-receipts identity) #'string<))
+                     "validated newest segment and full replay agree after two rotations"))))
+  nil)
+
+(-> test-shell-log-receipt-validation () null)
+(defun test-shell-log-receipt-validation ()
+  "Validate the whole segment before publishing any receipt, including its tail."
+  (with-test-configuration (configuration)
+    (let ((*shell-log-capture-byte-limit* 32)
+          (runtime                        (task-orchestrator-create)))
+      (unwind-protect
+           (dolist (kind '(:valid :header :v1 :torn :malformed :gap :checkpoint :identity :version :missing :owner :traversal))
+             (let* ((conversation (conversation-create configuration :identifier (string-downcase (symbol-name kind))))
+                    (artifact     (shell-log-tests--receipt-capture configuration runtime conversation
+                                   :root                                                                (conversation-identifier conversation)))
+                    (receipt      (task-completion--receipt (getf (shell-log-artifact-metadata artifact) :execution-id))))
+               (shell-log-tests--receipt-append conversation receipt)
+               (when (eq kind :header) (conversation-append-summary conversation "Header receipt"))
+               (let* ((path  (conversation-storage-active-pathname (conversation-pathname conversation)))
+                      (forms (copy-tree (conversation--read-records path))))
+                 (case kind
+                   (:v1
+                    (setf (getf (rest (first forms)) :version) 1)
+                    (remf (rest (first forms)) :pending-input-identifiers)
+                    (conversation-identifier-migration--write-forms (conversation-pathname conversation) forms)
+                    (platform-delete-directory-tree *platform*
+                      (conversation-storage-directory-pathname (conversation-pathname conversation))
+                      :validate t :if-does-not-exist ':ignore))
+                   (:owner
+                    (setf (getf (shell-log-artifact-metadata artifact) :completion-owner-conversation) nil))
+                   (:traversal
+                    (setf (getf (shell-log-artifact-metadata artifact) :completion-owner-conversation) "../foreign"))
+                   (:torn
+                    (with-open-file (s path :direction :output :if-exists :append)
+                      (write-string "(:message :seq " s)))
+                   (:malformed
+                    (with-open-file (s path :direction :output :if-exists :append)
+                      (write '(:message :seq 2 :role) :stream s) (terpri s)))
+                   (:gap
+                    (incf (getf (rest (second forms)) :seq))
+                    (conversation-identifier-migration--write-forms path forms))
+                   (:checkpoint
+                    (conversation-append-summary conversation "Checkpoint")
+                    (let* ((active  (conversation-storage-active-pathname (conversation-pathname conversation)))
+                           (rotated (conversation--read-records active)))
+                      (conversation-identifier-migration--write-forms active (list (first rotated)))))
+                   (:identity
+                    (setf (getf (rest (first forms)) :id) "another")
+                    (conversation-identifier-migration--write-forms path forms))
+                   (:version
+                    (setf (getf (rest (first forms)) :version) 999)
+                    (conversation-identifier-migration--write-forms path forms))
+                   (:missing
+                    (platform-delete-file *platform* path)))
+                 (test-assert (eq (not (null (shell-log-tests--receipt-prunable configuration artifact)))
+                                  (not (null (member kind '(:valid :header :v1 :torn)))))
+                              (format nil "whole-segment receipt validation: ~A" kind)))))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> test-shell-log-receipt-pressure () null)
+(defun test-shell-log-receipt-pressure ()
+  "Prune verified root/child receipts under pressure, retaining an unknown capture."
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-capture-byte-limit*    32)
+           (*shell-log-retention-count-limit* 3)
+           (runtime                           (task-orchestrator-create))
+           (root                              (conversation-create configuration :identifier "pressure-root"))
+           (child-job                         (task-tests--make-job runtime :identifier "pressure-child" :root-identifier "pressure-root"))
+           (child                             (conversation-create configuration :identifier (task-job-execution-identifier child-job)
+                                                                   :storage-root             (task--artifact-root configuration child-job))))
+      (unwind-protect
+           (let* ((unknown (shell-log-tests--receipt-capture configuration runtime root :root "pressure-root"))
+                  (first   (shell-log-tests--receipt-capture configuration runtime root :root "pressure-root"))
+                  (second  (shell-log-tests--receipt-capture configuration runtime child :root "pressure-root")))
+             (dolist (pair (list (cons first root) (cons second child)))
+               (shell-log-tests--receipt-append (rest pair)
+                 (task-completion--receipt (getf (shell-log-artifact-metadata (first pair)) :execution-id))))
+             (test-assert
+              (handler-case (progn (shell-log-tests--receipt-capture configuration runtime root :root "pressure-root") t)
+                (shell-log-error () nil))
+              "allocation under count pressure reclaims receipt-backed closed captures")
+             (test-assert (eq :closed (getf (shell-log--read-manifest configuration
+                                             (shell-log-capture-directory unknown)) :state))
+                          "pressure preserves genuinely unknown evidence"))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> test-shell-log-receipt-migration () null)
+(defun test-shell-log-receipt-migration ()
+  "Resolve a real migrated root alias through its authoritative canonical identity."
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-capture-byte-limit* 32)
+           (runtime                        (task-orchestrator-create))
+           (old                            "cb472f21-969d-48f5-9c1e-e793d19054b9")
+           (conversation                   (conversation-create configuration :identifier old)))
+      (unwind-protect
+           (let* ((artifact (shell-log-tests--receipt-capture configuration runtime conversation :root old))
+                  (receipt  (task-completion--receipt (getf (shell-log-artifact-metadata artifact) :execution-id))))
+             (shell-log-tests--receipt-append conversation receipt)
+             (let* ((entries   (conversation-identifier-migrate configuration))
+                    (entry     (conversation-identifier-migration--entry-for-old old entries))
+                    (canonical (getf entry :new)))
+               (test-assert (and canonical (not (equal old canonical))) "real migration publishes a new root identifier")
+               (test-assert (equal canonical (pathname-name (conversation-pathname-for-id configuration old)))
+                            "authoritative root lookup resolves the old alias")
+               (test-assert (shell-log-tests--receipt-prunable configuration artifact)
+                            "old capture metadata recognizes receipt in migrated root")))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> test-shell-log-receipt-cache () null)
+(defun test-shell-log-receipt-cache ()
+  "A new prune sees appended receipts after an earlier conservative cache miss."
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-capture-byte-limit*    32)
+           (*shell-log-retention-count-limit* 1)
+           (runtime                           (task-orchestrator-create))
+           (conversation                      (conversation-create configuration :identifier "cached-root")))
+      (unwind-protect
+           (let* ((artifact                  (shell-log-tests--receipt-capture configuration runtime conversation :root "cached-root"))
+                  (receipt                   (task-completion--receipt (getf (shell-log-artifact-metadata artifact) :execution-id)))
+                  (*shell-log-receipt-cache* (make-hash-table :test #'equal)))
+             (declare (special *shell-log-receipt-cache*))
+             (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                          "first lookup has no verified evidence")
+             (shell-log-tests--receipt-append conversation receipt)
+             (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                          "one prune-local snapshot may conservatively retain its negative result")
+             (let ((*shell-log-receipt-cache* nil))
+               (declare (special *shell-log-receipt-cache*))
+               (test-assert (shell-log-tests--receipt-prunable configuration artifact)
+                            "standalone lookup reads fresh delivery evidence"))
+             (test-assert (handler-case (progn (shell-log-tests--receipt-capture configuration runtime conversation :root "cached-root") t)
+                            (shell-log-error () nil))
+                          "new prune overrides a stale caller cache and admits replacement allocation"))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> test-shell-log-receipt-linked-segment () null)
+(defun test-shell-log-receipt-linked-segment ()
+  "Reject linked transcript segments even if the target contains exact receipts."
+  (with-test-configuration (configuration)
+    (with-test-fixture (':symbolic-links "completion receipt segment substitution")
+      (let* ((*shell-log-capture-byte-limit* 32)
+             (runtime                        (task-orchestrator-create))
+             (conversation                   (conversation-create configuration :identifier "linked-root")))
+        (unwind-protect
+             (let* ((artifact (shell-log-tests--receipt-capture configuration runtime conversation :root "linked-root"))
+                    (receipt  (task-completion--receipt (getf (shell-log-artifact-metadata artifact) :execution-id))))
+               (shell-log-tests--receipt-append conversation receipt)
+               (conversation-append-summary conversation "Header witness")
+               (let* ((active (conversation-storage-active-pathname (conversation-pathname conversation)))
+                      (target (merge-pathnames "foreign-segment.sexp" (config :data-root configuration))))
+                 (uiop:copy-file active target)
+                 (platform-delete-file *platform* active)
+                 (test-fixture-make-symbolic-link *platform* (namestring target) (namestring active))
+                 (test-assert (not (shell-log-tests--receipt-prunable configuration artifact))
+                              "linked receipt segment cannot authorize pruning")))
+          (task-orchestrator-close runtime)))))
+  nil)
