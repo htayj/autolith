@@ -2957,11 +2957,16 @@ later picker searches read it without scanning the log."
 
 (-> conversation--header-string-list-p (t) boolean)
 (defun conversation--header-string-list-p (value)
-  "Return true when VALUE is a finite proper list of nonempty strings."
+  "Return true when VALUE is a finite proper list of unique nonempty strings."
   (handler-case
       (and (listp value)
            (or (null value) (list-length value))
-           (every #'non-empty-string-p value)
+           (let ((seen (make-hash-table :test #'equal)))
+             (every (lambda (identifier)
+                      (and (non-empty-string-p identifier)
+                           (not (gethash identifier seen))
+                           (setf (gethash identifier seen) t)))
+                    value))
            t)
     (error ()
       nil)))
@@ -3078,9 +3083,6 @@ later picker searches read it without scanning the log."
                        (typep search-message-count '(integer 0))
                        (or (null preview) (stringp preview))
                        (conversation--header-string-list-p pending-identifiers)
-                       (= (length pending-identifiers)
-                          (length (remove-duplicates pending-identifiers
-                                                     :test #'string=)))
                        (conversation--header-record-list-p
                         user-operation-records ':user-operation)
                        (conversation--header-record-list-p

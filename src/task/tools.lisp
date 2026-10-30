@@ -434,9 +434,17 @@ matches signal a TASK-ERROR naming the candidates."
                         (merge-pathnames (format nil "~A/" owner)
                                          (task--artifact-group-root configuration root))))))
 
-(-> task--owner-receipts (configuration t t &key (:cache (option hash-table))) list)
+(-> task--receipt-index (list) hash-table)
+(defun task--receipt-index (receipts)
+  "Index exact durable RECEIPTS for constant-time delivery checks."
+  (let ((index (make-hash-table :test #'equal)))
+    (dolist (receipt receipts index)
+      (setf (gethash receipt index) t))))
+
+(-> task--owner-receipts
+    (configuration t t &key (:cache (option hash-table))) (option hash-table))
 (defun task--owner-receipts (configuration root owner &key cache)
-  "Read detached receipts from one fully validated physical owner segment.
+  "Index detached receipts from one fully validated physical owner segment.
 Version-2 checkpoint headers restate all preceding identifiers; v1 uses its
 identity file. Publish nothing until the complete selected segment validates.
 CACHE, when supplied, belongs to one caller snapshot, including negative reads."
@@ -456,14 +464,14 @@ CACHE, when supplied, belongs to one caller snapshot, including negative reads."
                                 (task--safe-owner-path configuration active)
                                 (let* ((header       (conversation--peek-segment-header active))
                                        (conversation (conversation--from-header identity active header))
-                                       (found        (copy-list (conversation-pending-input-identifiers conversation))))
+                                       (found        (task--receipt-index (conversation-pending-input-identifiers conversation))))
                                   (conversation--map-segment-records
                                    identity active
                                    (lambda (record)
                                      (when (eq (first record) :message)
                                        (let ((receipt (getf (rest record) :pending-input-identifier)))
                                          (when (non-empty-string-p receipt)
-                                           (pushnew receipt found :test #'equal))))))
+                                           (setf (gethash receipt found) t))))))
                                   found))))
                         (error () nil))))
                 (when cache (setf (gethash key cache) result))

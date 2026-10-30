@@ -75,16 +75,16 @@
            t)
     (type-error () nil)))
 
-(-> task-unfinished-work--owner-receipts (agent string) list)
+(-> task-unfinished-work--owner-receipts (agent string) (option hash-table))
 (defun task-unfinished-work--owner-receipts (agent owner)
-  "Read exact OWNER receipts without loading, repairing or writing a conversation."
+  "Index exact OWNER receipts without loading, repairing or writing a conversation."
   (if (equal owner (conversation-identifier (agent-conversation agent)))
-      (conversation-pending-input-identifiers (agent-conversation agent))
+      (task--receipt-index (conversation-pending-input-identifiers (agent-conversation agent)))
       (task--owner-receipts (agent-configuration agent)
                             (task-parent-root-conversation-identifier agent) owner)))
 
 (-> task-unfinished-work--row
-    (list &key (:live (option session-job)) (:viewer string) (:receipts list)) (option list))
+    (list &key (:live (option session-job)) (:viewer string) (:receipts (option hash-table))) (option list))
 (defun task-unfinished-work--row (entry &key live viewer receipts)
   "Project one owned ENTRY and coherent live state into references only."
   (let* ((record        (getf entry :record))
@@ -107,7 +107,7 @@
                      (or (and abandon-path (probe-file abandon-path))
                          (and (not (getf record :detached-p))
                               (member status '(:completed :failed :cancelled)))
-                         (member (task-completion--receipt identifier) receipts :test #'equal))))
+                         (and receipts (gethash (task-completion--receipt identifier) receipts)))))
       (list :job-id (getf record :job-id) :execution-id identifier
             :owner-conversation owner
             :status             (if (member status '(:queued :running :completed :failed :cancelled))
