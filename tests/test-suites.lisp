@@ -1433,6 +1433,12 @@
   test-compaction-unfinished-corrupt-replay
   test-agent-compaction-completed-during-request)
 
+(define-test-suite side-status
+  test-side-status-snapshot
+  test-side-status-history-and-context
+  test-side-status-policies-and-validation
+  test-side-status-message-jumps)
+
 (define-test-suite user-operation-context
   test-user-operation-persistence-and-context
   test-user-operation-bounds-and-validation

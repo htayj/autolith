@@ -421,7 +421,8 @@ truthful source of dimensions."
 (defparameter *application-prompt* "❯ "
   "The styled input prompt shown on the live editor row.")
 
-(defparameter *application-message-header-prefixes* '("❯ you" "● autolith" "> " "< ")
+(defparameter *application-message-header-prefixes*
+  '("❯ you" "● autolith" "> " "< " "◆ status")
   "The transcript prefixes opening user and assistant messages in either style.
 
 The fullscreen viewport jumps between these lines, so a reader can follow the
@@ -2599,6 +2600,8 @@ has no faithful invocation."
 (defun conversation-record-entry (application record)
   "Return the styled transcript entry represented by durable RECORD."
   (case (first record)
+    (:side-status
+     (copy-tree (getf (rest record) :spans)))
     (:message
      (let ((properties (rest record)))
        (when (eq (getf properties :role) :user)
@@ -2801,7 +2804,7 @@ rows."
             application canonical-name))))
     (:assistant-yield
      (typep (getf (rest record) :job-count) '(integer 1)))
-    (:summary
+    ((:summary :side-status)
      t)
     (otherwise
      nil)))

@@ -130,6 +130,12 @@
                   :time        (getf (rest record) :time)
                   :through-seq (getf (rest record) :through-seq)
                   :content     summary))))
+    (:side-status
+     (list ':side-status
+           :seq     (getf (rest record) :seq)
+           :time    (getf (rest record) :time)
+           :source  (getf (rest record) :source)
+           :content (terminal--spans-text (getf (rest record) :spans))))
     ((:async-lisp-delivered :provider)
      nil)
     (otherwise
@@ -256,6 +262,8 @@ whole history when a crash or retention boundary interrupted sequencing."
      (format stream "context compacted through sequence ~A~%~A~%"
              (getf (rest record) :through-seq)
              (or (getf (rest record) :content) "")))
+    (:side-status
+     (format stream "~A~%" (getf (rest record) :content)))
     (:user-operation
      (format stream "~A~%~@[~A~%~]"
              (or (getf (rest record) :source) "")
