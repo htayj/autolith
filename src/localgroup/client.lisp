@@ -56,6 +56,49 @@
              :session-id session-id))
     response))
 
+(-> localgroup-owner-reachability (pathname string (integer 1)) keyword)
+(defun localgroup-owner-reachability (pathname identifier owner-pid)
+  "Query one matching owner record without pruning, under a single two-second budget.
+
+Only definite record absence yields :NO-REACHABLE-ENDPOINT. Errors and identity
+mismatches yield :UNKNOWN; neither read nor transport creates or modifies records."
+  (handler-case
+      (sb-sys:with-deadline (:seconds 2)
+        (let ((before (platform-path-status *platform* pathname)))
+          (unless before
+            (return-from localgroup-owner-reachability ':no-reachable-endpoint))
+          (with-open-stream (stream (platform-open-regular-file *platform* pathname))
+            (unless (platform-file-status-same-object-p
+                     before (platform-stream-status *platform* stream))
+              (return-from localgroup-owner-reachability ':unknown))
+            (let* ((buffer (make-array 65537 :element-type '(unsigned-byte 8)))
+                   (count  (read-sequence buffer stream)))
+              (when (> count 65536)
+                (return-from localgroup-owner-reachability ':unknown))
+              (let* ((*read-eval* nil)
+                     (text        (utf8-octets-to-string (subseq buffer 0 count)))
+                     (eof         (gensym "EOF")))
+                (multiple-value-bind (record end)
+                    (read-from-string text nil eof)
+                  (unless (and (image-daemon:daemon-registry-record-p record)
+                               (eq (read-from-string text nil eof :start end) eof)
+                               (string= (localgroup--record-session-id record) identifier)
+                               (eql (getf (rest record) :pid) owner-pid))
+                    (return-from localgroup-owner-reachability ':unknown))
+                  (let* ((response (daemon-call (localgroup--record-port record)
+                                                (localgroup--record-token record) ':status))
+                         (status   (and (proper-list-p response)
+                                        (eq (first response) ':ok)
+                                        (getf (rest response) :status))))
+                    (if (and (proper-list-p status)
+                             (eq (first status) ':localgroup-status)
+                             (equal (getf (rest status) :session-id) identifier)
+                             (eql (getf (rest status) :pid) owner-pid))
+                        ':reachable
+                        ':unknown))))))))
+    ((or sb-sys:deadline-timeout error) ()
+      ':unknown)))
+
 (-> localgroup--session-prefix-p (string string) boolean)
 (defun localgroup--session-prefix-p (prefix session-id)
   "Return true when nonempty PREFIX matches SESSION-ID's canonical or displayed form."

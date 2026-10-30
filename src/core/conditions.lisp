@@ -413,7 +413,13 @@
     :initarg       :lease-pathname
     :reader        conversation-in-use-lease-pathname
     :type          pathname
-    :documentation "The process-shared lease file whose lock is held."))
+    :documentation "The process-shared lease file whose lock is held.")
+   (owner-pid
+    :initarg       :owner-pid
+    :initform      nil
+    :reader        conversation-in-use-owner-pid
+    :type          (option (integer 1))
+    :documentation "The observed lock owner PID, or NIL when it could not be identified."))
   (:documentation
    "A live Autolith process already owns the requested conversation."))
 

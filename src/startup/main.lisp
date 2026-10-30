@@ -1469,13 +1469,58 @@ autolith uninstall removes the installation and keeps user data."
        (funcall (command-handler command) command))))
   nil)
 
+(-> main--conversation-owner-record (conversation-in-use) (option pathname))
+(defun main--conversation-owner-record (condition)
+  "Locate only the exact sibling localgroup record from a structurally valid lease path."
+  (let* ((lease      (conversation-in-use-lease-pathname condition))
+         (identifier (conversation-in-use-identifier condition))
+         (directory  (pathname-directory lease)))
+    (when (and (eq (first directory) ':absolute)
+               (equal (first (last directory)) "conversation-leases")
+               (equal (pathname-name lease) identifier)
+               (equal (pathname-type lease) "lock"))
+      (make-pathname :directory (append (butlast directory) '("localgroup"))
+                     :name identifier :type "sexp" :defaults lease))))
+
+(-> main--startup-error-text (condition) string)
+(defun main--startup-error-text (condition)
+  "Enrich busy errors only at startup; failed diagnostics preserve the original error."
+  (let ((original (princ-to-string condition)))
+    (handler-case
+        (if (typep condition 'conversation-in-use)
+            (let ((pid (conversation-in-use-owner-pid condition)))
+              (cond
+                ((null pid)
+                 (format nil "~A The lock owner could not be identified. Recheck before retrying."
+                         original))
+                ((= pid (current-process-id))
+                 (format nil "~A This process holds the conversation lease." original))
+                (t
+                 (let* ((record       (main--conversation-owner-record condition))
+                        (reachability (if record
+                                          (localgroup-owner-reachability
+                                           record (conversation-in-use-identifier condition) pid)
+                                          ':unknown)))
+                   (format nil "~A Observed lock owner PID ~D. ~A" original pid
+                           (case reachability
+                             (:reachable
+                              "A matching localgroup endpoint is reachable; inspect or attach with autolith lg.")
+                             (:no-reachable-endpoint
+                              (format nil "No matching published localgroup endpoint was found. Inspect and recheck PID ~D; if you choose to stop it, run kill ~D, then retry. The owner may have changed since this snapshot." pid pid))
+                             (otherwise
+                              "Localgroup reachability is unknown. Inspect and recheck the observed PID before retrying; the owner may have changed since this snapshot.")))))))
+            original)
+      ((or sb-sys:deadline-timeout error) ()
+        original))))
+
 (-> main (list) null)
 (defun main (arguments)
   "Run the Autolith command described by ARGUMENTS with stable exit classification."
   (handler-case
       (main-dispatch arguments)
     ((or autolith-error cl-llm-provider-api:provider-api-error) (condition)
-      (format *error-output* "Autolith could not start: ~A~%" condition)
+      (format *error-output* "Autolith could not start: ~A~%"
+              (main--startup-error-text condition))
       (uiop:quit 64))
     ;; Ctrl-C outside the raw-mode terminal interface ends the command, after
     ;; unwinding its cleanup, with the shell's interrupt status.
