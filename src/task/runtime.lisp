@@ -1092,6 +1092,10 @@ values from either side of a terminal transition."
   "Cancel JOB and every retained descendant in its own pool."
   (multiple-value-bind (accepted-p cascaded)
       (job-cancel job :reason reason :cascade-p t)
+    (when accepted-p
+      (session-job-note-cancellation job reason))
+    (dolist (descendant cascaded)
+      (session-job-note-cancellation descendant reason))
     (values accepted-p
             (sort (mapcar #'session-job-identifier cascaded) #'string<))))
 
@@ -1125,6 +1129,10 @@ values from either side of a terminal transition."
                       task-identifiers)
             (multiple-value-bind (cancelled-p cascaded)
                 (job-cancel candidate :reason reason :cascade-p t)
+              (when cancelled-p
+                (session-job-note-cancellation candidate reason))
+              (dolist (descendant cascaded)
+                (session-job-note-cancellation descendant reason))
               (when cancelled-p
                 (push (session-job-identifier candidate)
                       cancelled-descendants))
