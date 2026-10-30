@@ -261,7 +261,11 @@ tables. The orchestrator owns cross-pool ordering, child naming, hurry-up policy
 nesting depth, and lifecycle listeners."))
 
 (defclass session-job (job)
-  ((orchestrator
+  ((cancellation-observation
+    :initform      nil
+    :accessor      session-job-cancellation-observation
+    :documentation "Autolith cancellation timing and once-only warning, under the orchestrator lock.")
+   (orchestrator
     :initarg       :orchestrator
     :reader        session-job-orchestrator
     :type          task-orchestrator

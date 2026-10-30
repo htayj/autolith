@@ -51,6 +51,24 @@ connected wakeup nothing would resume it, so nothing is awaited."
                      (task-completion-awaited-jobs agent)))
            t))))
 
+(-> application-job-completions--presentation-admissible-p
+    (application-input-controller &key (:session-locked-p boolean)) boolean)
+(defun application-job-completions--presentation-admissible-p (controller &key session-locked-p)
+  "Allow terminal notices only while this controller owns an unpaused session.
+
+Persistence and follow-up editing restrict inference, not terminal presentation."
+  (let ((application (application-input-controller-application controller)))
+    (and (slot-boundp application 'agent)
+         (typep (application-agent application) 'agent)
+         (not (application-input-controller-stopping-p controller))
+         (not (application-input-controller-failure controller))
+         (not (application-input-controller-localgroup-handoff-p controller))
+         (not (application-input-controller-queued-work-paused-p controller))
+         (not (if session-locked-p
+                  (let ((session (application-localgroup-session application)))
+                    (and session (localgroup-session-paused-p session)))
+                  (application-localgroup-paused-p application))))))
+
 (-> application-job-completions--controller-admissible-p
     (application-input-controller) boolean)
 (defun application-job-completions--controller-admissible-p (controller)
@@ -122,6 +140,15 @@ snapshot cannot change the meaning of an already finalized transcript entry."
     (application-input-controller) (option list))
 (defun application-job-completions--take-maintenance (controller)
   "Drain notification pressure without granting an inference or consuming admitted results."
+  (let* ((application (application-input-controller-application controller))
+         (agent       (and (slot-boundp application 'agent) (application-agent application)))
+         (scan-wait   (and agent (task-cancellation-scan-wait agent))))
+    (when (and (application-job-completions--presentation-admissible-p controller)
+               scan-wait (zerop scan-wait))
+      (return-from application-job-completions--take-maintenance
+        (list ':job-completion-maintenance
+              (list :conversation        (conversation-identifier (application-conversation application))
+                    :cancellation-scan-p t)))))
   (when (application-job-completions--controller-admissible-p controller)
     (let* ((application (application-input-controller-application controller))
            (agent       (application-agent application)))
@@ -136,6 +163,39 @@ snapshot cannot change the meaning of an already finalized transcript entry."
                         :events       (mapcar (lambda (notice) (getf notice :id))
                                               (subseq notices 0 (min (length notices) *task-completion-batch-limit*)))))))))))
 
+(-> application-job-completions--present-cancellations
+    (application-input-controller list) null)
+(defun application-job-completions--present-cancellations (controller ticket)
+  "Drain terminal warnings under controller, session, delivery, then UI locks.
+Scanning and wake callbacks run outside these locks. Pause/resume writers release
+session before acquiring controller; keep the same controller-to-session order
+as ordinary controller admission, without recursively locking the session."
+  (let* ((application (application-input-controller-application controller))
+         (session     (application-localgroup-session application)))
+    (flet ((present ()
+             (when (and (application-job-completions--presentation-admissible-p
+                         controller :session-locked-p t)
+                        (equal (getf ticket :conversation)
+                               (conversation-identifier (application-conversation application))))
+               (task-cancellation-present-pending
+                (application-agent application)
+                (lambda (notice)
+                  (application-present
+                   application
+                   (application--job-completion-entry
+                    application (list :job-completion notice :time (get-universal-time)))
+                   :identifier
+                   (application--record-presentation-identifier
+                    application (list :message :job-completion notice)))
+                  ;; Durable replay may already have emitted this identity.
+                  t)))))
+      (with-lock-held ((application-input-controller-lock controller))
+        (if session
+            (with-lock-held ((image-daemon:daemon-runtime-lock session))
+              (present))
+            (present)))))
+  nil)
+
 (-> application-job-completions-maintain (application-input-controller list) null)
 (defun application-job-completions-maintain (controller ticket)
   "Recheck a bounded maintenance ticket and free receipt-backed capacity without a provider turn."
@@ -143,17 +203,24 @@ snapshot cannot change the meaning of an already finalized transcript entry."
          (agent       (application-agent application))
          (admitted-p
            (with-lock-held ((application-input-controller-lock controller))
-             (and (application-job-completions--controller-admissible-p controller)
+             (and (if (getf ticket :cancellation-scan-p)
+                      (application-job-completions--presentation-admissible-p controller)
+                      (application-job-completions--controller-admissible-p controller))
                   (equal (getf ticket :conversation)
                          (conversation-identifier (application-conversation application)))))))
     (when admitted-p
+      (task-cancellation-maintain agent)
+      (application-job-completions--present-cancellations controller ticket)
       (let ((identifiers
               (loop for notice in (task-completion-pending agent)
-                    when (and (member (getf notice :id) (getf ticket :events) :test #'equal)
+                    when (and (not (eq (getf notice :kind) ':cancellation-warning))
+                              (member (getf notice :id) (getf ticket :events) :test #'equal)
                               (not (application-job-completions--notice-admissible-p application notice)))
                       collect (getf notice :id))))
         (when identifiers
-          (task-completion-deliver agent :identifiers identifiers)))))
+          (task-completion-deliver agent :identifiers identifiers)))
+      ;; Selected delivery can itself publish a newly due warning.
+      (application-job-completions--present-cancellations controller ticket)))
   nil)
 
 (-> application-job-completions--take-work
@@ -200,8 +267,9 @@ snapshot cannot change the meaning of an already finalized transcript entry."
       ;; Delivery may have won a busy request boundary after ticket construction.
       (when (some (lambda (notice)
                     (application-job-completions--notice-admissible-p application notice))
-                  (task-completion-deliver
-                   agent :identifiers (mapcar (lambda (notice) (getf notice :id)) notices)))
+                  (setf notices
+                      (task-completion-deliver
+                       agent :identifiers (mapcar (lambda (notice) (getf notice :id)) notices))))
         (let ((goal (application-goal application)))
           (when (and goal (or (not (mission-goal-p goal)) mission-authorized-p))
             (incf (getf goal :continuations 0))
@@ -213,7 +281,9 @@ snapshot cannot change the meaning of an already finalized transcript entry."
                     (application-input-controller--apply-pending-commands controller :agent owner)))
              (application--run-turn
               application
-              *application-job-completion-continuation-prompt*
+              (if (some (lambda (notice) (eq (getf notice :kind) ':cancellation-warning)) notices)
+                  *application-job-cancellation-continuation-prompt*
+                  *application-job-completion-continuation-prompt*)
               :continuation-p              t
               :steering-function           take
               :steering-persisted-function acknowledge

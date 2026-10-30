@@ -319,6 +319,13 @@
   test-job-completion-policy-transport)
 
 (define-test-suite job-completion-delivery
+  test-job-cancellation-warning-once
+  test-job-cancellation-warning-controller
+  test-job-completion-continuation-selection
+  test-job-cancellation-presentation-boundaries
+  test-job-cancellation-selected-delivery-presentation
+  test-job-cancellation-terminal-replay
+  test-job-cancellation-rejected-root-descendants
   test-job-completion-durable-delivery
   test-job-completion-delivery-crash-points
   test-job-completion-terminal-truth-and-reconstruction
