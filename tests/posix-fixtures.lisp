@@ -135,6 +135,208 @@
     (sb-sys:with-pinned-objects (buffer)
       (sb-posix:write descriptor (sb-sys:vector-sap buffer) 1))))
 
+#+linux
+(-> posix-fixture--output-poll (integer) integer)
+#+linux
+(defun posix-fixture--output-poll (descriptor)
+  "Return raw output poll flags without SBCL's readiness filtering."
+  (sb-alien:with-alien ((poll (sb-alien:struct sb-unix::pollfd)))
+    (setf (sb-alien:slot poll 'sb-unix::fd) descriptor
+          (sb-alien:slot poll 'sb-unix::events) sb-unix:pollout
+          (sb-alien:slot poll 'sb-unix::revents) 0)
+    (sb-unix::unix-poll (sb-alien:addr poll) 1 0)
+    (sb-alien:slot poll 'sb-unix::revents)))
+
+#+linux
+(-> posix-fixture--supervised-request-deadline (real) list)
+#+linux
+(defun posix-fixture--supervised-request-deadline (delay)
+  "Collect causal checks inside a disposable process, including failed cleanup."
+  (with-test-configuration (configuration root)
+    (declare (ignore configuration))
+    (let* ((script      (merge-pathnames "prefix-child.lisp" root))
+           (ready       (merge-pathnames "prefix.ready" root))
+           (record      (supervised-process-create))
+           (make-thread (symbol-function 'bt:make-thread))
+           (finished    (bt:make-semaphore))
+           (budget      1.0)
+           (result      ':unset)
+           (owner-error nil)
+           (owner       nil)
+           (reaped      nil)
+           (unavailable nil)
+           (raw-poll    nil)
+           (filtered    ':unset)
+           (complete-p  nil)
+           (started     nil)
+           (returned    nil))
+      (with-open-file (stream script :direction ':output :if-exists ':error)
+        (write-string
+         "(let ((bytes (make-array 4196 :element-type '(unsigned-byte 8))) (total 0))
+  (sb-sys:with-pinned-objects (bytes)
+    (loop while (< total 4196) do
+      (multiple-value-bind (count errno)
+          (sb-unix:unix-read 0 (sb-sys:sap+ (sb-sys:vector-sap bytes) total) (- 4196 total))
+        (cond ((and count (plusp count)) (incf total count))
+              ((eql errno sb-unix:eintr) nil)
+              (t (error \"prefix read failed\"))))))
+  (with-open-file (stream (merge-pathnames \"prefix.ready\" *load-truename*)
+                          :direction :output :if-exists :error)
+    (write total :stream stream)))
+(sleep 30)
+" stream))
+      (test-call-with-function-replacements
+       (list (list 'bt:make-thread
+                   (lambda (function &rest options)
+                     (apply make-thread
+                            (if (equal (getf options :name) "supervised subprocess I/O")
+                                (lambda () (sleep delay) (funcall function))
+                                function)
+                            options))))
+       (lambda ()
+         (setf started (get-internal-real-time)
+               owner
+               (funcall make-thread
+                        (lambda ()
+                          (unwind-protect
+                               (handler-case
+                                   (setf result
+                                         (supervised-process-request
+                                          record (make-string 1048576 :initial-element #\x)
+                                          :seconds  budget
+                                          :start
+                                          (lambda (install)
+                                            (let* ((process
+                                                     (uiop:launch-program
+                                                      (list (namestring sb-ext:*runtime-pathname*)
+                                                            "--noinform" "--no-sysinit" "--no-userinit"
+                                                            "--script" (namestring script))
+                                                      :input ':stream :output ':stream :error-output ':stream))
+                                                   (descriptor
+                                                     (sb-sys:fd-stream-fd (uiop:process-info-input process)))
+                                                   (capacity (sb-posix:fcntl descriptor 1032)))
+                                              (format t "~&PIPE capacity-before=~D~%" capacity)
+                                              ;; F_GETPIPE_SZ is 1032; F_SETPIPE_SZ is 1031 on Linux.
+                                              (unless (= capacity 8192)
+                                                (handler-case (sb-posix:fcntl descriptor 1031 8192)
+                                                  (sb-posix:syscall-error (condition)
+                                                    (setf unavailable
+                                                          (format nil "F_SETPIPE_SZ 8192: ~A (errno ~D)"
+                                                                  condition (sb-posix:syscall-errno condition)))
+                                                    (supervised-process-terminate process)
+                                                    (supervised-process--close-streams process)
+                                                    (error "~A" unavailable))))
+                                              (setf capacity (sb-posix:fcntl descriptor 1032))
+                                              (format t "~&PIPE capacity-after=~D~%" capacity)
+                                              (unless (= capacity 8192)
+                                                (supervised-process-terminate process)
+                                                (supervised-process--close-streams process)
+                                                (error "Expected 8192-byte pipe, got ~D." capacity))
+                                              (funcall install process)))
+                                          :active-p (lambda () (not (probe-file ready)))
+                                          :stop
+                                          (lambda (operation)
+                                            (supervised-process-stop operation)
+                                            (when (supervised-process-process operation)
+                                              (let* ((process (supervised-process-process operation))
+                                                     (descriptor
+                                                       (sb-sys:fd-stream-fd (uiop:process-info-input process))))
+                                                (setf reaped (uiop:wait-process process)
+                                                      raw-poll (posix-fixture--output-poll descriptor)
+                                                      filtered (sb-unix:unix-simple-poll descriptor :output 0)))))
+                                          :complete
+                                          (lambda (operation)
+                                            (setf complete-p
+                                                  (and (supervised-process-thread operation)
+                                                       (not (bt:thread-alive-p
+                                                             (supervised-process-thread operation)))
+                                                       (not (open-stream-p
+                                                             (uiop:process-info-input
+                                                              (supervised-process-process operation)))))))))
+                                 (error (condition) (setf owner-error condition)))
+                            (setf returned (get-internal-real-time))
+                            (bt:signal-semaphore finished)))
+                        :name "test supervised request owner"))
+         ;; A fresh budget after delayed scheduling would end near 1.5s, not 1.0s.
+         (let ((finished-p (bt:wait-on-semaphore finished :timeout (+ budget 0.25))))
+           (when finished-p (bt:join-thread owner))
+           (format t "~&PIPE delay=~F reaped=~S raw=~S filtered=~S returned=~S error=~S~%"
+                  delay reaped raw-poll filtered
+                  (and returned (/ (- returned started) internal-time-units-per-second)) owner-error)
+           (when unavailable
+             (return-from posix-fixture--supervised-request-deadline
+               (list :unavailable unavailable)))
+           (when owner-error (error owner-error))
+           (list :checks
+                  (list (null owner-error) "The 8192-byte pipe setup and request must execute.")
+                 (list (not (null (probe-file ready))) "The child consumed exactly 4196 raw bytes.")
+                 (list (eql reaped 137) "Stop killed and reaped the fixture child.")
+                 (list (eql raw-poll 8) "The readerless pipe reports raw ERR alone.")
+                 (list (null filtered) "SBCL filters ERR-only output readiness to NIL.")
+                 (list (not (null finished-p)) "The original owner returns within its original request budget.")
+                 (list (null result) "The timed out exchange returns NIL.")
+                 (list (not (null complete-p)) "Original cleanup joins I/O and abort-closes the input stream.")
+                 (list (not (bt:thread-alive-p owner)) "The request owner has exited.")
+                 (list (not (bt:thread-alive-p (supervised-process-thread record)))
+                       "The actual exchange I/O thread has exited."))))))))
+
+#-linux
+(defmethod test-fixture-supervised-request-deadline ((platform posix-platform) delay)
+  "Withhold the Linux pipe-sizing fixture on other POSIX hosts."
+  (declare (ignore platform delay))
+  (test-withheld ':posix-adapter "Linux supervised request pipe sizing"))
+
+#+linux
+(defmethod test-fixture-supervised-request-deadline ((platform posix-platform) delay)
+  "Replay checks from a bounded process, or explicitly withhold unavailable setup."
+  (with-test-configuration (configuration root)
+    (declare (ignore configuration))
+    (let* ((result-file (merge-pathnames "causal-result.sexp" root))
+           (pid         (progn (finish-output) (sb-posix:fork)))
+           (reaped      nil)
+           (status      nil))
+      (when (zerop pid)
+        (sb-posix:setpgid 0 0)
+        (let ((result
+                (handler-case (posix-fixture--supervised-request-deadline delay)
+                  (error (condition) (list :error (princ-to-string condition))))))
+          (with-open-file (stream result-file :direction ':output :if-exists ':error)
+            (let ((*print-readably* t)) (write result :stream stream)))
+          (finish-output)
+          ;; Do not unwind a failed owner's join or keep its spinning I/O thread.
+          (sb-posix:_exit 0)))
+      (unwind-protect
+           (progn
+             (loop with deadline = (+ (get-internal-real-time)
+                                     (* 4 internal-time-units-per-second))
+                   do (multiple-value-bind (waited code)
+                          (sb-posix:waitpid pid sb-posix:wnohang)
+                        (when (= waited pid)
+                          (setf reaped t status code)
+                          (return)))
+                   when (>= (get-internal-real-time) deadline) do (return)
+                   do (sleep 0.01))
+             (unless (and reaped (sb-posix:wifexited status)
+                          (zerop (sb-posix:wexitstatus status)))
+              (error "Supervised request fixture did not exit normally within four seconds."))
+             (let* ((*read-eval* nil)
+                    (result      (with-open-file (stream result-file) (read stream))))
+               (ecase (first result)
+                 (:error
+                  (error "Supervised request fixture error: ~A" (second result)))
+                 (:unavailable
+                  (let ((description (second result)))
+                    (format t "~&UNAVAILABLE ~A~%" description)
+                    (test-withheld ':pipe-resize description)))
+                 (:checks
+                  (dolist (check (rest result))
+                    (test-assert (first check) (second check)))))))
+        ;; The prefix child shares this dedicated group, including on setup failure.
+        (ignore-errors (sb-posix:kill (- pid) sb-posix:sigkill))
+        (unless reaped
+          (ignore-errors (sb-posix:kill pid sb-posix:sigkill))
+          (sb-posix:waitpid pid 0))))))
+
 (defmethod test-fixture-run-forked ((platform posix-platform) function)
   "Fork, run FUNCTION in the child, and reap the child."
   (declare (ignore platform))

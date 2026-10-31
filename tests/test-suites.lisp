@@ -118,6 +118,8 @@
   test-telemetry-worker-redactor-contract
   test-telemetry-worker-narratives
   test-telemetry-subprocess-deadlines
+  test-supervised-request-readerless-pipe-deadline
+  test-supervised-request-remaining-deadline
   test-telemetry-concurrent-process-retirement
   test-telemetry-process-admission-retirement
   test-telemetry-anonymous-upload

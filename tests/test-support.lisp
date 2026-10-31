@@ -366,6 +366,14 @@ or the read-only attribute on Windows."))
 (defgeneric test-fixture-set-file-mode (platform pathname mode)
   (:documentation "Set PATHNAME's POSIX permission bits to MODE."))
 
+(defgeneric test-fixture-supervised-request-deadline (platform delay)
+  (:documentation "Exercise a readerless full pipe with DELAY seconds of I/O scheduling."))
+
+(defmethod test-fixture-supervised-request-deadline ((platform platform) delay)
+  "Record the Linux pipe regression as unavailable on other hosts."
+  (declare (ignore platform delay))
+  (test-withheld ':posix-adapter "Linux natural8192 supervised request"))
+
 (defgeneric test-fixture-call-with-descriptor-input (platform content function)
   (:documentation
    "Call FUNCTION with a descriptor-backed character input stream holding CONTENT."))

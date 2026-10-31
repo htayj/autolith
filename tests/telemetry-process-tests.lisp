@@ -2,6 +2,18 @@
 
 ;;;; -- Supervised Operation Retirement --
 
+(-> test-supervised-request-readerless-pipe-deadline () null)
+(defun test-supervised-request-readerless-pipe-deadline ()
+  "Finish cleanup after a naturally full Linux pipe loses its reader."
+  (test-fixture-supervised-request-deadline *platform* 0)
+  nil)
+
+(-> test-supervised-request-remaining-deadline () null)
+(defun test-supervised-request-remaining-deadline ()
+  "Charge delayed I/O scheduling to the original request budget."
+  (test-fixture-supervised-request-deadline *platform* 0.5)
+  nil)
+
 (-> test-telemetry-concurrent-process-retirement () null)
 (defun test-telemetry-concurrent-process-retirement ()
   "Concurrent revokers wait through native teardown and the owner's final I/O cleanup."

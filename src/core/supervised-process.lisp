@@ -85,7 +85,15 @@ releases owner records."
                             (supervised-process-thread record)
                             (bt:make-thread
                              (lambda ()
-                               (let ((response (supervised-process-exchange process request)))
+                               (let ((response
+                                       (handler-case
+                                           (sb-sys:with-deadline
+                                               (:seconds
+                                                (max 0
+                                                     (/ (- deadline (get-internal-real-time))
+                                                        internal-time-units-per-second)))
+                                             (supervised-process-exchange process request))
+                                         ((or sb-sys:deadline-timeout error) () nil))))
                                  (bt:with-lock-held (result-lock)
                                    (setf result response done t))))
                              :name "supervised subprocess I/O"))))
