@@ -61,10 +61,14 @@
       (ensure-directories-exist pending)
       (ensure-directories-exist vault)
       (snapshot-write pending
-                      (list :pending-inputs :version 1 :conversation-id identifier
-                            :steering (list (list :user-message-input :version 1 :text "queued image"
-                                                  :image-pathnames (list (namestring image))))
-                            :work     nil))
+                      (application-input-controller--pending-state-form
+                       (list :snapshot-identifier             "transfer-pending"
+                             :steering-items
+                             (list (user-message-input-create :text            "queued image"
+                                                              :image-pathnames (list image)))
+                             :work-items                      '((:native-lisp "(mission-wakeup '(:id (1) :token 1))"))
+                             :steering-promotion-prefix-count 1)
+                       identifier))
       (snapshot-write vault
                       (list :recovery-input-vault :version 1 :conversation-id identifier
                             :captures (list (list :id "capture-1" :captured-at (get-universal-time)

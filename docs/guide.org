@@ -900,6 +900,8 @@ to replace the whole list or one zero-based entry:
 
 Entries are =(:message INPUT)=, =(:command TEXT)=, =(:lisp SOURCE)=, or
 =(:native-lisp SOURCE)= for noninteractive scheduled wakeups.
+Pending snapshots store scheduled wakeups in a separate section ignored by
+releases before 0.67.9; after a downgrade, only those wakeups are omitted.
 Direct vault reads and top-level =setf= forms containing only =vault-contents=
 places execute during an active turn. Returned lists are detached snapshots;
 publish edits with =setf=. Use =(setf (vault-contents) nil)= to clear parked input.

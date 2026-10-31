@@ -65,7 +65,7 @@
   (values
     (record-check
      form :tag ':pending-inputs :versions '(1 2) :allow-other-keys nil
-     :keyword-keys-p t :maximum-length 18
+     :keyword-keys-p t :maximum-length 20
      :fields
      (case (record-version form)
        (1
@@ -80,7 +80,8 @@
           (:indicator :steering :required t)
           (:indicator :work :required t)
           (:indicator :vault-capture-identifiers)
-          (:indicator :steering-promotion-prefix-count)))))))
+          (:indicator :steering-promotion-prefix-count)
+          (:indicator :native-work)))))))
 
 (-> application-recovery-input-vault--form-shape-p (t) boolean)
 (defun application-recovery-input-vault--form-shape-p (form)
@@ -91,6 +92,13 @@
      :keyword-keys-p t :maximum-length 6
      :fields (list (list :indicator ':conversation-id :required t :validate #'stringp)
                    (list :indicator ':captures :required t :validate #'proper-list-p)))))
+
+(-> application-recovery-input-vault--carry-native-work (list list) list)
+(defun application-recovery-input-vault--carry-native-work (payload source)
+  "Carry SOURCE's optional native section into a durable PAYLOAD record."
+  (if (record-property-present-p (cons ':payload source) ':native-work)
+      (append payload (list :native-work (getf source :native-work)))
+      payload))
 
 (-> application-recovery-input-vault--pending-payload-form (list) list)
 (defun application-recovery-input-vault--pending-payload-form (state)
@@ -110,14 +118,16 @@
                  (or (getf state :steering-promotion-prefix-count) 0)
                  :legacy-p               nil)
            "conversation")))
-    (list :active-work        (getf (rest form) :active-work)
+    (application-recovery-input-vault--carry-native-work
+     (list :active-work       (getf (rest form) :active-work)
           :steering-in-flight (getf (rest form) :steering-in-flight)
           :steering           (getf (rest form) :steering)
           :work               (getf (rest form) :work)
           :vault-capture-identifiers
           (getf (rest form) :vault-capture-identifiers)
           :steering-promotion-prefix-count
-          (getf (rest form) :steering-promotion-prefix-count))))
+          (getf (rest form) :steering-promotion-prefix-count))
+     (rest form))))
 
 (-> application-recovery-input-vault--pending-payload-equal-p (list list) boolean)
 (defun application-recovery-input-vault--pending-payload-equal-p (left right)
@@ -272,7 +282,8 @@ OTHER-CONVERSATION-P permits a valid legacy record for another conversation."
                    (:indicator :steering-in-flight :required t)
                    (:indicator :steering :required t)
                    (:indicator :work :required t)
-                   (:indicator :steering-promotion-prefix-count)))
+                   (:indicator :steering-promotion-prefix-count)
+                   (:indicator :native-work)))
     (let ((identifier  (getf form :id))
           (captured-at (getf form :captured-at)))
       (when (and (non-empty-string-p identifier)
@@ -280,17 +291,19 @@ OTHER-CONVERSATION-P permits a valid legacy record for another conversation."
         (handler-case
             (let ((state
                     (application-input-controller--pending-state
-                     (list :pending-inputs
-                           :version 2
-                           :snapshot-identifier       identifier
-                           :conversation-id           conversation-identifier
-                           :active-work               (getf form :active-work)
-                           :steering-in-flight        (getf form :steering-in-flight)
-                           :steering                  (getf form :steering)
-                           :work                      (getf form :work)
-                           :vault-capture-identifiers nil
-                           :steering-promotion-prefix-count
+                     (application-recovery-input-vault--carry-native-work
+                      (list :pending-inputs
+                            :version 2
+                            :snapshot-identifier       identifier
+                            :conversation-id           conversation-identifier
+                            :active-work               (getf form :active-work)
+                            :steering-in-flight        (getf form :steering-in-flight)
+                            :steering                  (getf form :steering)
+                            :work                      (getf form :work)
+                            :vault-capture-identifiers nil
+                            :steering-promotion-prefix-count
                            (or (getf form :steering-promotion-prefix-count) 0))
+                      form)
                      conversation-identifier)))
               (when (and state
                          (plusp
@@ -337,14 +350,16 @@ OTHER-CONVERSATION-P permits a valid legacy record for another conversation."
                   (or (getf capture :steering-promotion-prefix-count) 0)
                   :legacy-p                  nil)
             conversation-identifier)))
-    (list :id                 (copy-seq identifier)
+    (application-recovery-input-vault--carry-native-work
+     (list :id                (copy-seq identifier)
           :captured-at        (getf capture :captured-at)
           :active-work        (getf (rest pending-form) :active-work)
           :steering-in-flight (getf (rest pending-form) :steering-in-flight)
           :steering           (getf (rest pending-form) :steering)
           :work               (getf (rest pending-form) :work)
           :steering-promotion-prefix-count
-          (getf (rest pending-form) :steering-promotion-prefix-count))))
+           (getf (rest pending-form) :steering-promotion-prefix-count))
+     (rest pending-form))))
 
 (-> application-recovery-input-vault--capture-payload-equal-p (list list) boolean)
 (defun application-recovery-input-vault--capture-payload-equal-p (left right)

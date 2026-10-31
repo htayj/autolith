@@ -1375,6 +1375,15 @@
   test-pending-publication-lock-boundaries
   test-pending-input-persistence)
 
+(define-test-suite pending-native-work
+  test-pending-snapshot-readable-by-pre-native-readers
+  test-pending-native-work-form-rejections
+  test-pending-native-work-finite-and-legacy
+  test-pending-native-work-lifecycle
+  test-pending-native-work-vault
+  test-pending-native-work-identities
+  test-acp-input-validate-storage-native-work)
+
 (define-test-suite mission-inference
   test-mission-inference-unknown-drains-child
   test-mission-inference-cancelling-block-refuses-continuation
