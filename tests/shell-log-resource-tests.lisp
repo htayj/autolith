@@ -326,7 +326,7 @@
 
 (-> test-shell-log-byte-windows-and-search () null)
 (defun test-shell-log-byte-windows-and-search ()
-  "Read exact raw ranges and search bounded pages across gigantic unterminated lines."
+  "Read exact raw ranges and bounded search pages, including the shared fifty-result cap."
   (with-test-configuration (configuration)
     (let* ((*shell-log-active*              (make-hash-table :test #'equal))
            (*shell-log-capture-byte-limit*  256)
@@ -360,6 +360,27 @@
             do (test-assert (> (getf page :next-byte-offset) offset) "Search pagination always progresses")
                (setf offset (getf page :next-byte-offset)))
           (test-assert (equal found '(14 50)) "Search recovers middle and boundary-spanning matches exactly"))
+        (let ((*shell-log-resource-scan-bytes* 1024))
+          (dolist (maximum '(20 30 50))
+            (test-assert
+             (tool-result-success-p
+              (shell-log-tests--read resource context (json-object "query" "x" "max-results" maximum)))
+             "Resource reads accept explicit search limits through fifty"))
+          (let* ((page  (shell-log-resource--search configuration path :query "x" :maximum 50))
+                 (next  (shell-log-resource--search configuration path :query "x" :maximum 50
+                                                   :offset (getf page :next-byte-offset)))
+                 (found (mapcar (lambda (match) (getf match :byte-offset))
+                                (append (getf page :matches) (getf next :matches)))))
+            (test-assert (= 50 (length (getf page :matches))) "Explicit fifty-result pages honor their bound")
+            (test-assert (equal found (loop for byte across bytes for index from 0
+                                           when (= byte 120) collect index))
+                         "Larger pages resume without dropping or repeating matches")
+            (test-assert (null (getf next :next-byte-offset)) "The final search page reaches the end")))
+        (test-assert
+         (handler-case (progn (shell-log-tests--read resource context
+                                                     (json-object "query" "x" "max-results" 51)) nil)
+           (tool-error () t))
+         "Search result limits above fifty are rejected")
         (test-assert
          (handler-case (progn (shell-log-tests--read resource context
                                                      (json-object "byte-count" 4097)) nil)

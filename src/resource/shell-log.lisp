@@ -8,8 +8,8 @@
 (defparameter *shell-log-resource-scan-bytes* (* 1024 1024)
   "Maximum raw bytes examined by one paginated search.")
 
-(defparameter *shell-log-resource-maximum-results* 20
-  "Maximum bounded excerpts returned by one search.")
+(defparameter *shell-log-resource-maximum-results* 50
+  "Maximum bounded excerpts returned by one search, matching resource.read.")
 
 (defclass shell-log-resource (resource)
   ((directory :initarg :directory :reader shell-log-resource-directory
