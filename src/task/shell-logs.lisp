@@ -228,6 +228,19 @@ Disable measurement until resource resolution has checked ancestor ownership."
   "Return the per-stream allowance reserved before ARTIFACT's launch."
   (getf (shell-log-artifact-metadata artifact) :capture-byte-limit))
 
+(-> shell-log--group-directories (configuration pathname) list)
+(defun shell-log--group-directories (configuration group)
+  "Enumerate one task group's captures without traversing links."
+  (shell-log--safe-path configuration group)
+  (when (uiop:directory-exists-p group)
+    (loop for execution in (uiop:subdirectories group)
+          for logs = (merge-pathnames "shell-log/" execution)
+          append (progn
+                   (shell-log--safe-path configuration logs)
+                   (when (uiop:directory-exists-p logs)
+                     (loop for directory in (uiop:subdirectories logs)
+                           collect (shell-log--safe-path configuration directory)))))))
+
 (-> shell-log--directories (configuration) list)
 (defun shell-log--directories (configuration)
   "Enumerate managed artifact directories without traversing links."
@@ -235,15 +248,7 @@ Disable measurement until resource resolution has checked ancestor ownership."
     (shell-log--safe-path configuration root)
     (when (uiop:directory-exists-p root)
       (loop for session in (uiop:subdirectories root)
-            append (progn
-                     (shell-log--safe-path configuration session)
-                     (loop for execution in (uiop:subdirectories session)
-                           for logs = (merge-pathnames "shell-log/" execution)
-                           append (progn
-                                    (shell-log--safe-path configuration logs)
-                                    (when (uiop:directory-exists-p logs)
-                                      (loop for directory in (uiop:subdirectories logs)
-                                            collect (shell-log--safe-path configuration directory))))))))))
+            append (shell-log--group-directories configuration session)))))
 
 (-> shell-log--sync-delivered-p (configuration list) boolean)
 (defun shell-log--sync-delivered-p (configuration metadata)
@@ -306,6 +311,23 @@ Disable measurement until resource resolution has checked ancestor ownership."
 (defparameter *shell-log-receipt-cache* nil
   "Exact owner receipt snapshots, freshly bound for each prune; NIL means uncached.")
 
+(-> shell-log--delivery-recorded-p (list) boolean)
+(defun shell-log--delivery-recorded-p (metadata)
+  "Recognize positive delivery authority recorded before owner retention."
+  (let ((time (getf metadata :delivered-at)))
+    (and (integerp time) (plusp time))))
+
+(-> shell-log--delivered-p (configuration list) boolean)
+(defun shell-log--delivered-p (configuration metadata)
+  "Require existing exact-owner synchronous evidence or a durable completion receipt."
+  (or (shell-log--sync-delivered-p configuration metadata)
+      (let ((receipts (task--owner-receipts configuration (getf metadata :root-conversation)
+                                           (getf metadata :completion-owner-conversation)
+                                           :cache *shell-log-receipt-cache*)))
+        (and receipts
+             (gethash (task-completion--receipt (getf metadata :execution-id)) receipts)
+             t))))
+
 (-> shell-log--prunable-p (configuration pathname list) boolean)
 (defun shell-log--prunable-p (configuration directory metadata)
   "Protect active captures and undelivered job completion evidence."
@@ -313,13 +335,42 @@ Disable measurement until resource resolution has checked ancestor ownership."
        (not (eq (getf metadata :state) ':active))
        (or (null (getf metadata :job-id))
            (null (getf metadata :captures))
-           (shell-log--sync-delivered-p configuration metadata)
-           (let ((receipts (task--owner-receipts configuration (getf metadata :root-conversation)
-                                                (getf metadata :completion-owner-conversation)
-                                                :cache *shell-log-receipt-cache*)))
-             (and receipts
-                  (gethash (task-completion--receipt (getf metadata :execution-id)) receipts))))
+           (shell-log--delivery-recorded-p metadata)
+           (shell-log--delivered-p configuration metadata))
        t))
+
+(-> shell-log-persist-owner-delivery (configuration string string) null)
+(defun shell-log-persist-owner-delivery (configuration root owner)
+  "Preserve exact positive delivery evidence before deleting a child owner's storage.
+Any manifest inspection or publication failure vetoes retention of that owner."
+  (unless (and (every #'shell-log--component-p (list root owner))
+               (not (equal root owner)))
+    (shell-log--fail "Invalid retained shell log owner identity."))
+  (with-shell-log-lock (configuration)
+    (let ((*shell-log-receipt-cache* (make-hash-table :test #'equal))
+          (group                     (task--artifact-group-root configuration root)))
+      (dolist (directory (shell-log--group-directories configuration group))
+        (let ((metadata (shell-log--read-manifest configuration directory :measure-p nil)))
+          (unless metadata
+            (shell-log--fail "Cannot read shell capture ownership before retention." directory))
+          (when (and (equal root (getf metadata :root-conversation))
+                     (equal owner (getf metadata :completion-owner-conversation)))
+            (let ((execution (getf metadata :execution-id))
+                  (artifact  (getf metadata :artifact-id)))
+              (unless (and (every #'shell-log--component-p (list execution artifact))
+                           (uiop:pathname-equal directory
+                             (merge-pathnames (format nil "~A/shell-log/~A/" execution artifact) group)))
+                (shell-log--fail "Shell capture identity disagrees with its directory." directory)))
+            (when (and (member (getf metadata :state) '(:closed :interrupted))
+                       (getf metadata :job-id) (getf metadata :captures)
+                       (not (shell-log--delivery-recorded-p metadata))
+                       (not (shell-log--active-p directory))
+                       (shell-log--delivered-p configuration metadata))
+              (setf (getf metadata :delivered-at) (get-universal-time))
+              (shell-log--write-manifest
+               (make-instance 'shell-log-artifact :configuration configuration
+                              :capture-directory directory :metadata metadata))))))))
+  nil)
 
 (-> shell-log--manifest-staging-p (pathname) boolean)
 (defun shell-log--manifest-staging-p (file)
