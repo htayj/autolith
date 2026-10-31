@@ -2660,7 +2660,9 @@ the command again. Missing, interrupted and pruned captures return diagnostics.
 Defaults are 64 MiB per stream, 1 GiB of reserved capture capacity and 256
 retained artifacts. Eligible completed captures become pruneable after seven
 days or under capacity pressure, on the next allocation. Active captures and
-undelivered completion evidence are protected. Adjust
+undelivered completion evidence are protected. Delivery evidence observed before child artifact retention
+is recorded on each capture, allowing ordinary pruning after the owner's
+conversation storage is removed. Adjust
 =*shell-log-capture-byte-limit*=, =*shell-log-retention-byte-limit*=,
 =*shell-log-retention-count-limit*= and =*shell-log-retention-age*= in trusted
 configuration. Captures exceeding their limit are explicitly incomplete.

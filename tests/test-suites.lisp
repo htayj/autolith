@@ -153,6 +153,15 @@
 (define-test-suite shell-log-resource
   test-shell-log-sync-details-shapes
   test-shell-log-sync-details-identities
+  test-shell-log-owner-delivery-restart
+  test-shell-log-owner-delivery-concurrency
+  test-shell-log-owner-delivery-persistence
+  test-shell-log-owner-delivery-failures
+  test-shell-log-owner-delivery-boundaries
+  test-shell-log-owner-delivery-tagged-details
+  test-shell-log-owner-delivery-leases
+  test-shell-log-owner-retention
+  test-shell-log-owner-retention-pressure
   test-shell-log-receipt-migration
   test-shell-log-receipt-cache
   test-shell-log-receipt-linked-segment

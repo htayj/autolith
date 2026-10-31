@@ -499,10 +499,10 @@ retention step."
             (uiop:pathname-directory-pathname output-path)))))
 
 (-> task--prune-result-artifacts
-    (pathname &key (:protected-roots list))
+    (pathname &key (:protected-roots list) (:before-delete (option function)))
     null)
 (defun task--prune-result-artifacts
-    (current-root &key (protected-roots (list current-root)))
+    (current-root &key (protected-roots (list current-root)) before-delete)
   "Remove oldest completed sibling artifacts beyond the retention limit.
 
 PROTECTED-ROOTS preserves artifacts still exposed by the live session. Directories
@@ -524,6 +524,7 @@ candidates."
                       protected-roots)
           (handler-case
               (progn
+                (when before-delete (funcall before-delete directory))
                 (platform-delete-directory-tree *platform* directory
                                                 :validate          t
                                                 :if-does-not-exist ':ignore)
@@ -630,7 +631,19 @@ candidates."
              (rename-file temporary target)
              (task--prune-result-artifacts
               root
-              :protected-roots (task--protected-artifact-roots job root))
+              :protected-roots (task--protected-artifact-roots job root)
+              :before-delete
+              (lambda (directory)
+                (let ((owner (first (last (pathname-directory directory))))
+                      (group (task--artifact-group-root configuration
+                               (session-job-root-conversation-identifier job))))
+                  (unless (and (task--owner-component-p owner)
+                               (uiop:pathname-equal group
+                                 (uiop:pathname-parent-directory-pathname directory)))
+                    (error 'task-error :message "Invalid retained child artifact identity."
+                                       :tool-name "task.run" :task-id (job-identifier job)))
+                  (shell-log-persist-owner-delivery configuration
+                    (session-job-root-conversation-identifier job) owner))))
              target)
         (when (probe-file temporary)
           (delete-file temporary))))))
