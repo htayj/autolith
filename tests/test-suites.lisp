@@ -151,6 +151,8 @@
   test-shell-log-export-boundary)
 
 (define-test-suite shell-log-resource
+  test-shell-log-sync-details-shapes
+  test-shell-log-sync-details-identities
   test-shell-log-receipt-migration
   test-shell-log-receipt-cache
   test-shell-log-receipt-linked-segment

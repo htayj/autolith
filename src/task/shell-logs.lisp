@@ -259,7 +259,12 @@ Disable measurement until resource resolution has checked ancestor ownership."
                        (and (eq (getf log :state) ':closed)
                             (equal execution (getf log :execution-id))
                             (equal artifact (getf log :artifact-id))))
-                     logs)))
+                     logs))
+
+             (delivered-details-p (details)
+               (and (proper-list-p details)
+                    (evenp (length details))
+                    (delivered-logs-p (getf details :shell-logs)))))
       (and (member (getf metadata :state) '(:closed :interrupted))
            (not (getf metadata :detached-p t))
            (every #'shell-log--component-p (list root owner))
@@ -285,15 +290,13 @@ Disable measurement until resource resolution has checked ancestor ownership."
                              (and (member (getf (rest record) :status) '(:ok :error))
                                   (or (null call-id)
                                       (equal call-id (getf (rest record) :call-id)))
-                                  (delivered-logs-p
-                                   (getf (getf (rest record) :details) :shell-logs))))
+                                  (delivered-details-p (getf (rest record) :details))))
                             (:goal
                              (and (null call-id)
                                   (loop for gate in (getf (rest record) :gates)
                                         thereis
                                         (and (member (getf gate :status) '(:passed :failed))
-                                             (delivered-logs-p
-                                              (getf (getf gate :tool-details) :shell-logs)))))))
+                                             (delivered-details-p (getf gate :tool-details)))))))
                         (setf delivered-p t)))))
                  delivered-p)
              (error ()

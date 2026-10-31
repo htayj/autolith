@@ -1094,3 +1094,133 @@
                             "Duplicate checkpoint identifiers invalidate all receipt evidence")))
         (task-orchestrator-close runtime))))
   nil)
+
+(-> shell-log-tests--sync-details-case
+    (string &key (:path keyword) (:shape keyword) (:mismatch (option keyword))
+     (:status keyword) (:child-p boolean)) null)
+(defun shell-log-tests--sync-details-case (name &key (path ':tool) (shape ':tagged) mismatch
+                                                    (status ':ok) child-p)
+  "Persist incompatible details before an exact receipt, checking eligibility only."
+  (with-test-configuration (configuration)
+    (let* ((*shell-log-active*             (make-hash-table :test #'equal))
+           (*shell-log-capture-byte-limit* 32)
+           (root                           "sync-details-root")
+           (owner                          (if child-p "sync-details-child" root))
+           (conversation                   (conversation-create configuration :identifier owner
+                                             :storage-root                                (and child-p
+                                                                                           (merge-pathnames "sync-details-child/"
+                                                                                             (task--artifact-group-root configuration root)))))
+           (context                        (make-instance 'tool-context :configuration configuration
+                                             :conversation conversation :worker nil))
+           (runtime                        (task-orchestrator-create))
+           (job                            (task-tests--make-job runtime :identifier "details-command"
+                                             :root-identifier root :detached-p nil)))
+      (unwind-protect
+           (progn
+             (setf (slot-value job 'completion-owner-conversation) owner
+                   (slot-value job 'parent-call-id) (and (eq path ':tool) "details-call"))
+             (let* ((artifact (shell-log-allocate context :job job))
+                    (metadata (shell-log-tests--finish artifact #(65)))
+                    (receipt  (copy-list (shell-log--public-metadata metadata)))
+                    (details  (case shape
+                                (:none
+                                 nil)
+                                (:empty
+                                 nil)
+                                (:unrelated
+                                 '(:offset 0))
+                                (:tagged
+                                 '(:task-agents :offset 0))
+                                (:odd
+                                 (list :shell-logs (list receipt) :bad-tail))
+                                (:atom
+                                 17)
+                                (:dotted
+                                 (list* :shell-logs (list receipt) 17))
+                                (:non-keyword
+                                 '(17 23))
+                                (:duplicate
+                                 (list :shell-logs nil :shell-logs (list receipt)))))
+                    (target   (if (eq mismatch ':owner)
+                                  (conversation-create configuration :identifier "other-owner")
+                                  conversation)))
+               (labels ((check-state (expected phase)
+                          (test-assert (eq expected (shell-log--sync-delivered-p configuration metadata))
+                                       (format nil "~A ~A delivery" name phase))
+                          (test-assert (eq expected (shell-log--prunable-p configuration
+                                                     (shell-log-capture-directory artifact) metadata))
+                                       (format nil "~A ~A eligibility" name phase)))
+
+                        (gate (value gate-status)
+                          (list :status gate-status :tool-details value))
+
+                        (append-details (value)
+                          (conversation-append-record conversation
+                            (if (eq path ':tool)
+                                (list :tool-result :call-id "details-call" :status ':ok :details value)
+                                (list :goal :gates (list (gate value ':passed)))))))
+                 (unless (eq shape ':none)
+                   (append-details details)
+                   (check-state nil "prefix alone"))
+                 (case mismatch
+                   (:execution
+                    (setf (getf receipt :execution-id) "other-execution"))
+                   (:artifact
+                    (setf (getf receipt :artifact-id) "other-artifact"))
+                   (:log-active
+                    (setf (getf receipt :state) ':active))
+                   (:active
+                    (setf (getf metadata :state) ':active))
+                   (:detached
+                    (setf (getf metadata :detached-p) t))
+                   (:goal-call
+                    (setf (getf metadata :parent-call-id) "details-call")))
+                 (unless (eq mismatch ':no-receipt)
+                   (conversation-append-record target
+                     (if (eq path ':tool)
+                         (list :tool-result :call-id (if (eq mismatch ':call) "other-call" "details-call")
+                               :status status :details (list :shell-logs (list receipt)))
+                         (list :goal :gates
+                               (append (when (eq path ':gates) (list (gate details ':passed)))
+                                       (list (gate (list :shell-logs (list receipt)) status)))))))
+                 (when (eq mismatch ':header)
+                   (let* ((file  (conversation-storage-active-pathname (conversation-pathname conversation)))
+                          (forms (copy-tree (conversation--read-records file))))
+                     (setf (getf (rest (first forms)) :id) "other-header")
+                     (conversation-identifier-migration--write-forms file forms)))
+                 (check-state (null mismatch) "after receipt"))))
+        (task-orchestrator-close runtime))))
+  nil)
+
+(-> test-shell-log-sync-details-shapes () null)
+(defun test-shell-log-sync-details-shapes ()
+  "Skip incompatible stored details without acknowledging them or losing later receipts."
+  (dolist (path '(:tool :goal :gates))
+    (dolist (shape '(:empty :unrelated :tagged :odd :atom :dotted :non-keyword :duplicate))
+      (shell-log-tests--sync-details-case (format nil "~A/~A" path shape)
+                                         :path path :shape shape
+                                         :status (if (eq path ':tool) ':ok ':passed))))
+  (dolist (row '((:tool :ok) (:tool :error) (:goal :passed) (:goal :failed)))
+    (destructuring-bind (path status) row
+      (shell-log-tests--sync-details-case (format nil "terminal/~A/~A" path status)
+                                         :path path :shape ':none :status status)))
+  nil)
+
+(-> test-shell-log-sync-details-identities () null)
+(defun test-shell-log-sync-details-identities ()
+  "Keep exact identity and lifecycle protection after skipping tagged details."
+  (dolist (child-p '(nil t))
+    (dolist (path '(:tool :goal))
+      (shell-log-tests--sync-details-case (format nil "~A/~A/exact" child-p path)
+                                         :path path :child-p child-p
+                                         :status (if (eq path ':tool) ':ok ':passed))
+      (dolist (mismatch '(:no-receipt :owner :header :execution :artifact :log-active :active :detached))
+        (shell-log-tests--sync-details-case (format nil "~A/~A/~A" child-p path mismatch)
+                                           :path path :mismatch mismatch :child-p child-p
+                                           :status (if (eq path ':tool) ':ok ':passed)))
+      (shell-log-tests--sync-details-case (format nil "~A/~A/nonterminal" child-p path)
+                                         :path path :mismatch ':status :status ':running :child-p child-p))
+    (shell-log-tests--sync-details-case "wrong call" :mismatch ':call :child-p child-p)
+    (shell-log-tests--sync-details-case "goal cannot acknowledge call" :path ':goal :status ':passed
+                                       :mismatch ':goal-call :child-p child-p))
+  nil)
