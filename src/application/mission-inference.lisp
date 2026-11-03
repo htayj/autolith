@@ -77,14 +77,18 @@
           (mission--evidence context :inference-failure (princ-to-string failure)))
         (unless (integerp tokens)
           (unless bounded-p (incf (getf goal :unknown-usage)))
-          (if child
-              (mission--attribute-child-unknown context child
-                                               :reservation (when bounded-p reservation))
-              (when (eq (getf goal :status) ':active)
-                (mission--transition
-                 context ':blocked
-                 "An inference request settled without reported usage; started children may finish, new work needs a new budget."
-                 :cancel-p nil))))
+          (when child
+            (mission--attribute-child-unknown context child
+                                             :reservation (when bounded-p reservation)))
+          (unless bounded-p
+            (if (mission--unknown-usage-blocks-p goal)
+                (when (and (null child) (eq (getf goal :status) ':active))
+                  (mission--transition
+                   context ':blocked
+                   "An inference request settled without reported usage; started children may finish, new work needs a new budget."
+                   :cancel-p nil))
+                (mission--evidence context ':unknown-usage
+                                   "An inference request settled without reported usage; recorded by mission policy."))))
         (when (and (member (getf goal :status) '(:active :blocked))
                    (> (getf goal :tokens-used) (getf goal :token-limit)))
           (mission--transition context ':exhausted "Mission token budget exhausted."))
@@ -101,7 +105,8 @@ Provider-reported billable usage includes input tokens. Output allocations do no
 bound total provider billing or retry exposure. Preserve all provider return values.
 A request refused before invoking FUNCTION has known zero usage. After dispatch,
 an exact child's missing usage charges its finite admitted allocation once and
-retains child UNKNOWN audit; unproven uncertainty requires conservative quarantine."
+retains child UNKNOWN audit; unproven uncertainty requires conservative quarantine
+unless the mission explicitly selects the :record unknown-usage policy."
   (let ((originating-child
           (and (typep *mission-admitted-operation* 'task-job)
                (eq (task-job-mission-context *mission-admitted-operation*) context)

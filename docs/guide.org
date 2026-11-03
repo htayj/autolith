@@ -188,14 +188,35 @@ finish. Root or unproven ownership keeps conservative blocked behavior. Recovery
 cannot infer per-request child bounds from aggregate outstanding reservations.
 Existing unresolved UNKNOWN is never reclassified by restore or continuation.
 
+The default =:unknown-usage-policy :block= applies the unresolved-usage quarantine
+above. At mission start, explicitly select =:unknown-usage-policy :record= to
+retain unresolved unknown counts and evidence while admitting further inference
+and new children under ordinary budgets. Bounded exact-child reservation charges
+are unaffected. With =:record=, the token allowance bounds reported usage plus
+reservation charges, not unreported provider spend; turn and wall-clock limits
+still apply exactly. Independent reviewers still require reported usage. Missing
+or malformed persisted policies block. Large numeric limits are finite limits,
+not an implicit opt-in. This policy cannot be changed by resuming a mission and
+does not automatically reactivate a blocked mission. Starting a replacement
+mission changes its identity; recreate any intended schedules for that mission.
+
+#+BEGIN_SRC lisp
+(mission :start
+ '(:objective "Run the periodic checks"
+   :turn-limit 10000 :token-limit 10000000 :wall-seconds 86400
+   :unknown-usage-policy :record
+   :criteria ((:id "checks" :description "The user accepts the checks"))))
+#+END_SRC
+
 The wall-clock deadline includes gate execution, delegated tools, pauses and
 time away. Work runs under cl-jobpond supervision. Use =(goal :pause)= and
 =(mission :resume)= without resetting any mission budget; use
 =(mission :cancel "REASON")= to terminate it. Terminal states are =verified=, =exhausted=, =cancelled=
 and =failed=. A =blocked= mission retains the evidence needed to resolve its
 blocker and resume. Interrupted inference restores as blocked when its usage
-cannot be recovered. Gate attempts, fingerprints and evidence restore with the
-conversation and survive compaction independently of model summaries.
+cannot be recovered, unless the mission explicitly selected =:record=. Gate
+attempts, fingerprints and evidence restore with the conversation and survive
+compaction independently of model summaries.
 
 Gates run in order, stopping at the first failure. Command gates use the ordinary
 shell authorization and sandbox boundary. Artifact gates require =:path= and
