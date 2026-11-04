@@ -91,7 +91,8 @@
              (mission--evidence context ':unknown-usage
                                 "An inference request settled without reported usage; recorded by mission policy."))))
         (when (and (member (getf goal :status) '(:active :blocked))
-                   (> (getf goal :tokens-used) (getf goal :token-limit)))
+                   (> (getf goal :tokens-used) (getf goal :token-limit))
+                   (not (eq (mission-exhaustion--policy context) :evaluate)))
           (mission--transition context ':exhausted "Mission token budget exhausted."))
         (mission--record context))))
   ;; A ready completion may be waiting only for this reservation to settle.
@@ -124,8 +125,10 @@ retains child UNKNOWN audit; unproven uncertainty requires conservative quaranti
         (failure      nil))
     (unwind-protect
          (progn
-           (sb-sys:without-interrupts
-             (setf reservation (mission--reserve-inference context :allowance allowance)))
+           (mission-exhaustion--admitting
+            context (lambda ()
+                      (sb-sys:without-interrupts
+                        (setf reservation (mission--reserve-inference context :allowance allowance)))))
            (handler-case
                (let* ((*provider-mission-output-allowance* reservation)
                       (results                             (mission--supervise

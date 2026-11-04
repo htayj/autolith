@@ -481,6 +481,42 @@ Ordinary native defaults remain lazy and follow the current environment."
   :maximum                                      86400
   :default                                      0)
 
+(define-setting :mission-exhaustion-policy (choice-setting)
+  :label                                   "Mission exhaustion policy"
+  :group                                   :behavior
+  :documentation                           "Ask on exhaustion, or request one independently funded strong-model evaluation."
+  :type                                    '(member :ask :evaluate)
+  :options                                 '(:ask :evaluate)
+  :scope                                   :durable
+  :default                                 :ask)
+
+(define-setting :mission-extension-limit (number-setting)
+  :label                                 "Mission extension count"
+  :group                                 :behavior
+  :documentation                         "Maximum exhaustion extensions per mission, captured at start."
+  :type                                  '(integer 0 16)
+  :minimum                               0
+  :maximum                               16
+  :scope                                 :durable
+  :default                               2)
+
+(define-setting :mission-extension-multiple (number-setting)
+  :label                                    "Mission extension multiple"
+  :group                                    :behavior
+  :documentation                            "Ceiling multiple of immutable original mission limits."
+  :type                                     '(integer 1 8)
+  :minimum                                  1
+  :maximum                                  8
+  :scope                                    :durable
+  :default                                  2)
+
+(define-setting :mission-exhaustion-model (string-setting)
+  :label                                  "Mission exhaustion model"
+  :group                                  :behavior
+  :documentation                          "Explicit strong reviewer model. Unset falls back to ask, never to the working model."
+  :type                                   '(option string)
+  :scope                                  :durable)
+
 (define-setting :cost-limit (number-setting)
   :label                    "Cost limit"
   :group                    :behavior

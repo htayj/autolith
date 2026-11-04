@@ -2,6 +2,9 @@
 
 ;;;; -- Verified Session Goals --
 
+(defparameter *mission-operation-milliseconds* 900000
+  "Per-operation wall cap for evaluated missions, not a total mission cap.")
+
 (defparameter *mission-evidence-limit* 4096
   "Maximum retained characters in one mission evidence entry.")
 
@@ -25,6 +28,9 @@
                         :accessor      mission-context-transition-revision
                         :type          unsigned-byte
                         :documentation "Orders terminal notice publication against later transitions.")
+   (evaluation-lock :initform      (make-lock "Mission exhaustion evaluation")
+                    :reader        mission-context-evaluation-lock
+                    :documentation "Serializes independent exhaustion evaluations.")
    (request-lock :initform      (make-recursive-lock "Mission requests")
                  :reader        mission-context-request-lock
                  :documentation "Serializes provider admission and settlement.")
@@ -253,6 +259,10 @@ NEW-WORK-P always requires an active mission. Hard budgets apply to both paths."
       (mission--reject ':mission-usage-quarantine
                        "Mission usage is unknown; inference and new work require explicit spending authority."))
     (unless (plusp (mission--remaining-milliseconds context))
+      (when (and (eq (mission-exhaustion--policy context) :evaluate)
+                 (plusp (getf goal :requests-outstanding 0)))
+        (mission--reject :exhausted "Mission deadline elapsed; admitted requests must settle first."))
+      (mission-exhaustion--trigger context :wall)
       (mission--transition context ':exhausted "Mission-wide wall-clock budget exhausted.")
       (mission--reject ':exhausted "Mission-wide wall-clock budget exhausted."))
     (when (and inference-p
@@ -260,6 +270,9 @@ NEW-WORK-P always requires an active mission. Hard budgets apply to both paths."
                    (>= (getf goal :tokens-used) (getf goal :token-limit))))
       ;; Requests already admitted retain their allowance to finish and settle.
       (unless (plusp (getf goal :requests-outstanding))
+        (mission-exhaustion--trigger context
+                                     (if (>= (getf goal :turns-used) (getf goal :turn-limit))
+                                         :turns :tokens))
         (mission--transition context ':exhausted "Mission-wide work budget exhausted."))
       (mission--reject ':exhausted "Mission-wide work budget exhausted.")))
   nil)
@@ -268,7 +281,10 @@ NEW-WORK-P always requires an active mission. Hard budgets apply to both paths."
 (defun mission--supervise (context name function &key timeout)
   "Run FUNCTION inline through cl-jobpond under the mission's remaining deadline.
 The calling thread preserves provider bindings and authorization callbacks."
-  (let* ((milliseconds (mission--remaining-milliseconds context))
+  (mission-exhaustion--admitting context (lambda () (mission--admit context :inference-p nil)))
+  (let* ((evaluated-p  (eq (mission-exhaustion--policy context) :evaluate))
+         (milliseconds (if evaluated-p *mission-operation-milliseconds*
+                           (mission--remaining-milliseconds context)))
          (pool         (make-job-pool :name name :maximum-concurrency 1
                                       :maximum-batch-size 1 :maximum-live-jobs 1
                                       :maximum-runtime-milliseconds
@@ -281,14 +297,16 @@ The calling thread preserves provider bindings and authorization callbacks."
                                                             (funcall function))))))))
     (unwind-protect
          (progn
-           (with-recursive-lock-held ((mission-context-lock context))
-             ;; Register before releasing state so cancellation cannot miss this job.
-             (mission--admit context :inference-p nil)
-             (push job (mission-context-jobs context))
-             (setf (gethash job (mission-context-threads context)) (current-thread))
-             (when (and (typep *mission-admitted-operation* 'task-job)
-                        (job-cancellation-requested-p *mission-admitted-operation*))
-               (job-cancel job :reason (job-cancellation-reason *mission-admitted-operation*))))
+           (mission-exhaustion--admitting
+            context (lambda ()
+                     (with-recursive-lock-held ((mission-context-lock context))
+                       ;; Register before releasing state so cancellation cannot miss this job.
+                       (mission--admit context :inference-p nil)
+                       (push job (mission-context-jobs context))
+                       (setf (gethash job (mission-context-threads context)) (current-thread))
+                       (when (and (typep *mission-admitted-operation* 'task-job)
+                                  (job-cancellation-requested-p *mission-admitted-operation*))
+                         (job-cancel job :reason (job-cancellation-reason *mission-admitted-operation*))))))
            (job-run-inline job)
            (let ((snapshot (job-await job)))
             (cond
@@ -298,6 +316,8 @@ The calling thread preserves provider bindings and authorization callbacks."
                (if (and timeout (< timeout milliseconds))
                    (mission--reject ':gate-timeout "Gate execution reached its deadline.")
                    (progn
+                     (when evaluated-p
+                       (mission--reject :operation-timeout "Mission operation reached its per-operation cap."))
                      (mission--transition context ':exhausted "Mission operation reached its wall-clock deadline.")
                      (mission--reject ':exhausted "Mission operation reached its deadline."))))
               (t
@@ -359,6 +379,9 @@ The calling thread preserves provider bindings and authorization callbacks."
     (mission--reject ':invalid "A mission requires objective, criteria and positive turn-limit, token-limit and wall-seconds."))
   (unless (member (getf specification :unknown-usage-policy ':block) '(:block :record))
     (mission--reject ':invalid "Unknown usage policy must be :block or :record."))
+  (when (and (nth-value 2 (get-properties specification '(:exhaustion-policy)))
+             (not (member (getf specification :exhaustion-policy) '(:ask :evaluate))))
+    (mission--reject :invalid "Exhaustion policy must be ask or evaluate."))
   (let* ((gates                 (mapcar #'mission-gate-normalize (getf specification :gates)))
          (gate-identifiers      (mapcar (lambda (gate) (getf gate :id)) gates))
          (criteria              (loop for criterion in (getf specification :criteria)
@@ -392,6 +415,9 @@ The calling thread preserves provider bindings and authorization callbacks."
 (defun application-mission-start (application specification)
   "Replace the goal with an explicitly budgeted mission, without starting a turn."
   (let ((goal (mission--validate-specification specification)))
+    (nconc goal (list :exhaustion-policy
+                     (or (getf specification :exhaustion-policy)
+                         (config :mission-exhaustion-policy (application-configuration application)))))
     (when (and (mission-goal-p (application-goal application))
                (member (getf (application-goal application) :status) '(:active :paused :blocked)))
       (application-mission-stop application ':cancelled "Replaced by a new mission."))
@@ -399,6 +425,7 @@ The calling thread preserves provider bindings and authorization callbacks."
       (flet ((install ()
                (setf (application-goal application) goal)
                (let ((context (mission--attach application)))
+                 (mission-exhaustion--ensure context)
                  (mission--evidence context ':started "Explicit mission acceptance policy installed.")
                  (mission--record context)
                  (mission-knowledge-record-status context ':active))))
@@ -483,7 +510,11 @@ The calling thread preserves provider bindings and authorization callbacks."
                   (mission--unknown-usage-blocks-p goal))
              (mission--transition context ':blocked
                                   "Interrupted inference has unknown token usage; resume requires a new budget."))
+            ((and (getf (getf goal :exhaustion) :pending)
+                  (member (getf goal :status) '(:active :paused :blocked)))
+             (mission-exhaustion--restore-interrupted context))
             ((and (member (getf goal :status) '(:active :paused :blocked))
+                  (not (eq (mission-exhaustion--policy context) :evaluate))
                   (not (plusp (mission--remaining-milliseconds context))))
              (mission--transition context ':exhausted "The durable wall-clock deadline elapsed while away."))
             (t
@@ -586,7 +617,7 @@ Report identity relative to the guarded goal, never arbitrary goal evidence."
                    (and (typep parent 'task-child-agent)
                         (let ((job (task-child-agent-job parent)))
                           (and (eq (task-job-mission-context job) context) job)))))
-             (mission--admit context :inference-p nil)
+             (mission-exhaustion--admitting context (lambda () (mission--admit context :inference-p nil)))
              (mission--supervise context (format nil "Mission ~A" tool-name) operation-function)))))))
 
 (-> mission--request-owned-p (mission-context conversation) boolean)
@@ -645,7 +676,8 @@ Report identity relative to the guarded goal, never arbitrary goal evidence."
   (let ((context (task-job-mission-context job)))
     (if context
         (progn
-          (mission--admit context :inference-p nil :new-work-p t)
+          (mission-exhaustion--admitting
+           context (lambda () (mission--admit context :inference-p nil :new-work-p t)))
           (let ((*mission-admitted-operation* job))
             (mission--supervise context "Mission child" (lambda () (task-job--run job)))))
         (task-job--run job))))
