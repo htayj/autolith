@@ -425,6 +425,9 @@
   test-job-completion-terminal-mixed-replay
   test-job-completion-terminal-admission-race
   test-job-completion-terminal-coalescing
+  test-job-completion-lightweight-goal-authority
+  test-job-completion-completed-lightweight-wake
+  test-job-completion-lightweight-limit-accounting
   test-job-completion-controller-coalescing
   test-job-completion-controller-continuation-notice
   test-job-completion-controller-ticket-delivery
@@ -704,6 +707,7 @@
   test-mcp-reload-transaction-boundary)
 
 (define-test-suite application-command
+  test-application-goal-continuation-setting
   test-application-grouped-settings
   test-application-command-defining-form
   test-application-command-semantic-calls
@@ -1427,6 +1431,7 @@
 
 (define-test-suite application
   test-provider-exhaustion-presentation
+  test-application-goal-continuation-limits
   test-presentation-configuration-isolation
   test-operation-request-turn
   test-application-transcript-actions

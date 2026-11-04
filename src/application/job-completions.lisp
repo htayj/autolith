@@ -29,8 +29,13 @@
              ((mission-goal-p goal)
               (not (eq (getf goal :status) ':active)))
              (goal
-              (and (eq (getf goal :status) ':active)
-                   (< (getf goal :continuations 0) *application-goal-continuation-limit*)))
+              (case (getf goal :status)
+                (:active
+                 (not (application--goal-continuations-exhausted-p application goal)))
+                (:complete
+                 t)
+                (t
+                 nil)))
              (t
               t)))))))
 
@@ -201,13 +206,13 @@ snapshot cannot change the meaning of an already finalized transcript entry."
            (values "the session goal is paused" "Use (goal :resume) to continue it."))
           ((and goal (not (eq status ':active)))
            (values (format nil "the session goal is ~A" status) review))
-          ((and goal (>= (getf goal :continuations 0) *application-goal-continuation-limit*))
+          ((and goal (application--goal-continuations-exhausted-p application goal))
            (values (format nil "the session goal used ~D of ~D automatic continuations (effective limit ~D)"
-                           (getf goal :continuations 0) *application-goal-continuation-limit*
-                           *application-goal-continuation-limit*)
+                           (getf goal :continuations 0) (application-goal-continuation-limit application)
+                           (application-goal-continuation-limit application))
                    (format nil "Send a message to reset the count, or raise the limit with ~
-                                (setf autolith::*application-goal-continuation-limit* ~D) for this process."
-                           (* 2 *application-goal-continuation-limit*))))
+                                (settings :goal-continuation-limit ~D) or (settings :goal-continuation-limit :unlimited)."
+                           (* 2 (application-goal-continuation-limit application)))))
           (t
            (values "the result is not eligible for automatic continuation" review)))
       (format nil "No automatic continuation: ~A. ~A" reason action))))
@@ -416,7 +421,9 @@ as ordinary controller admission, without recursively locking the session."
                       (task-completion-deliver
                        agent :identifiers (mapcar (lambda (notice) (getf notice :id)) notices))))
         (let ((goal (application-goal application)))
-          (when (and goal (or (not (mission-goal-p goal)) mission-authorized-p))
+          (when (and goal (if (mission-goal-p goal)
+                             mission-authorized-p
+                             (eq (getf goal :status) ':active)))
             (incf (getf goal :continuations 0))
             (application--record-goal application)))
         (application-input-controller-call-with-primary-steering
