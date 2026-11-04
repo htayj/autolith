@@ -268,6 +268,36 @@ default =:block= policy, interrupted inference becomes blocked when its usage
 cannot be recovered. Gate attempts, fingerprints, and evidence restore with the
 conversation and survive compaction independently of model summaries.
 
+Choose =:mission-exhaustion-policy :evaluate= to review a turn, token or total
+wall-clock boundary before stopping. The default policy is =:ask=. Set an
+explicit strong =:mission-exhaustion-model=; without one, evaluation falls back
+to asking the user. Override the captured policy for one mission with
+=:exhaustion-policy :ask= or =:exhaustion-policy :evaluate= in its start specification.
+
+The exhaustion reviewer gets one tool-free request per trigger, funded from an
+independent six-turn, 150000-token allowance, with a 300-second operation cap
+including input preparation. Its usage never charges the working mission.
+Invalid decisions, unknown usage, allowance exhaustion, failed redaction and
+interruption fall back to asking the user. Read the private evaluator conversation
+referenced by the durable exhaustion decision for redacted inputs, response,
+measured usage and result.
+
+Configure =:mission-extension-limit= (default 2, maximum 16) and
+=:mission-extension-multiple= (default 2, maximum 8). Original budgets, ceilings
+and the extension count are captured when the mission starts. Each extension
+adds at most half the original named limit, rounded up, without crossing its
+original-budget ceiling. A valid extension changes limits only. Progress,
+verification and previous extension evidence inform the decision. Under this
+policy each admitted operation has a separate 900-second cap; shorter gate and
+tool deadlines apply. Total wall exhaustion is evaluated at the next admission.
+
+The same response may propose evidence-cited harness papercuts. Ordinary project
+failures, refusals and timeouts are insufficient by themselves. Candidate
+validation and private-store deduplication are independent of the decision.
+The decision notice counts only confirmed new reports; a reporting error can
+leave creation uncertain. Reload interrupted evaluations without redispatching
+the request or repeating the decision notice.
+
 Gates run in order and stop at the first failure. Command gates use the ordinary
 shell authorization and sandbox boundary. Artifact gates require =:path= and
 optionally accept an expected =:sha256=. Lisp gates require a =:predicate=

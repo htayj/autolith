@@ -1738,6 +1738,23 @@
   test-mission-inference-output-reservation-cap
   test-mission-inference-reservation-recovery)
 
+(define-test-suite mission-exhaustion
+  test-mission-exhaustion-operation-boundary
+  test-mission-exhaustion-extensions
+  test-mission-exhaustion-fallbacks
+  test-mission-exhaustion-ceilings-and-restore
+  test-mission-exhaustion-concurrency
+  test-mission-exhaustion-stale-and-cancel
+  test-mission-exhaustion-papercuts
+  test-mission-exhaustion-papercut-failures
+  test-mission-exhaustion-policy
+  test-mission-exhaustion-runtime-caps
+  test-mission-exhaustion-nonlocal-cancellation
+  test-mission-exhaustion-interrupted-restore
+  test-mission-exhaustion-durable-trace
+  test-mission-exhaustion-independent-candidates
+  test-mission-exhaustion-private-redaction)
+
 (define-test-suite missions
   test-mission-terminal-notice-tool-path
   test-mission-terminal-notice-controller
