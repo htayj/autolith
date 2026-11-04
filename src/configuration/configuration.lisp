@@ -258,6 +258,14 @@ Ordinary native defaults remain lazy and follow the current environment."
   :visible-p                                nil
   :default                                  nil)
 
+(define-setting :saved-model-selection-notice (string-setting)
+  :label                                      "Saved model selection notice"
+  :group                                      :model
+  :documentation                              "Pending startup notice after dropping an unavailable saved selection."
+  :scope                                      :session
+  :visible-p                                  nil
+  :default                                    "")
+
 (define-setting :model-provider (string-setting)
   :label                        "Model provider"
   :group                        :model
@@ -265,6 +273,8 @@ Ordinary native defaults remain lazy and follow the current environment."
   :scope                        :durable
   :visible-p                    nil
   :environment                  "AUTOLITH_MODEL_PROVIDER"
+  :deferrable-p                 t
+  :validator                    'configuration--model-provider-problem
   :default                      "")
 
 (define-setting :model (choice-setting)
