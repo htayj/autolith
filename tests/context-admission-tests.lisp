@@ -823,3 +823,1227 @@
                      "the handoff guard does not change d0 settlement"))))
             (mission-detach application))))))
   nil)
+
+
+;;;; -- Measured Ordinary Input Regression --
+
+(defclass context-measured-test-provider (context-admission-test-provider)
+  ((requests
+    :initform      nil
+    :accessor      context-measured-test-requests
+    :documentation "Final admitted requests in newest-first order."))
+  (:documentation "Real Responses execution with synthetic final usage and no network."))
+
+(defparameter *context-measured-test-refusal-function* nil
+  "Request-local fixture observer for the first refusal before agent recovery.")
+
+(defmethod provider-open-response-stream :around
+    ((provider context-measured-test-provider) (request hash-table)
+     &key credentials conversation)
+  "Observe actual admission inside the ordinary loop's recovery handler."
+  (declare (ignore credentials conversation))
+  (handler-bind ((provider-context-budget-error
+                   (lambda (condition)
+                     (when *context-measured-test-refusal-function*
+                       (funcall *context-measured-test-refusal-function* condition)))))
+    (call-next-method)))
+
+(defmethod provider-open-response-stream
+    ((provider context-measured-test-provider) (request hash-table)
+     &key credentials conversation)
+  "Return a complete inert Responses stream after ordinary admission."
+  (declare (ignore credentials conversation))
+  (push request (context-measured-test-requests provider))
+  (setf (context-admission-test-provider-last-request provider) request
+        (context-admission-test-provider-last-ceiling provider) *provider-maximum-output-tokens*)
+  (incf (context-admission-test-provider-network-calls provider))
+  (let* ((number (context-admission-test-provider-network-calls provider))
+         (id     (format nil "measured-response-~D" number))
+         (item   (json-object "type" "message" "id" (format nil "measured-output-~D" number)
+                              "role" "assistant" "status" "completed"
+                              "content" (vector (json-object "type" "output_text" "text" "Inspected synthetic images."))))
+         (source
+           (concatenate
+            'string
+            (test-sse-event-string (json-object "type" "response.created" "response" (json-object "id" id)))
+            (test-sse-event-string (json-object "type" "response.output_item.done" "item" item))
+            (test-sse-event-string
+             (json-object "type" "response.completed" "response"
+                          (json-object "id" id "status" "completed" "output" (vector item)
+                                       "usage" (json-object "input_tokens" 160000 "output_tokens" 30
+                                                            "total_tokens" 160030
+                                                            "input_tokens_details" (json-object "cached_tokens" 120000))))))))
+    (values (make-instance 'test-character-input-stream :source source) 200 nil)))
+
+(-> context-measured-tests--append-images (conversation integer integer &key (:separate-p boolean)) null)
+(defun context-measured-tests--append-images (conversation start count &key separate-p)
+  "Append correlated fs.view-image-shaped outputs without opening any image."
+  (dotimes (offset count)
+    (let* ((number (+ start offset))
+           (id     (format nil "measured-image-~D" number)))
+      (when separate-p
+        (conversation-append-user-message conversation (format nil "Inspect synthetic image ~D" number)))
+      (conversation-append-provider-item
+       conversation (json-object "type" "function_call" "call_id" id "name" "fs__view_image"
+                                 "arguments" "{\"path\":\"synthetic.png\"}"))
+      (conversation-append-provider-item
+       conversation (json-object "type" "function_call_output" "call_id" id
+                                 "output" (vector (json-object "type" "input_text" "text" "Viewed synthetic PNG")
+                                                  (json-object "type" "input_image" "detail" "high"
+                                                               "image_url" (format nil "data:image/png;base64,c3ludGhldGlj~D" number)))))))
+  nil)
+
+(-> context-measured-tests--image-count (t) (integer 0))
+(defun context-measured-tests--image-count (value)
+  "Count structured image nodes, not image-looking text."
+  (typecase value
+    (hash-table
+     (if (json-string= (json-get value "type") "input_image")
+         1
+         (loop for child being the hash-values of value sum (context-measured-tests--image-count child))))
+    (string
+     0)
+    (vector
+     (loop for child across value sum (context-measured-tests--image-count child)))
+    (cons
+     (loop for child in value sum (context-measured-tests--image-count child)))
+    (t
+     0)))
+
+(-> context-measured-tests--run (&key (:separate-p boolean) (:headroom-p boolean)) null)
+(defun context-measured-tests--run (&key separate-p headroom-p)
+  "Earn a genuine ordinary input measurement, then admit appended evidence at 600K."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "900000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
+    (with-test-configuration (configuration)
+      (let* ((configuration                       (configuration-copy configuration :model "gpt-6.1-sol" :provider-validation-p nil))
+             (*context-contributors*              nil)
+             (*context-resolver*                  (cl-llm-provider-api:make-context-resolver))
+             (*context-last-deliveries*           (make-hash-table :test #'equal))
+             (*context-last-delivery-order*       nil)
+             (*provider-mission-output-allowance* (when headroom-p 8192))
+             (provider                            (make-instance 'context-measured-test-provider :configuration configuration
+                                                                :credential-manager                             (credential-manager-create configuration)))
+             (conversation                        (conversation-create configuration))
+             (agent                               (agent-create :configuration configuration :conversation conversation :provider provider
+                                                                :tool-registry (make-instance 'tool-registry)))
+             (completions                         nil)
+             (observer                            (make-instance 'callback-agent-observer
+                                                                 :status-callback (lambda (status details)
+                                                                                    (when (eq status :provider-request-completed)
+                                                                                      (push details completions))
+                                                                                    nil)))
+             (prior-count                         (if separate-p 45 35))
+             (first-result                        nil)
+             (target-result                       nil)
+             (refusal                             nil))
+        (conversation-append-user-message conversation (make-string 32000 :initial-element #\u))
+        (context-measured-tests--append-images conversation 0 prior-count :separate-p separate-p)
+        (test-call-with-function-replacements
+         (list (list 'credential-manager-credentials
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (provider-tests--credentials configuration))))
+         (lambda ()
+           (test-assert (not (agent-should-compact-p agent)) "Small synthetic payloads do not trigger the soft compaction check.")
+           (setf first-result (agent--run-provider-loop agent observer :tools-p nil))
+           (let* ((request       (first (context-measured-test-requests provider)))
+                  (prefix        (getf (first completions) :cache-prefix))
+                  (wire          (getf prefix :wire))
+                  (stable-count  (getf wire :prefix-items 0))
+                  (input         (json-get request "input"))
+                  (stable-images (context-measured-tests--image-count (subseq input 0 stable-count)))
+                  (usage         (provider-usage-normalize (provider-result-usage first-result))))
+             (test-assert (= 160000 (json-get usage "input_tokens")) "A completed inert ordinary response supplies the full input measurement.")
+             (test-assert (= 120000 (json-get usage "cached_input_tokens")) "Cached input is a subset of the measured full input.")
+             (test-assert (= 1 (context-admission-test-provider-network-calls provider)) "Only the earned first success reached transport.")
+             (test-assert (= prior-count (context-measured-tests--image-count request)) "The measured prior request contains every prior structured image.")
+             (test-assert (= prior-count stable-images) "The actual final stable prefix covers images in the newest user exchange.")
+             (test-assert (equal wire (provider-cache-wire-plan request :volatile-items (getf prefix :volatile-items 0)))
+                          "The ordinary completion fingerprint describes the actual final wire request.")
+             (format t "~&C-PREFIX separate=~S headroom=~S input=160000 cached=120000 images=~D stable-images=~D wire-items=~D stable-items=~D volatile=~D raw=~D reserve=~D~%"
+                     separate-p headroom-p prior-count stable-images (length input) stable-count
+                     (getf prefix :volatile-items 0) (provider-request-input-token-estimate provider request)
+                     (provider-request-output-reserve provider request)))
+           (context-measured-tests--append-images conversation prior-count 2 :separate-p separate-p)
+           (conversation-append-provider-item conversation
+                                               (json-object "type" "message" "role" "assistant" "content" "New generated reasoning text is delta."))
+           (platform-setenv "AUTOLITH_CONTEXT_WINDOW" "600000")
+           (test-assert (= 600000 (provider-effective-context-window provider)) "Only this private fixture changes from its earning window to the target window.")
+           (test-assert (not (agent-should-compact-p agent)) "The actual ordinary loop need not compact the measured recent images.")
+           (let ((before (mapcar #'json-encode (conversation-input-items conversation))))
+             ;; Observe the original typed refusal before the ordinary recovery handler.
+             ;; This prevents paid summaries from obscuring the causal admission failure.
+             (block target
+               (let ((*context-measured-test-refusal-function*
+                       (lambda (condition)
+                         (setf refusal condition)
+                         (return-from target nil))))
+                 (setf target-result (agent--run-provider-loop agent observer :tools-p nil))))
+             (when refusal
+               (format t "~&C-REFUSAL separate=~S headroom=~S images=~D input=~D reserve=~D window=~D transports=~D measured=160000~%"
+                       separate-p headroom-p (+ prior-count 2)
+                       (provider-context-budget-error-estimated-input-tokens refusal)
+                       (provider-context-budget-error-output-reserve refusal)
+                       (provider-context-budget-error-context-window refusal)
+                       (context-admission-test-provider-network-calls provider))
+               (test-assert (and (= 8192 (provider-context-budget-error-output-reserve refusal))
+                                 (> (provider-context-budget-error-estimated-input-tokens refusal) 600000))
+                            "The base failure is the conservative ordinary image estimate, not fixture setup.")
+               (test-assert (equal before (mapcar #'json-encode (conversation-input-items conversation)))
+                            "A local refusal preserves canonical image evidence."))
+             (test-assert (and (null refusal) target-result
+                               (= 2 (context-admission-test-provider-network-calls provider)))
+                          "Prior measured input plus appended evidence must reach ordinary transport at 600K.")
+             (when target-result
+               (let ((request (first (context-measured-test-requests provider))))
+                 (test-assert (= (+ prior-count 2) (context-measured-tests--image-count request))
+                              "Admission preserves all structured images on the actual ordinary wire.")
+                 (test-assert (every (lambda (item) (member item (mapcar #'json-encode (conversation-input-items conversation)) :test #'equal)) before)
+                              "Successful admission preserves canonical image evidence and surrounding text.")))))))))
+  nil)
+
+(-> test-context-measured-current-images () null)
+(defun test-context-measured-current-images ()
+  "Admit a many-image current exchange after an earned ordinary input measurement."
+  (context-measured-tests--run)
+  nil)
+
+(-> test-context-measured-headroom-images () null)
+(defun test-context-measured-headroom-images ()
+  "Reuse the same measurement at early output headroom and final admission."
+  (context-measured-tests--run :headroom-p t)
+  nil)
+
+(-> test-context-measured-distributed-images () null)
+(defun test-context-measured-distributed-images ()
+  "Admit recent images distributed across exchanges using their own prior measurement."
+  (context-measured-tests--run :separate-p t :headroom-p t)
+  nil)
+
+
+;;;; -- Earned Measurement Controls --
+
+(-> context-measured-tests--earned (function) null)
+(defun context-measured-tests--earned (continuation)
+  "Run CONTINUATION with a real ordinary receipt earned on synthetic current images."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "900000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
+    (with-test-configuration (configuration)
+      (let* ((configuration                 (configuration-copy configuration :model "gpt-6.1-sol" :provider-validation-p nil))
+             (*context-contributors*        nil)
+             (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+             (*context-last-deliveries*     (make-hash-table :test #'equal))
+             (*context-last-delivery-order* nil)
+             (provider                      (make-instance 'context-measured-test-provider :configuration configuration
+                                                           :credential-manager                            (credential-manager-create configuration)))
+             (conversation                  (conversation-create configuration))
+             (agent                         (agent-create :configuration configuration :conversation conversation :provider provider
+                                                          :tool-registry (make-instance 'tool-registry)))
+             (observer                      (make-instance 'callback-agent-observer :status-callback (lambda (&rest values) (declare (ignore values)) nil))))
+        (conversation-append-user-message conversation (make-string 32000 :initial-element #\u))
+        (context-measured-tests--append-images conversation 0 35)
+        (test-call-with-function-replacements
+         (list (list 'credential-manager-credentials
+                     (lambda (&rest arguments) (declare (ignore arguments)) (provider-tests--credentials configuration))))
+         (lambda ()
+           (agent--run-provider-loop agent observer :tools-p nil)
+           (let ((*provider-input-measurement-route*
+                   (provider-input-measurement--route provider (provider-tests--credentials configuration))))
+             (funcall continuation (list :provider provider :conversation conversation :agent agent :observer observer
+                                         :configuration configuration))))))))
+  nil)
+
+(-> context-measured-tests--estimate (model-provider conversation hash-table) (values integer boolean))
+(defun context-measured-tests--estimate (provider conversation request)
+  "Estimate REQUEST in the exact ordinary owner scope after an earned success."
+  (let ((*provider-input-measurement-context* (list :owner conversation :adapter provider)))
+    (provider-request-input-token-estimate provider request)))
+
+(-> test-context-measured-estimate-controls () null)
+(defun test-context-measured-estimate-controls ()
+  "Check measured whole input, fresh delta, payload bounds, overhead and exact mutations."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider     (getf fixture :provider))
+            (conversation (getf fixture :conversation))
+            (receipt      (conversation-input-measurement conversation))
+            (request      (provider-request-object provider conversation #()))
+            (count        (getf receipt :count))
+            (unaccounted  (json-object-copy request)))
+       (test-assert (conversation-input-measurement-valid-p receipt) "Only a completed ordinary request earns a bounded receipt.")
+       (test-assert (= 160000 (getf receipt :input)) "The 120K cache subset neither discounts nor surcharges full160K input.")
+       (setf (gethash "input" unaccounted) (subseq (json-get request "input") count))
+       (multiple-value-bind (estimate uncertain-p) (context-measured-tests--estimate provider conversation request)
+         (test-assert (= estimate (+ 160000 (ceiling (provider-context--request-characters unaccounted) 4))) "Measured input adds the entire generated-output tail and full current overhead.")
+         (test-assert uncertain-p "A mixed measured/local estimate retains uncertainty.")
+         (let ((overhead (json-decode (json-encode request))))
+           (setf (gethash "instructions" overhead) (make-string 40000 :initial-element #\i)
+                 (gethash "tools" overhead) (vector (json-object "type" "function" "name" "new_tool" "description" (make-string 40000 :initial-element #\t))))
+           (let ((current-cost (json-object-copy overhead)))
+             (setf (gethash "input" current-cost) (subseq (json-get overhead "input") count))
+             (test-assert (= (context-measured-tests--estimate provider conversation overhead)
+                             (+ 160000 (ceiling (provider-context--request-characters current-cost) 4)))
+                          "All current instructions and tool definitions are charged without subtracting old overhead.")
+             (test-assert (> (context-measured-tests--estimate provider conversation overhead) estimate)
+                          "Adding substantial current overhead raises the admission estimate."))
+           (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "180000"))
+             (let ((*provider-input-measurement-context* (list :owner conversation :adapter provider)))
+               (test-assert (handler-case (progn (provider-check-request-context provider overhead) nil)
+                              (provider-context-budget-error () t)) "Large current overhead can refuse even with a valid measured prefix.")))))
+       (let* ((new-image (json-object "type" "input_image" "image_url" "data:image/png;base64,AA"))
+              (tail      (concatenate 'vector (json-get request "input") (vector new-image)))
+              (candidate (json-object-copy request)))
+         (setf (gethash "input" candidate) tail)
+         (let ((small (context-measured-tests--estimate provider conversation candidate)))
+           (test-assert (>= (- small (context-measured-tests--estimate provider conversation request)) 16384) "Every unanchored structured image retains the conservative bound.")
+           (setf (gethash "image_url" new-image) (make-string 100000 :initial-element #\a))
+           (test-assert (= small (context-measured-tests--estimate provider conversation candidate)) "New image payload bytes do not replace the image allowance.")
+           (setf (gethash "input" candidate) (concatenate 'vector tail (vector (json-object "type" "input_text" "text" (make-string 100000 :initial-element #\a)))))
+           (test-assert (> (context-measured-tests--estimate provider conversation candidate) (+ small 24000)) "Long ordinary text is charged even beside structured images.")))
+       (dolist (mutation '(:text :image :role :order :delete :call-id :model))
+         (let* ((candidate (json-decode (json-encode request)))
+                (items     (json-get candidate "input")))
+           (ecase mutation
+             (:text
+              (setf (gethash "text" (aref (json-get (aref items 0) "content") 0)) (make-string 32000 :initial-element #\v)))
+             (:image
+              (setf (gethash "image_url" (aref (json-get (aref items 2) "output") 1)) "data:image/png;base64,c3ludGhldGljX"))
+             (:role
+              (setf (gethash "role" (aref items 0)) "xxxx"))
+             (:order
+              (rotatef (aref items 1) (aref items 2)))
+             (:delete
+              (setf (gethash "input" candidate) (subseq items 1)))
+             (:call-id
+              (setf (gethash "call_id" (aref items 1)) "measured-image-X"))
+             (:model
+              (setf (gethash "model" candidate) "gpt-6.1-alt")))
+           (let ((raw (provider-request-input-token-estimate provider candidate)))
+             (test-assert (= raw (context-measured-tests--estimate provider conversation candidate)) "Changed earlier content/order/correlation/model falls back to the full raw estimate.")))))))
+  nil)
+
+(-> test-context-measured-durable-controls () null)
+(defun test-context-measured-durable-controls ()
+  "Reload an earned receipt and reject invalid metadata and unmeasured legacy usage."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider     (getf fixture :provider))
+            (conversation (getf fixture :conversation))
+            (receipt      (conversation-input-measurement conversation))
+            (loaded       (conversation-load (conversation-pathname conversation)))
+            (request      (provider-request-object provider loaded #())))
+       (test-assert (equal receipt (conversation-input-measurement loaded)) "Ordinary receipt metadata survives durable reload.")
+       (test-assert (equal receipt (getf (rest (conversation--header-record conversation)) :input-measurement)) "Chunk snapshots carry only the bounded receipt.")
+       (test-assert (< (context-measured-tests--estimate provider loaded request) 200000) "Reloaded exact-prefix proof enables measured admission.")
+       (dolist (bad (list nil '(:version 2) (list :version 99 :input 160000 :count 71 :root (getf receipt :root) :identity (getf receipt :identity) :issued 2 :layout :responses)
+                          (list :version 1 :input -1 :count 71 :root "bad" :identity "bad" :issued 2 :layout :responses)))
+         (test-assert (not (conversation-input-measurement-valid-p bad)) "Missing, future and malformed metadata is not an anchor."))
+       (let ((legacy (conversation-create (getf fixture :configuration) :identifier "old55-usage-no-receipt")))
+         (conversation-append-user-message legacy (make-string 32000 :initial-element #\u))
+         (context-measured-tests--append-images legacy 0 35)
+         (conversation-append-provider-metadata legacy '(:request-number 1 :response-id "old55-success" :usage (("input_tokens" 160000) ("output_tokens" 30) ("cached_input_tokens" 120000)) :request-identity (:family :codex :model "gpt-6.1-sol")))
+         (let* ((active (conversation-log-pathname legacy))
+                (forms  (conversation--read-records active)))
+           (remf (rest (first forms)) :input-measurement)
+           (conversation-identifier-migration--write-forms active forms)
+           (test-assert (not (member :input-measurement (rest (first (conversation--read-records active)))))
+                        "The OLD55-format journal fixture has no new receipt header field."))
+         (let ((reloaded (conversation-load (conversation-pathname legacy))))
+           (test-assert (null (conversation-input-measurement reloaded)) "Pre-receipt usage alone cannot earn a measured prefix.")
+           (test-assert (> (context-measured-tests--estimate provider reloaded (provider-request-object provider reloaded #())) 590000) "Legacy usage without a wire receipt retains conservative image admission."))))))
+  nil)
+
+(-> test-context-measured-owner-controls () null)
+(defun test-context-measured-owner-controls ()
+  "Detached helpers sharing identity/path/cache keys cannot consume an owner's receipt."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider     (getf fixture :provider))
+            (conversation (getf fixture :conversation))
+            (request      (provider-request-object provider conversation #()))
+            (view         (conversation-compaction-summary-view conversation (conversation-input-items conversation)))
+            (calls        (context-admission-test-provider-network-calls provider)))
+       (test-assert (null (conversation-input-measurement view)) "Detached views start without the parent's receipt.")
+       (test-assert (> (context-measured-tests--estimate provider view request) 590000) "Shared external identity does not imply measured input ownership.")
+       (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+         (let ((*provider-input-measurement-context* (list :owner conversation :adapter provider)))
+           (test-assert (handler-case (progn (provider-open-response-stream provider request :conversation view) nil)
+                          (provider-context-budget-error () t)) "Even direct detached transport admission cannot consume the active parent's receipt.")))
+       (test-assert (= calls (context-admission-test-provider-network-calls provider)) "Refused helper requests do not reach transport."))))
+  nil)
+
+
+;;;; -- Ordinary Measurement Lifecycle Controls --
+
+(defclass context-measured-lifecycle-provider (context-measured-test-provider)
+  ()
+  (:documentation "Synthetic failures at the real Responses transport boundary."))
+
+(defclass context-measured-deadline-stream (test-character-input-stream)
+  ()
+  (:documentation "A response stream whose real close method signals a cleanup deadline."))
+
+(defmethod close ((stream context-measured-deadline-stream) &key abort)
+  "Inject SBCL's deadline condition after a complete ordinary response."
+  (declare (ignore abort))
+  (error 'sb-sys:deadline-timeout :seconds 0.001))
+
+(defparameter *context-measured-transport-hook* nil
+  "An owned test barrier called inside the inert transport after admission.")
+
+(defparameter *context-measured-lifecycle-mode* nil
+  "Transport fault keyword or final usage object for the current test.")
+
+(defmethod provider-open-response-stream
+    ((provider context-measured-lifecycle-provider) (request hash-table)
+     &key credentials conversation)
+  "Inject failures below admission while retaining the ordinary parser."
+  (declare (ignore credentials conversation))
+  (when *context-measured-transport-hook* (funcall *context-measured-transport-hook*))
+  (if (null *context-measured-lifecycle-mode*)
+      (call-next-method)
+      (progn
+        (incf (context-admission-test-provider-network-calls provider))
+        (case *context-measured-lifecycle-mode*
+          (:transport
+           (error 'simple-error :format-control "Synthetic transport failure"))
+          (:retry
+           (setf *context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030))
+           (values (make-instance 'test-character-input-stream :source "Retryable HTTP failure") 500 nil))
+          (:summary
+           (let* ((item   (json-object "type" "message" "role" "assistant" "status" "completed"
+                                       "content" (vector (json-object "type" "output_text" "text"
+                                                                      (format nil "[Progress]~%Paid synthetic summary.~%[Decisions]~%Continue.~%[Context]~%Owned fixture.~%[Constraints]~%Synthetic only.~%[Next steps]~%Resume.~%[References]~%Fixture.")))))
+                  (source (concatenate 'string
+                                       (test-sse-event-string (json-object "type" "response.output_item.done" "item" item))
+                                       (test-sse-event-string (json-object "type" "response.completed" "response"
+                                                                          (json-object "id" "paid-summary" "output" (vector item) "usage"
+                                                                                       (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))))))
+             (values (make-instance 'test-character-input-stream :source source) 200 nil)))
+          (:http
+           (values (make-instance 'test-character-input-stream :source "Synthetic HTTP failure") 500 nil))
+          (otherwise
+           (let* ((mode   *context-measured-lifecycle-mode*)
+                  (usage  (if (hash-table-p mode) mode (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))
+                  (source (test-sse-event-string
+                           (json-object "type" (if (eq mode :partial) "response.incomplete" "response.completed")
+                                        "response" (json-object "id" "lifecycle-response"
+                                                                "output" #()
+                                                                "usage" usage)))))
+             (values (make-instance (case mode
+                                             (:cleanup
+                                              'test-failing-close-stream)
+                                             (:cleanup-deadline
+                                              'context-measured-deadline-stream)
+                                             (otherwise
+                                              'test-character-input-stream)) :source source)
+                     200 nil)))))))
+
+(-> context-measured-tests--event (t) null)
+(defun context-measured-tests--event (event)
+  "Ignore fixture events without omitting the required callback."
+  (declare (ignore event))
+  nil)
+
+(-> context-measured-tests--attempt (list &key (:callback (option function))) (values provider-result list))
+(defun context-measured-tests--attempt (fixture &key callback)
+  "Use runtime's ordinary wrapper and transport, returning its transient ticket."
+  (let ((provider (getf fixture :provider))
+        (owner    (getf fixture :conversation)))
+    (provider-call-with-input-measurement
+     owner (lambda () (provider-stream-turn provider owner :tool-namespaces #()
+                                             :event-callback                (or callback #'context-measured-tests--event))))))
+
+(-> test-context-measured-failure-lifecycle () null)
+(defun test-context-measured-failure-lifecycle ()
+  "Only successful final usage after cleanup may replace an earned measurement."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner                                (getf fixture :conversation))
+            (provider                             (getf fixture :provider))
+            (*provider-maximum-transient-retries* 0)
+            (receipt                              (copy-tree (conversation-input-measurement owner))))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (dolist (usage (list (json-object) (json-object "input_tokens" 0)
+                           (json-object "input_tokens" "170000")
+                           (json-object "input_tokens" 170000.5)
+                           (json-object "output_tokens" 30 "total_tokens" 170030)
+                           (json-object "input_tokens" 170000 "cached_input_tokens" 170001)))
+         (let ((*context-measured-lifecycle-mode* usage))
+           (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+             (test-assert (null ticket) "Missing or malformed final input cannot earn a ticket.")
+             (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket)))
+         (test-assert (equal receipt (conversation-input-measurement owner)) "Invalid usage does not overwrite the receipt."))
+       (let ((before (copy-tree (conversation-usage owner))))
+         (dolist (mode '(:http :transport :partial :cleanup :cleanup-deadline :downstream :cancel))
+           (let ((*context-measured-lifecycle-mode* (unless (member mode '(:downstream :cancel)) mode))
+                 (ticket                            nil)
+                 (completion-seen                   nil)
+                 (calls                             (context-admission-test-provider-network-calls provider)))
+             (test-assert
+              (handler-case
+                  (progn
+                    (setf ticket
+                          (nth-value 1
+                            (if (eq mode :cancel)
+                                (block cancelled
+                                  (provider-call-with-input-measurement
+                                   owner (lambda ()
+                                           (provider-stream-turn provider owner :tool-namespaces #()
+                                                                 :event-callback                 #'context-measured-tests--event)
+                                           (setf completion-seen t)
+                                           (return-from cancelled (values nil nil)))))
+                                (context-measured-tests--attempt
+                                 fixture :callback (when (eq mode :downstream)
+                                                     (lambda (event)
+                                                       (when (typep event 'provider-completed-event)
+                                                        (setf completion-seen t)
+                                                        (error 'simple-error :format-control "Synthetic downstream failure"))))))))
+                    (not (null (member mode '(:cancel :cleanup :cleanup-deadline)))))
+                (error () t))
+              "Failed attempts unwind, except best-effort cleanup which may return a paid result.")
+             (format t "~&LIFECYCLE mode=~S ticket=~S~%" mode (not (null ticket)))
+             (test-assert (null ticket) "No post-callback failure can publish an anchor.")
+             (test-assert (equal receipt (conversation-input-measurement owner)) "Failed attempts preserve the prior receipt.")
+             (test-assert (= (1+ calls) (context-admission-test-provider-network-calls provider)) "Every fault control reaches its actual transport exactly once.")
+             (when (member mode '(:cancel :downstream))
+               (test-assert completion-seen "Cancellation/downstream failure occurs after actual completion."))))
+         (test-assert (equal before (conversation-usage owner)) "Failed attempts append no paid usage metadata."))
+       (let ((*context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))
+         (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+           (test-assert (not (null ticket)) "A later successful retry earns its own ticket.")
+           (agent--persist-provider-result (getf fixture :agent) result :request-number 3 :input-measurement ticket)))
+       (test-assert (= 170000 (getf (conversation-input-measurement owner) :input)) "Only the successful retry replaces measured input."))))
+  nil)
+
+(-> test-context-measured-publication-lineage () null)
+(defun test-context-measured-publication-lineage ()
+  "Reject reverse completion and edits between ordinary return and persistence."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let ((owner (getf fixture :conversation))
+           (agent (getf fixture :agent)))
+       (multiple-value-bind (older-result older-ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore older-result))
+         (multiple-value-bind (result newer-ticket) (context-measured-tests--attempt fixture)
+           (agent--persist-provider-result agent result :request-number 3 :input-measurement newer-ticket)
+           (test-assert (null (provider-input-measurement-ticket-receipt owner older-ticket)) "An earlier ticket cannot overwrite a newer issuance.")
+           (test-assert (= (getf (getf newer-ticket :receipt) :issued) (getf (conversation-input-measurement owner) :issued)) "The newest successful issuance is retained.")))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore result))
+         (setf (conversation-input-items owner) (conversation-input-items owner))
+         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "Even a no-op reset revokes in-flight publication."))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore result))
+         (let ((item (first (conversation-input-items owner))))
+           (setf (gethash "role" item) "assistant"))
+         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "An in-place role edit after return invalidates the ticket.")))))
+  nil)
+
+(-> test-context-measured-effective-identity () null)
+(defun test-context-measured-effective-identity ()
+  "An earned prefix cannot cross effective adapter, endpoint or input interpretation."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner         (getf fixture :conversation))
+            (provider      (getf fixture :provider))
+            (request       (provider-request-object provider owner #()))
+            (configuration (getf fixture :configuration)))
+       (let ((candidate (make-instance 'context-measured-lifecycle-provider :configuration configuration)))
+         (multiple-value-bind (estimate reason)
+             (let ((*provider-input-measurement-context* (list :owner owner :adapter candidate)))
+               (provider-input-measurement--estimate candidate request))
+           (test-assert (and (null estimate) (eq reason :identity-changed)) "A changed effective adapter class falls back.")))
+       (with-test-environment (("AUTOLITH_PROVIDER_ENDPOINT" "https://synthetic.invalid/responses"))
+         (multiple-value-bind (estimate reason)
+             (let ((*provider-input-measurement-context* (list :owner owner :adapter provider)))
+               (provider-input-measurement--estimate provider request))
+           (test-assert (and (null estimate) (eq reason :identity-changed)) "A changed effective endpoint falls back.")))
+       (dolist (field '("reasoning" "request"))
+         (let ((changed (json-object-copy request)))
+           (setf (gethash field changed) (json-object "effort" "changed"))
+           (test-assert (null (let ((*provider-input-measurement-context* (list :owner owner :adapter provider)))
+                                (provider-input-measurement--estimate provider changed))) "Changed interpretation or unsupported envelope cannot consume the anchor."))))))
+  nil)
+
+(-> test-context-measured-volatile-projection () null)
+(defun test-context-measured-volatile-projection ()
+  "Charge changed one-request context, instructions and tools through product projection."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner                            (getf fixture :conversation))
+            (provider                         (getf fixture :provider))
+            (volatile-text                    "Initial one-request context")
+            (instruction                      "Small initial instructions.")
+            (schemas                          (provider-tests--search-filter-schemas))
+            (prefix                           nil)
+            (*provider-cache-prefix-function* (lambda (value) (setf prefix value))))
+       (test-call-with-function-replacements
+        (list (list 'system-prompt (lambda (configuration) (declare (ignore configuration)) instruction))
+              (list 'context-tests--next-request
+                    (lambda (context)
+                      (declare (ignore context))
+                      (make-context-contribution :identifier (if (> (length volatile-text) 100) "changed-volatile" "initial-volatile")
+                                                 :instruction volatile-text :lifetime ':next-request))))
+        (lambda ()
+          (register-context-contributor "measured-volatile" 'context-tests--next-request)
+          (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+            (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket))
+          (test-assert (plusp (getf prefix :volatile-items 0)) "Actual encoder output contains an excluded volatile suffix.")
+          (setf instruction (make-string 40000 :initial-element #\i)
+                volatile-text (make-string 4000 :initial-element #\v))
+          (let* ((request     (provider-request-object provider owner schemas))
+                 (receipt     (conversation-input-measurement owner))
+                 (unaccounted (json-object-copy request)))
+            (setf (gethash "input" unaccounted) (subseq (json-get request "input") (getf receipt :count)))
+            (multiple-value-bind (estimate reason)
+                (let ((*provider-input-measurement-context* (list :owner owner :adapter provider)))
+                  (provider-input-measurement--estimate provider request))
+              (test-assert (eq reason :measured-prefix) "Changing a one-request suffix preserves only the attested stable prefix.")
+              (test-assert (= estimate (+ 160000 (ceiling (provider-context--request-characters unaccounted) 4))) "Current projected tools/instructions/tail are all charged.")
+              (test-assert (>= (length (json-get request "instructions" "")) 40000) "Current large system instructions are present in the actual request.")
+              (test-assert (> (provider-context--request-characters (gethash "input" unaccounted)) 4000) "Current volatile contribution is admitted within the advisory budget and charged in the suffix."))))))))
+  nil)
+
+(-> test-context-measured-storage-lifecycle () null)
+(defun test-context-measured-storage-lifecycle ()
+  "Restore bounded headers and invalidate compaction, including paid rejected publication."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner                           (getf fixture :conversation))
+            (receipt                         (copy-tree (conversation-input-measurement owner)))
+            (header                          (conversation--header-record owner))
+            (restored                        (conversation--from-header (conversation-pathname owner) (conversation-log-pathname owner) header))
+            (history                         (mapcar #'json-encode (conversation-input-items owner)))
+            (*provider-cache-request-prefix* '(:volatile-items 1)))
+       (test-assert (equal receipt (conversation-input-measurement restored)) "A header-only snapshot restores its validated bounded receipt.")
+       (dolist (bad (list '(:version 99) '(:version 1 :input 0)))
+         (let ((changed (copy-tree header)))
+           (setf (getf (rest changed) :input-measurement) bad)
+           (test-assert (null (conversation-input-measurement
+                               (conversation--from-header (conversation-pathname owner) (conversation-log-pathname owner) changed))) "Malformed/future persisted headers load without credit.")))
+       (conversation-append-provider-metadata owner '(:request-number 2 :usage (("input_tokens" 100) ("output_tokens" 50) ("total_tokens" 150))))
+       (let ((paid (copy-tree (conversation-usage owner))))
+         (test-assert (handler-case
+                         (progn (conversation-append-summary owner "Rejected paid summary"
+                                                             :validate-projection (lambda (candidate)
+                                                                                    (declare (ignore candidate))
+                                                                                    (error 'simple-error :format-control "Synthetic candidate refusal"))) nil)
+                       (error () t)) "Failed ordinary candidate validation does not publish a summary.")
+         (test-assert (equal history (mapcar #'json-encode (conversation-input-items owner))) "Rejected publication preserves canonical history.")
+         (test-assert (equal paid (conversation-usage owner)) "Rejected publication preserves known paid summary usage.")
+         (test-assert (equal receipt (conversation-input-measurement owner)) "Rejected replacement does not invalidate the canonical owner's receipt."))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore result))
+         (conversation-append-summary owner "Portable compacted context")
+         (test-assert (null (conversation-input-measurement owner)) "Portable compaction invalidates the old measured prefix.")
+         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "A precompaction completion cannot publish after chunk rollover."))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (test-assert ticket "A postcompaction success captures a fresh stable boundary despite inherited volatile counts.")
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 3 :input-measurement ticket))
+       (let* ((loaded  (conversation-load (conversation-pathname owner)))
+              (request (provider-request-object (getf fixture :provider) loaded #())))
+         (test-assert (conversation-input-measurement-valid-p (conversation-input-measurement loaded)) "New success in a rotated chunk survives normal journal replay.")
+         (test-assert (< (context-measured-tests--estimate (getf fixture :provider) loaded request) 200000) "The replayed new receipt revalidates its own postcompaction wire prefix.")))))
+  nil)
+
+(-> test-context-measured-legacy-refusal () null)
+(defun test-context-measured-legacy-refusal ()
+  "OLD55 usage without a receipt cannot cross actual ordinary admission."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider (getf fixture :provider))
+            (legacy   (conversation-create (getf fixture :configuration) :identifier "old55-real-refusal")))
+       (conversation-append-user-message legacy (make-string 32000 :initial-element #\u))
+       (context-measured-tests--append-images legacy 0 35)
+       (conversation-append-provider-metadata legacy '(:request-number 1 :usage (("input_tokens" 160000) ("output_tokens" 30) ("cached_input_tokens" 120000))))
+       (let* ((active (conversation-log-pathname legacy))
+              (forms  (conversation--read-records active)))
+         (remf (rest (first forms)) :input-measurement)
+         (conversation-identifier-migration--write-forms active forms))
+       (let* ((loaded  (conversation-load (conversation-pathname legacy)))
+              (calls   (context-admission-test-provider-network-calls provider))
+              (attempt (copy-list fixture)))
+         (setf (getf attempt :conversation) loaded)
+         (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+           (test-assert (handler-case (progn (context-measured-tests--attempt attempt) nil)
+                          (provider-context-budget-error () t)) "Usage-only legacy journal is actually refused, not seeded from status counters."))
+         (test-assert (= calls (context-admission-test-provider-network-calls provider)) "Legacy refusal occurs before any target transport.")))))
+  nil)
+
+(-> test-context-measured-native-mechanical () null)
+(defun test-context-measured-native-mechanical ()
+  "Reject receipts across native checkpoints, mechanical bounding and projection rewind."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let ((owner (getf fixture :conversation)))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore result))
+         (conversation-append-native-compaction
+          owner (list (json-object "type" "context_compaction" "encrypted_content" "synthetic-native-checkpoint"))
+          :family ':codex :summary "Synthetic native handoff")
+         (test-assert (null (conversation-input-measurement owner)) "Native compaction invalidates ordinary input evidence.")
+         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "Native publication revokes the outstanding ticket.")
+         (test-assert (null (conversation-input-measurement (conversation-load (conversation-pathname owner)))) "Native invalidation survives chunk reload."))
+       (conversation-append-user-message owner "Inspect old evidence")
+       (conversation-append-provider-item owner (precompaction-tests--call "measured-large-output"))
+       (conversation-append-tool-result owner "measured-large-output" :tool-name "shell.run"
+                                        :output (make-string 12000 :initial-element #\e) :success-p t)
+       (conversation-append-user-message owner "Next user turn")
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 4 :input-measurement ticket))
+       (test-assert (conversation-input-measurement-valid-p (conversation-input-measurement owner)) "Post-native ordinary success earns its own receipt.")
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (declare (ignore result))
+         (let ((paid (copy-tree (conversation-usage owner))))
+           (test-assert (plusp (conversation-precompact owner)) "Mechanical bounding actually changes an old oversized output.")
+           (test-assert (null (conversation-input-measurement owner)) "Mechanical replacement clears the old receipt.")
+           (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "Mechanical replacement revokes in-flight publication.")
+           (test-assert (equal paid (conversation-usage owner)) "Mechanical projection changes do not rewrite paid usage.")))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 5 :input-measurement ticket))
+       (setf (conversation-input-items owner) (butlast (conversation-input-items owner)))
+       (test-assert (null (conversation-input-measurement owner)) "Projection rewind cannot inherit evidence from discarded input."))))
+  nil)
+
+(-> test-context-measured-child-ownership () null)
+(defun test-context-measured-child-ownership ()
+  "A child with inherited history earns only its own ordinary input measurement."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((parent         (getf fixture :conversation))
+            (provider       (getf fixture :provider))
+            (parent-receipt (copy-tree (conversation-input-measurement parent)))
+            (child          (conversation-create (getf fixture :configuration) :identifier "measured-child-owner"))
+            (child-agent    (agent-create :configuration (getf fixture :configuration) :conversation child :provider provider
+                                          :tool-registry (make-instance 'tool-registry)))
+            (calls          (context-admission-test-provider-network-calls provider)))
+       (setf (conversation-input-items child) (mapcar (lambda (item) (json-decode (json-encode item))) (conversation-input-items parent)))
+       (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+         (let ((*provider-input-measurement-context* (list :owner parent :adapter provider)))
+           (test-assert (handler-case
+                           (progn (provider-stream-turn provider child :tool-namespaces #() :goal-context "Parent-owned advisory context"
+                                                       :event-callback #'context-measured-tests--event) nil)
+                         (provider-context-budget-error () t)) "Goal context and inherited history do not authorize the parent's receipt.")))
+       (test-assert (= calls (context-admission-test-provider-network-calls provider)) "The unmeasured child is refused before transport.")
+       (let ((attempt (copy-list fixture)))
+         (setf (getf attempt :conversation) child)
+         (multiple-value-bind (result ticket) (context-measured-tests--attempt attempt)
+           (agent--persist-provider-result child-agent result :request-number 1 :input-measurement ticket))
+         (test-assert (conversation-input-measurement-valid-p (conversation-input-measurement child)) "A successful ordinary child request earns a child-local receipt.")
+         (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+           (multiple-value-bind (result ticket) (context-measured-tests--attempt attempt)
+             (declare (ignore result))
+             (test-assert (not (null ticket)) "Only its own success admits the child's later request."))))
+       (test-assert (= (+ calls 2) (context-admission-test-provider-network-calls provider)) "Exactly two child transports follow its own earning request.")
+       (test-assert (equal parent-receipt (conversation-input-measurement parent)) "Child completion cannot replace the parent's receipt."))))
+  nil)
+
+
+;;;; -- Retry and Replay Admission Controls --
+
+(-> test-context-measured-automatic-retry () null)
+(defun test-context-measured-automatic-retry ()
+  "Earn one ticket only after an automatic failed attempt then success in one call."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider                             (getf fixture :provider))
+            (owner                                (getf fixture :conversation))
+            (calls                                (context-admission-test-provider-network-calls provider))
+            (before                               (copy-list (conversation-usage owner)))
+            (receipt                              (copy-tree (conversation-input-measurement owner)))
+            (failures                             0)
+            (completions                          0)
+            (*provider-maximum-transient-retries* 1)
+            (*context-measured-lifecycle-mode*    :retry)
+            (cl-llm-provider-api:*bounded-retry-sleep-function*
+              (lambda (seconds) (declare (ignore seconds)) nil)))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (multiple-value-bind (result ticket)
+           (context-measured-tests--attempt
+            fixture :callback (lambda (event)
+                                (when (typep event 'provider-attempt-failed-event)
+                                  (incf failures)
+                                  (test-assert (equal receipt (conversation-input-measurement owner)) "The failed automatic attempt cannot replace its predecessor."))
+                                (when (typep event 'provider-completed-event) (incf completions))))
+         (test-assert (= failures 1) "Exactly one failed automatic attempt is observed.")
+         (test-assert (= completions 1) "Only the successful retry completes.")
+         (test-assert (= (+ calls 2) (context-admission-test-provider-network-calls provider)) "Both automatic attempts reach transport in this one ordinary call.")
+         (test-assert (equal before (conversation-usage owner)) "No result is published before the ordinary call returns.")
+         (test-assert (= 170000 (getf (getf ticket :receipt) :input)) "Only the final retry's complete usage earns a ticket.")
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket)
+         (test-assert (= (+ 170000 (first before)) (first (conversation-usage owner))) "Only the successful paid input is added.")
+         (test-assert (= (+ 30 (second before)) (second (conversation-usage owner))) "Only the successful paid output is added.")
+         (test-assert (= 170000 (getf (conversation-input-measurement owner) :input)) "The final successful retry replaces the receipt.")))))
+  nil)
+
+(-> context-measured-tests--ordinary-refusal (model-provider conversation) null)
+(defun context-measured-tests--ordinary-refusal (provider owner)
+  "Check conservative fallback at real ordinary admission with no transport."
+  (let ((calls (context-admission-test-provider-network-calls provider)))
+    (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+      (test-assert
+       (handler-case
+           (progn
+             (provider-call-with-input-measurement
+              owner (lambda () (provider-stream-turn provider owner :tool-namespaces #()
+                                                     :event-callback                 #'context-measured-tests--event)))
+             nil)
+         (provider-context-budget-error (condition)
+           (> (+ (provider-context-budget-error-estimated-input-tokens condition)
+                 (provider-context-budget-error-output-reserve condition)) 600000)))
+       "Invalid evidence falls back and refuses at actual ordinary admission."))
+    (test-assert (= calls (context-admission-test-provider-network-calls provider)) "Fallback refuses before any transport."))
+  nil)
+
+(-> test-context-measured-replay-admission () null)
+(defun test-context-measured-replay-admission ()
+  "Exercise malformed/future metadata replay and changed loaded-owner admission."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider (getf fixture :provider))
+            (owner    (getf fixture :conversation))
+            (receipt  (copy-tree (conversation-input-measurement owner))))
+       (dolist (bad (list '(:version 99) '(:version 1 :input 0)))
+         (let ((fresh (conversation-create (getf fixture :configuration))))
+           (dolist (item (conversation-input-items owner))
+             (conversation-append-provider-item fresh (json-decode (json-encode item))))
+           (conversation-append-provider-metadata fresh (list :request-number 1 :input-measurement bad
+                                                             :usage '(("input_tokens" 160000) ("output_tokens" 30))))
+           (let ((loaded (conversation-load (conversation-pathname fresh))))
+             (test-assert (null (conversation-input-measurement loaded)) "Malformed/future metadata replay earns no receipt.")
+             (context-measured-tests--ordinary-refusal provider loaded)))
+         (conversation-append-provider-metadata owner (list :request-number 2 :input-measurement bad))
+         (test-assert (equal receipt (conversation-input-measurement (conversation-load (conversation-pathname owner)))) "Malformed/future metadata cannot overwrite a valid durable receipt."))
+       (let ((loaded (conversation-load (conversation-pathname owner))))
+         (setf (gethash "role" (first (conversation-input-items loaded))) "assistant")
+         (context-measured-tests--ordinary-refusal provider loaded))
+       (let ((loaded (conversation-load (conversation-pathname owner))))
+         (change-class provider 'context-measured-lifecycle-provider)
+         (context-measured-tests--ordinary-refusal provider loaded)))))
+  nil)
+
+(-> test-context-measured-overlapping-completions () null)
+(defun test-context-measured-overlapping-completions ()
+  "Complete genuinely overlapping ordinary transports in reverse issuance order."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider   (getf fixture :provider))
+            (owner      (getf fixture :conversation))
+            (before     (copy-list (conversation-usage owner)))
+            (calls      (context-admission-test-provider-network-calls provider))
+            (lock       (make-lock "Measured transport barrier"))
+            (condition  (make-condition-variable))
+            (entered    nil)
+            (released   nil)
+            (done       nil)
+            (thread     nil)
+            (failure    nil)
+            (old-result nil)
+            (old-ticket nil))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (labels ((wait-for (predicate)
+                  "Wait for one owned state change with a bounded deadline."
+                  (let ((deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second))))
+                    (with-lock-held (lock)
+                      (loop until (funcall predicate)
+                            do (when (or (>= (get-internal-real-time) deadline)
+                                         (not (condition-wait condition lock :timeout 1)))
+                                 (when (>= (get-internal-real-time) deadline)
+                                   (error 'simple-error :format-control "Owned measurement barrier timed out")))))))
+
+                (release ()
+                  "Release only this test's blocked transport."
+                  (with-lock-held (lock)
+                    (setf released t)
+                    (condition-notify condition))))
+         (unwind-protect
+              (progn
+                (setf thread
+                      (make-thread
+                       (lambda ()
+                         (let ((*context-contributors*            nil)
+                               (*context-resolver*                (cl-llm-provider-api:make-context-resolver))
+                               (*context-last-deliveries*         (make-hash-table :test #'equal))
+                               (*context-last-delivery-order*     nil)
+                               (*context-measured-lifecycle-mode* (json-object "input_tokens" 180000 "output_tokens" 30 "total_tokens" 180030))
+                               (*context-measured-transport-hook*
+                                 (lambda ()
+                                   (with-lock-held (lock)
+                                     (setf entered t)
+                                     (condition-notify condition))
+                                   (wait-for (lambda () released)))))
+                           (unwind-protect
+                                (handler-case
+                                    (multiple-value-setq (old-result old-ticket) (context-measured-tests--attempt fixture))
+                                  (error (caught) (setf failure caught)))
+                             (with-lock-held (lock)
+                               (setf done t)
+                               (condition-notify condition)))))
+                       :name "Owned measured older ordinary transport"))
+                (wait-for (lambda () entered))
+                (test-assert (thread-alive-p thread) "The older ordinary request is still inside transport when the newer one starts.")
+                (let ((*context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))
+                  (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+                    (test-assert ticket "The newer overlapping request earns its own ticket.")
+                    (agent--persist-provider-result (getf fixture :agent) result :request-number 3 :input-measurement ticket)))
+                (let ((newer (copy-tree (conversation-input-measurement owner))))
+                  (release)
+                  (wait-for (lambda () done))
+                  (join-thread thread)
+                  (when failure (error failure))
+                  (test-assert (= 180000 (json-get (provider-result-usage old-result) "input_tokens")) "The older request completes normally after the newer request.")
+                  (test-assert (null old-ticket) "A late older completion receives no publishable ticket.")
+                  (agent--persist-provider-result (getf fixture :agent) old-result :request-number 2 :input-measurement old-ticket)
+                  (test-assert (equal newer (conversation-input-measurement owner)) "Late older paid metadata cannot replace the newer receipt.")
+                  (test-assert (= 170000 (getf newer :input)) "The latest issuance owns the retained measured input.")
+                  (test-assert (= (+ calls 2) (context-admission-test-provider-network-calls provider)) "Exactly two overlapping ordinary transports complete.")
+                  (test-assert (= (+ (first before) 170000 180000) (first (conversation-usage owner))) "Both known paid inputs are preserved despite rejected old credit.")))
+           (release)
+           (when (and thread (thread-alive-p thread))
+             (handler-case (wait-for (lambda () done))
+               (error () (destroy-thread thread))))
+           (when thread (join-thread thread)))))))
+  nil)
+
+
+;;;; -- Measured Admission with Paid Compaction and Missions --
+
+(defmethod provider-native-compact-conversation
+    ((provider context-measured-lifecycle-provider) (conversation conversation)
+     &key tool-namespaces event-callback)
+  "Select portable compaction for this owned transport fixture."
+  (declare (ignore provider conversation tool-namespaces event-callback))
+  (values nil nil))
+
+(-> test-context-measured-paid-summary-rejection () null)
+(defun test-context-measured-paid-summary-rejection ()
+  "Preserve real paid summary usage when actual candidate admission rejects publication."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider                             (getf fixture :provider))
+            (owner                                (getf fixture :conversation))
+            (before                               (copy-list (conversation-usage owner)))
+            (history                              (mapcar #'json-encode (conversation-input-items owner)))
+            (receipt                              (copy-tree (conversation-input-measurement owner)))
+            (calls                                (context-admission-test-provider-network-calls provider))
+            (paid                                 nil)
+            (*context-measured-lifecycle-mode*    :summary)
+            (*provider-input-measurement-context* (list :owner owner :adapter provider)))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "900000"))
+         (let ((observer
+                 (make-instance 'callback-agent-observer
+                                :status-callback
+                                (lambda (status details)
+                                  (declare (ignore details))
+                                  (when (eq status :compaction-request-completed)
+                                    (setf paid (copy-list (conversation-usage owner)))
+                                    (platform-setenv "AUTOLITH_CONTEXT_WINDOW" "100"))
+                                  nil))))
+           (test-assert
+            (handler-case
+                (progn (agent-compact-conversation (getf fixture :agent) observer :tools-p nil) nil)
+              (provider-context-budget-error () t))
+            "After actual paid summary completion the real ordinary candidate validator refuses publication.")))
+       (test-assert paid "The paid summary completion observer ran before rejection.")
+       (test-assert (= (+ calls 1) (context-admission-test-provider-network-calls provider)) "Exactly one actual summary transport completes; no candidate transport occurs.")
+       (test-assert (= (+ 170000 (first before)) (first (conversation-usage owner))) "Known paid summary input survives rejected publication.")
+       (test-assert (= (+ 30 (second before)) (second (conversation-usage owner))) "Known paid summary output survives rejected publication.")
+       (test-assert (equal history (mapcar #'json-encode (conversation-input-items owner))) "The rejected real summary never replaces canonical history.")
+       (test-assert (equal receipt (conversation-input-measurement owner)) "The detached paid summary cannot overwrite its parent's ordinary receipt.")
+       (let ((loaded (conversation-load (conversation-pathname owner))))
+         (test-assert (equal (conversation-usage owner) (conversation-usage loaded)) "Known paid summary usage survives reload after refusal.")
+         (test-assert (equal history (mapcar #'json-encode (conversation-input-items loaded))) "Reload contains no rejected replacement.")
+         (test-assert (equal receipt (conversation-input-measurement loaded)) "Reload retains only the parent's ordinary receipt.")))))
+  nil)
+
+(-> test-context-measured-mission-accounting () null)
+(defun test-context-measured-mission-accounting ()
+  "Use real mission reservation, known settlement, UNKNOWN quarantine and refusal."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((provider    (getf fixture :provider))
+            (owner       (getf fixture :conversation))
+            (application (mission-inference-test--application (getf fixture :configuration) provider)))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket))
+       (setf (application-conversation application) owner
+             (application-agent application) (getf fixture :agent))
+       (application-mission-start application (mission-test--specification :turns 5 :tokens 10000000))
+       (unwind-protect
+            (let* ((context  (mission-context-find owner))
+                   (goal     (mission-context-goal context))
+                   (reserved nil)
+                   (calls    (context-admission-test-provider-network-calls provider)))
+              ;; Model an engaged primary turn, including its post-UNKNOWN admission.
+              (mission-context-bind context (getf fixture :agent))
+              (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+                (let ((*context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030))
+                      (*context-measured-transport-hook*
+                        (lambda ()
+                          (setf reserved (list (getf goal :requests-outstanding) (getf goal :tokens-reserved))))))
+                  (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+                    (test-assert ticket "The exact mission owner consumes its own earned prefix at 600K.")
+                    (agent--persist-provider-result (getf fixture :agent) result :request-number 3 :input-measurement ticket)))
+                (test-assert (and (= 1 (first reserved)) (plusp (second reserved))) "The actual admitted transport holds one finite outstanding reservation.")
+                (test-assert (and (= 170030 (getf goal :tokens-used)) (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved))) "Known mission usage settles once without shrinking the reservation policy.")
+                (let ((receipt                           (copy-tree (conversation-input-measurement owner)))
+                      (known                             (copy-list (conversation-usage owner)))
+                      (*context-measured-lifecycle-mode* (json-object)))
+                  (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+                    (test-assert (null ticket) "A successful transport with missing usage earns no ticket under a mission.")
+                    (agent--persist-provider-result (getf fixture :agent) result :request-number 4 :input-measurement ticket))
+                  (test-assert (and (= 1 (getf goal :unknown-usage)) (eq :blocked (getf goal :status)) (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved))) "UNKNOWN uses the actual mission quarantine and releases the finite reservation.")
+                  (test-assert (equal known (conversation-usage owner)) "Missing usage cannot become measured paid totals.")
+                  (test-assert (equal receipt (conversation-input-measurement owner)) "UNKNOWN cannot replace the valid ordinary receipt.")
+                  (test-assert (handler-case (progn (context-measured-tests--attempt fixture) nil) (mission-error () t)) "A quarantined mission refuses another ordinary attempt.")
+                  (test-assert (= (+ calls 2) (context-admission-test-provider-network-calls provider)) "Only the known and missing-usage attempts reach transport."))))
+         (mission-detach application)))))
+  nil)
+
+(-> test-context-measured-child-accounting () null)
+(defun test-context-measured-child-accounting ()
+  "Charge an admitted child's own measured requests through finite mission accounting."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((parent         (getf fixture :conversation))
+            (provider       (getf fixture :provider))
+            (configuration  (getf fixture :configuration))
+            (parent-receipt (copy-tree (conversation-input-measurement parent)))
+            (parent-usage   (copy-list (conversation-usage parent)))
+            (child          (conversation-create configuration :identifier "measured-accounted-child"))
+            (child-agent    (agent-create :configuration configuration :conversation child :provider provider
+                                          :tool-registry (make-instance 'tool-registry)))
+            (attempt        (copy-list fixture))
+            (application    (mission-inference-test--application configuration provider))
+            (orchestrator   (task-orchestrator-create))
+            (job            (task-tests--make-job orchestrator :identifier  "measured-finite-child"
+                                                              :parent-agent (getf fixture :agent))))
+       (change-class provider 'context-measured-lifecycle-provider)
+       (setf (conversation-input-items child) (mapcar (lambda (item) (json-decode (json-encode item))) (conversation-input-items parent)))
+       (setf (getf attempt :conversation) child
+             (application-conversation application) parent
+             (application-agent application) (getf fixture :agent))
+       (application-mission-start application (mission-test--specification :turns 8 :tokens 10000000))
+       (let* ((context (mission-context-find parent))
+              (goal    (mission-context-goal context))
+              (calls   (context-admission-test-provider-network-calls provider))
+              (held    nil))
+         (setf (slot-value job 'mission-context) context)
+         (mission-context-bind context job)
+         (mission-context-inherit parent child)
+         (unwind-protect
+              ;; Replace only the synthetic child's body, retaining actual child admission,
+              ;; supervision, ordinary transport, reservation and settlement implementations.
+              (test-call-with-function-replacements
+               (list (list 'task-job--run
+                           (lambda (running-job)
+                             (test-assert (and (eq job running-job) (eq job *mission-admitted-operation*)) "The real child runner supplies the exact admitted job identity.")
+                             (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+                               (test-assert (handler-case (progn (context-measured-tests--attempt attempt) nil) (provider-context-budget-error () t)) "An admitted but unmeasured child cannot borrow its parent's receipt."))
+                             (test-assert (and (= calls (context-admission-test-provider-network-calls provider)) (zerop (getf goal :tokens-used))) "Child local refusal has zero paid usage and no transport.")
+                             (multiple-value-bind (result ticket) (context-measured-tests--attempt attempt)
+                               (agent--persist-provider-result child-agent result :request-number 1 :input-measurement ticket))
+                             ;; The inherited mission billable policy discounts cached reads;
+                             ;; ordinary usage and the admission receipt retain full input.
+                             (test-assert (and (conversation-input-measurement-valid-p (conversation-input-measurement child))
+                                               (= 160000 (getf (conversation-input-measurement child) :input))
+                                               (equal '(160000 30 160030 120000 0 t) (conversation-usage child))
+                                               (= 40030 (getf goal :tokens-used))) "Child earning retains full input and follows the existing cached-read billable policy.")
+                             (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000"))
+                               (let ((*context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030
+                                                                                                  "input_tokens_details" (json-object "cached_tokens" 120000)))
+                                     (*context-measured-transport-hook*
+                                       (lambda ()
+                                         (setf held (list (getf goal :requests-outstanding) (getf goal :tokens-reserved)
+                                                          *provider-mission-output-allowance* *mission-admitted-operation*)))))
+                                 (multiple-value-bind (result ticket) (context-measured-tests--attempt attempt)
+                                   (test-assert ticket "Only the child's own receipt admits its ordinary request at 600K.")
+                                   (agent--persist-provider-result child-agent result :request-number 2 :input-measurement ticket)))
+                               (test-assert (and (= 1 (first held)) (plusp (second held)) (= (second held) (third held)) (eq job (fourth held))) "The actual child transport holds its finite reservation under the exact child permit.")
+                               (test-assert (and (= 90060 (getf goal :tokens-used)) (zerop (getf goal :tokens-reserved)) (zerop (getf goal :requests-outstanding))) "Known child requests settle once under the existing billable policy, without charging the output reserve.")
+                               (test-assert (and (= 170000 (getf (conversation-input-measurement child) :input))
+                                                 (equal '(330000 60 330060 240000 0 t) (conversation-usage child))) "Child receipts and known usage count full input with each cached subset included once.")
+                               (let ((receipt                           (copy-tree (conversation-input-measurement child)))
+                                     (known                             (copy-list (conversation-usage child)))
+                                     (*context-measured-lifecycle-mode* (json-object)))
+                                 (multiple-value-bind (result ticket) (context-measured-tests--attempt attempt)
+                                   (test-assert (null ticket) "Missing child usage earns no replacement ticket.")
+                                   (agent--persist-provider-result child-agent result :request-number 3 :input-measurement ticket))
+                                 (let ((charge (getf goal :reservation-charged-tokens)))
+                                   (test-assert (and (plusp charge) (= (+ 90060 charge) (getf goal :tokens-used)) (= 1 (mission-task-job-unknown-usage job))
+                                                     (zerop (getf goal :unknown-usage)) (zerop (getf goal :tokens-reserved)) (zerop (getf goal :requests-outstanding))) "Missing usage uses the child's actual finite allocation and child UNKNOWN audit once.")
+                                   (format t "~&MEASURED-CHILD known-total=330060 full-input=330000 output=60 cached-subset-total=240000 billable=90060 held=~D unknown-charge=~D child-unknown=~D~%"
+                                           (second held) charge (mission-task-job-unknown-usage job)))
+                                 (test-assert (and (equal known (conversation-usage child)) (equal receipt (conversation-input-measurement child))) "Child UNKNOWN preserves known conversation usage and its valid receipt."))
+                               (mission--transition context :paused "Pause the owned child fixture." :cancel-p nil)
+                               (test-assert (handler-case (progn (context-measured-tests--attempt attempt) nil) (mission-error () t)) "A receipt cannot bypass a paused child's mission admission.")
+                               (test-assert (= (+ calls 3) (context-admission-test-provider-network-calls provider)) "Only earning, known and missing-usage child requests reach transport."))
+                             nil)))
+               (lambda () (mission-task-job-run job)))
+           (mission-detach application)
+           (task-orchestrator-close orchestrator)))
+       (test-assert (and (equal parent-receipt (conversation-input-measurement parent)) (equal parent-usage (conversation-usage parent))) "Child accounting and measurement never modify the parent's conversation receipt or paid usage."))))
+  nil)
+
+
+;;;; -- Credential-Owned Routing --
+
+(defclass context-route-test-provider (codex-subscription-provider) ()
+  (:documentation "Real Codex transport with a first local-refusal observer."))
+
+(defmethod provider-open-response-stream :around
+    ((provider context-route-test-provider) (request hash-table) &key credentials conversation)
+  "Observe the first real refusal before ordinary recovery can issue a summary."
+  (declare (ignore request credentials conversation))
+  (handler-bind ((provider-context-budget-error
+                   (lambda (condition)
+                     (when *context-measured-test-refusal-function*
+                       (funcall *context-measured-test-refusal-function* condition)))))
+    (call-next-method)))
+
+(-> context-route-tests--credentials (configuration t string) oauth-credentials)
+(defun context-route-tests--credentials (configuration account bearer)
+  "Create synthetic credentials without consulting a credential store."
+  (make-instance 'oauth-credentials :access-token bearer :refresh-token "route-fixture-refresh"
+                 :id-token "route-fixture-id" :account-id account :expires-at nil
+                 :source-path (configuration-auth-path configuration)))
+
+(-> context-route-tests--run (t boolean boolean) null)
+(defun context-route-tests--run (next-account headroom-p admitted-p)
+  "Reload a real ordinary receipt and exercise the actual Codex header transport."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "900000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
+    (with-test-configuration (configuration)
+      (let* ((configuration                 (configuration-copy configuration :model "gpt-6.1-sol" :provider-validation-p nil))
+             (*context-contributors*        nil)
+             (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+             (*context-last-deliveries*     (make-hash-table :test #'equal))
+             (*context-last-delivery-order* nil)
+             (provider                      (make-instance 'context-route-test-provider :configuration configuration
+                                                           :credential-manager                         (credential-manager-create configuration)))
+             (owner                         (conversation-create configuration))
+             (agent                         (agent-create :configuration configuration :conversation owner :provider provider
+                                                          :tool-registry (make-instance 'tool-registry)))
+             (observer                      (make-instance 'callback-agent-observer :status-callback
+                                                          (lambda (&rest values) (declare (ignore values)) nil)))
+             (credentials                   (context-route-tests--credentials configuration "route-fixture-account-A" "route-fixture-bearer-one"))
+             (routes                        nil)
+             (requests                      nil))
+        (conversation-append-user-message owner (make-string 32000 :initial-element #\u))
+        (context-measured-tests--append-images owner 0 35)
+        (test-call-with-function-replacements
+         (list (list 'credential-manager-credentials
+                     (lambda (&rest arguments) (declare (ignore arguments)) credentials))
+               (list 'provider-post-event-stream
+                     (lambda (endpoint bytes &key headers keep-alive-p)
+                       (declare (ignore endpoint keep-alive-p))
+                       ;; Observe precisely the headers produced by the real Codex primary method.
+                       (push (provider-input-measurement--digest (rest (assoc "ChatGPT-Account-ID" headers :test #'equal))) routes)
+                       (push (json-decode (babel:octets-to-string bytes :encoding :utf-8)) requests)
+                       (let* ((item     (json-object "type" "message" "id" "route-output" "role" "assistant" "status" "completed"
+                                                     "content" (vector (json-object "type" "output_text" "text" "Synthetic route response."))))
+                              (response (json-object "id" "route-response" "status" "completed" "output" (vector item)
+                                                     "usage" (json-object "input_tokens" 160000 "output_tokens" 30 "total_tokens" 160030
+                                                                          "input_tokens_details" (json-object "cached_tokens" 120000)))))
+                         (values (make-instance 'test-character-input-stream :source
+                                                (concatenate 'string
+                                                             (test-sse-event-string (json-object "type" "response.created" "response" response))
+                                                             (test-sse-event-string (json-object "type" "response.output_item.done" "item" item))
+                                                             (test-sse-event-string (json-object "type" "response.completed" "response" response))))
+                                 200 nil)))))
+         (lambda ()
+           (agent--run-provider-loop agent observer :tools-p nil)
+           (test-assert (= 1 (length routes)) "Only the successful earning request reached the real header transport.")
+           (test-assert (= 160000 (getf (conversation-input-measurement owner) :input)) "Complete normalized input earns the route's receipt.")
+           (let* ((loaded                              (conversation-load (conversation-pathname owner)))
+                  (receipt                             (copy-tree (conversation-input-measurement loaded)))
+                  (next-agent                          (agent-create :configuration configuration :conversation loaded :provider provider
+                                                                     :tool-registry (make-instance 'tool-registry)))
+                  (*provider-mission-output-allowance* (when headroom-p 8192)))
+             (test-assert (equal receipt (conversation-input-measurement owner)) "Ordinary replay restores the same receipt before route comparison.")
+             (context-measured-tests--append-images loaded 35 2)
+             (platform-setenv "AUTOLITH_CONTEXT_WINDOW" "600000")
+             (setf credentials (context-route-tests--credentials configuration next-account "route-fixture-bearer-two"))
+             (let ((result (catch 'route-refusal
+                             (let ((*context-measured-test-refusal-function*
+                                     (lambda (condition) (throw 'route-refusal condition))))
+                               (agent--run-provider-loop next-agent observer :tools-p nil)))))
+               (test-assert (eq admitted-p (not (typep result 'provider-context-budget-error))) "Only a proven equivalent account route may consume the loaded receipt.")
+               (test-assert (= (if admitted-p 2 1) (length routes)) "Changed or unknown routing refuses before any target transport.")
+               (when admitted-p
+                 (test-assert (equal (first routes) (second routes)) "Bearer refresh preserves the actual stable account-routing header."))
+               (unless admitted-p
+                 (test-assert (equal receipt (conversation-input-measurement loaded)) "Route refusal preserves the prior valid receipt.")))
+             (provider-tests--assert-credential-free
+              (list receipt (conversation-input-measurement loaded)
+                    (conversation--header-record loaded)
+                    (uiop:read-file-string (conversation-log-pathname loaded)))
+              '("route-fixture-account-A" "route-fixture-account-B" "route-fixture-bearer-one" "route-fixture-bearer-two"
+                "route-fixture-refresh" "route-fixture-id" "ChatGPT-Account-ID" "Authorization")
+              "Routing proofs and ordinary journals contain no raw routing headers or credentials.")))))))
+  nil)
+
+(-> test-context-measured-route-switch () null)
+(defun test-context-measured-route-switch ()
+  "Changed synthetic account routing cannot borrow a replayed ordinary receipt."
+  (context-route-tests--run "route-fixture-account-B" nil nil)
+  nil)
+
+(-> test-context-measured-route-headroom () null)
+(defun test-context-measured-route-headroom ()
+  "Early headroom estimation must reject changed credential-owned routing."
+  (context-route-tests--run "route-fixture-account-B" t nil)
+  nil)
+
+(-> test-context-measured-route-refresh () null)
+(defun test-context-measured-route-refresh ()
+  "A bearer refresh on the same attested account route retains measurement credit."
+  (context-route-tests--run "route-fixture-account-A" nil t)
+  (context-route-tests--run "route-fixture-account-A" t t)
+  nil)
+
+(-> test-context-measured-route-unknown () null)
+(defun test-context-measured-route-unknown ()
+  "Absent, blank or malformed account routing falls back before transport."
+  (dolist (account '(nil "" " " "bad route"))
+    (context-route-tests--run account nil nil)
+    (context-route-tests--run account t nil))
+  nil)
+
+(-> test-context-measured-route-completion-change () null)
+(defun test-context-measured-route-completion-change ()
+  "Revoke a final-wire proof when credential-owned routing changes during parsing."
+  (dolist (change-p '(nil t))
+    (context-measured-tests--earned
+     (lambda (fixture)
+       (let* ((owner         (getf fixture :conversation))
+              (configuration (getf fixture :configuration))
+              (prior         (copy-tree (conversation-input-measurement owner)))
+              (reader        (fdefinition 'oauth-credentials-account-id))
+              (account       (funcall reader (provider-tests--credentials configuration)))
+              (completions   0))
+         (test-call-with-function-replacements
+          (list (list 'oauth-credentials-account-id
+                      (lambda (credentials) (declare (ignore credentials)) account)))
+          (lambda ()
+            (multiple-value-bind (result ticket)
+                (context-measured-tests--attempt
+                 fixture :callback
+                 (lambda (event)
+                   (when (typep event 'provider-completed-event)
+                     (incf completions)
+                     (when change-p (setf account "route-fixture-account-B")))))
+              (test-assert (= 1 completions) "The route change happens in the actual terminal streaming callback.")
+              (test-assert (= 160000 (json-get (provider-usage-normalize (provider-result-usage result)) "input_tokens")) "The successful response keeps its complete paid usage even when its route proof is revoked.")
+              (test-assert (eq change-p (null ticket)) "Only unchanged routing may issue a post-cleanup publication ticket.")
+              (provider-tests--assert-credential-free
+               ticket '("provider-test-account-a0542e" "provider-test-access-7f386d" "route-fixture-account-B" "ChatGPT-Account-ID")
+               "A transient publication ticket retains no raw account or credential headers.")
+              (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket)
+              (when change-p
+                (test-assert (equal prior (conversation-input-measurement owner)) "A mid-response route change cannot replace the valid prior receipt.")))))))))
+  nil)
