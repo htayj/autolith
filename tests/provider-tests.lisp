@@ -3424,6 +3424,92 @@
              "context placement leaves durable history unchanged"))))))
   nil)
 
+(-> test-codex-resumed-turn-context-prefix () null)
+(defun test-codex-resumed-turn-context-prefix ()
+  "Keep Codex turn context at its anchors after a mid-turn restart replays the conversation."
+  (with-test-configuration (configuration)
+    (let* ((*context-contributors*        nil)
+           (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+           (*context-last-deliveries*     (make-hash-table :test #'equal))
+           (*context-last-delivery-order* nil)
+           (conversation                  (conversation-create configuration))
+           (provider                      (provider-create configuration)))
+      (register-context-contributor
+       "codex-resumed-turn-prefix-test"
+       (lambda (context)
+         (declare (ignore context))
+         (list (change-class
+                (make-context-contribution :identifier  "anchored-block"
+                                           :instruction "Anchored current block.")
+                'anchored-context-contribution)
+               (make-context-contribution :identifier  "stable-block"
+                                          :instruction "Stable current block."
+                                          :lifetime    ':turn))))
+      (conversation-append-user-message conversation "earlier task")
+      (conversation-append-provider-item
+       conversation (json-object "type" "message" "role" "assistant"
+                                 "content" (json-array (json-object "type" "output_text"
+                                                                    "text" "earlier answer"))))
+      (conversation-append-user-message conversation "synthetic task")
+      (labels ((input (target)
+                 "Return the projected Codex input of TARGET's next request."
+                 (json-get (provider-request-object provider target #()
+                                                    :goal-context "current goal")
+                           "input"))
+
+               (tool-round (target call-id)
+                 "Append one durable tool exchange to TARGET."
+                 (conversation-append-provider-item
+                  target (json-object "type" "function_call" "name" "sample"
+                                      "call_id" call-id "arguments" "{}"))
+                 (conversation-append-provider-item
+                  target (json-object "type" "function_call_output"
+                                      "call_id" call-id "output" "one")))
+
+               (prefix-p (previous current)
+                 "Return true when every item of PREVIOUS starts CURRENT unchanged."
+                 (and (<= (length previous) (length current))
+                      (string= (json-encode previous)
+                               (json-encode (subseq current 0 (length previous))))))
+
+               (occurrences (text input)
+                 "Return how many items of INPUT carry TEXT."
+                 (count-if (lambda (item) (search text (json-encode item))) input))
+
+               (turn-context-p (input)
+                 "Return true when each context block follows the turn's user message once."
+                 (let ((start (position-if (lambda (item)
+                                             (search "synthetic task" (json-encode item)))
+                                           input)))
+                   (and start
+                        (< (+ start 3) (length input))
+                        (search "Anchored current block" (json-encode (aref input (+ start 1))))
+                        (search "current goal" (json-encode (aref input (+ start 2))))
+                        (search "Stable current block" (json-encode (aref input (+ start 3))))
+                        (every (lambda (text) (= 1 (occurrences text input)))
+                               '("Anchored current block" "current goal" "Stable current block"))))))
+        (input conversation)
+        (tool-round conversation "round-0")
+        (let* ((previous (input conversation))
+               (resumed  (conversation-load (conversation-pathname conversation))))
+          (test-assert (turn-context-p previous)
+                       "the live turn places its context after its user message")
+          (let ((*context-last-deliveries*     (make-hash-table :test #'equal))
+                (*context-last-delivery-order* nil))
+            (test-assert (string= (json-encode previous) (json-encode (input resumed)))
+                         "a resumed conversation rebuilds the interrupted request byte for byte")
+            (dolist (call-id '("round-1" "round-2"))
+              (tool-round resumed call-id)
+              (let ((current (input resumed)))
+                (test-assert
+                 (and (prefix-p previous current)
+                      (turn-context-p current)
+                      (equal (json-get (aref current (1- (length current))) "type")
+                             "function_call_output"))
+                 "each resumed tool round extends the previous input with context in place")
+                (setf previous current))))))))
+  nil)
+
 (defclass test-error-body-character-stream (test-character-input-stream)
   ((reads :initform 0 :accessor test-error-body-reads
           :documentation "Number of character reads, including EOF probes.")

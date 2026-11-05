@@ -885,6 +885,7 @@
   test-codex-rendered-context-request
   test-openai-api-anchored-contributions-request
   test-codex-tool-round-context-prefix
+  test-codex-resumed-turn-context-prefix
   test-provider-deferred-tool-models
   test-provider-deferred-tool-loading
   test-provider-request
@@ -1853,6 +1854,7 @@
   test-compaction-recovery-notice-counts
   test-compaction-recovery-encrypted-history
   test-compaction-recovery-publication-preserves-tail-families
+  test-compaction-recovery-turn-context-anchors
   test-compaction-recovery-metadata-permit
   test-compaction-recovery-unrelated-failure
   test-compaction-recovery-encrypted-eligibility
