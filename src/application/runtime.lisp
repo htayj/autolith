@@ -4344,7 +4344,8 @@ Return NIL and the terminal provider result as a secondary value."
   "Run bounded automatic continuation turns while the session goal is active.
 
 The turns stop, leaving the goal active, while a job whose completion will
-wake the model is still queued, running or undelivered."
+wake the model is still queued, running or undelivered, or while a hosted
+time wakeup will resume the current mission."
   (loop
     (let ((goal (application-goal application)))
       (unless (and goal (eq (getf goal :status) ':active))
@@ -4368,6 +4369,9 @@ wake the model is still queued, running or undelivered."
         (return))
       ;; A running job's completion wakes the model and resumes the goal.
       (when (application-job-completions-awaited-p application)
+        (return))
+      ;; A scheduled occurrence resumes the mission; prompting between occurrences only idles.
+      (when (application-mission-schedules-awaited-p application)
         (return))
       (incf (getf (application-goal application) :continuations))
       (application--record-goal application)
