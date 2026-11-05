@@ -86,15 +86,18 @@ placement-only change; content is identical.
 Implementation update: Codex keeps the system prompt in top-level
 =instructions=. Opted-in anchored contributions (=A=, such as selected skills)
 are projected at their first surviving history boundary on Responses, Anthropic
-and OpenRouter requests;
-the goal and every other contribution follow the history as developer input
-items. An earlier revision also anchored the goal and tail at their first
-boundary, but any change to a mutable block (the agenda, background jobs, or
-per-turn memories) then moved it and split the cached prefix where it used to
-be, discarding all history after it. Keeping that context at the tail costs its
-small size per request instead. No previous prompt is replayed and durable
-history is unchanged. This addresses request-prefix stability, not a guarantee
-of backend cache hits.
+and OpenRouter requests. Elsewhere the goal and every other contribution follow
+the history as developer input items. On Codex that tail is not cheap: behind
+trailing developer messages its cached read stops at the latest user message,
+so every tool round re-read the whole turn. Codex therefore also anchors the
+goal and each lasting block, keyed by its text, within the current turn: an
+unchanged block keeps its place across tool rounds, a new or changed one starts
+after the newest item, and a new user message moves them all behind it. A
+change splits the cached prefix no earlier than the latest user message, which
+bounds the cost an earlier revision paid when it kept blocks anchored at their
+first boundary for good. One-request context still follows the history. No
+previous prompt is replayed and durable history is unchanged. This addresses
+request-prefix stability, not a guarantee of backend cache hits.
 The assembly descriptions and measurements above describe the historical
 review revision, not the current Codex wire layout.
 

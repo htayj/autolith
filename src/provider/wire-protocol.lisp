@@ -597,6 +597,25 @@ NIL leaves the service default in place."))
                :test #'string=)
        "all_turns"))
 
+(defgeneric provider-responses-anchored-context-p (provider)
+  (:documentation
+   "Return true when PROVIDER anchors the goal and lasting context in Responses history.
+
+Otherwise they follow the history on every request."))
+
+(defmethod provider-responses-anchored-context-p ((provider responses-api-provider))
+  "Let request context follow the history."
+  (declare (ignore provider))
+  nil)
+
+(defmethod provider-responses-anchored-context-p ((provider codex-subscription-provider))
+  "Anchor context, since Codex reuses no cached input past trailing developer messages.
+
+Behind them its cached read stops at the latest user message, so every tool
+round of a turn would read the whole turn again."
+  (declare (ignore provider))
+  t)
+
 (defmethod provider-responses-hosted-tools
     ((provider codex-subscription-provider) configuration)
   "Return Codex's enabled hosted tool declarations."
@@ -625,9 +644,9 @@ NIL leaves the service default in place."))
      &key goal-context compaction-p)
   "Project product history, prompt policy, and context into a Responses request.
 
-Return the request and its context delivery. Only anchored contributions keep a
-place inside the history; the goal and every other contribution follow it, so
-changing one never invalidates a provider's cached prefix of earlier history."
+Return the request and its context delivery. Anchored contributions keep a place
+inside the history. The goal and every other contribution follow it, unless
+PROVIDER-RESPONSES-ANCHORED-CONTEXT-P anchors all but one-request context too."
   (let* ((configuration       (provider-configuration provider))
          (hosted-tools
            (and (not compaction-p)
@@ -652,9 +671,11 @@ changing one never invalidates a provider's cached prefix of earlier history."
             conversation (provider-family provider)
             :include-ephemeral-p (not compaction-p))))
     (multiple-value-bind (items stable-context volatile-context)
-        (context-delivery-project-items delivery conversation history)
-      (let* ((suffix (append (list (and (not compaction-p) goal-context))
-                             stable-context
+        (context-delivery-project-items
+         delivery conversation history
+         :goal-context      (and (not compaction-p) goal-context)
+         :anchor-trailing-p (provider-responses-anchored-context-p provider))
+      (let* ((suffix (append stable-context
                              (list volatile-context
                                    (and compaction-p *compaction-instructions*))))
              (projection

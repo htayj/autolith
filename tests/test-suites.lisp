@@ -883,7 +883,8 @@
   test-codex-context-request
   test-codex-reasoning-context
   test-codex-rendered-context-request
-  test-codex-anchored-contributions-request
+  test-openai-api-anchored-contributions-request
+  test-codex-tool-round-context-prefix
   test-provider-deferred-tool-models
   test-provider-deferred-tool-loading
   test-provider-request
