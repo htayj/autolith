@@ -630,13 +630,12 @@ The second value lists GOAL-CONTEXT and then renders each remaining contribution
 that outlives one request as its own block, in priority order. The third value
 renders the one-request contributions together: they change on every delivery.
 
-With ANCHOR-TRAILING-P, the goal and those blocks are anchored instead and the
-second value is NIL, so a tool round's request ends with its durable history,
-as a provider that reuses no cached input past trailing developer messages
-needs. Each is keyed by its text and keeps its place only within the current
-turn: a new or changed block, and every block at a new user message, starts
-after the newest item. A change therefore splits a cached prefix no earlier than
-the latest user message."
+With ANCHOR-TRAILING-P, the goal and lasting blocks share one versioned placement.
+Any owner change or removal relocates the entire current-state group; unchanged
+owners cannot leave an older anchor ahead of preserved history. An unchanged
+group keeps its boundary within the turn. A fresh version precedes the newest
+protocol-complete history suffix, so a tool round still ends in durable history.
+The latest user message bounds relocation. No historical state text is retained."
   (unless (or delivery (and anchor-trailing-p goal-context))
     (return-from context-delivery-project-items
       (values items (and goal-context (list goal-context)) nil)))
@@ -672,13 +671,15 @@ the latest user message."
              (anchors    nil)
              (projected  nil))
         (dolist (placement placements)
-          (let* ((key   (context-anchors-key-digest (getf placement :key)))
-                 (index (context--anchor-index
-                         (find key previous :key  (lambda (anchor) (getf anchor :key))
-                                            :test #'equal)
-                         history
-                         :turn-start (and (getf placement :turn-p) turn-start)))
-                 (after (and index (aref history index))))
+          (let* ((key    (context-anchors-key-digest (getf placement :key)))
+                 (anchor (find key previous :key  (lambda (entry) (getf entry :key))
+                                            :test #'equal))
+                 (index  (if (and (getf placement :turn-p) (null anchor))
+                             (context--current-state-index items :turn-start turn-start)
+                             (context--anchor-index
+                              anchor history
+                              :turn-start (and (getf placement :turn-p) turn-start))))
+                 (after  (and index (aref history index))))
             (push (list :key   key
                         :index index
                         :item  (and after (context-anchors-item-digest after)))
@@ -714,18 +715,48 @@ the latest user message."
 
 (-> context--trailing-placements ((option string) list) list)
 (defun context--trailing-placements (goal-context contributions)
-  "Return turn-bound placements of GOAL-CONTEXT and then of each of CONTRIBUTIONS.
+  "Return one jointly versioned group of turn-bound current-state placements.
 
-Each key includes the rendered text, so a changed block is a new placement."
-  (append
-   (when goal-context
-     (list (list :key (list ':goal goal-context) :text goal-context :turn-p t)))
-   (mapcar (lambda (contribution)
-             (let ((text (context--render (list contribution))))
-               (list :key    (append (context--contribution-key contribution) (list text))
-                     :text   text
-                     :turn-p t)))
-           contributions)))
+Retire every block together when any owner changes, appears or disappears.
+Keep each block's own developer message and priority order. Only version digests
+and history boundaries survive assembly; previous rendered snapshots do not."
+  (let* ((blocks
+           (append
+            (when goal-context
+              (list (list :key (list ':goal) :text goal-context)))
+            (mapcar (lambda (contribution)
+                      (list :key  (context--contribution-key contribution)
+                            :text (context--render (list contribution))))
+                    contributions)))
+         (version (context-anchors-key-digest blocks)))
+    (loop for block in blocks
+          for index from 0
+          collect (list :key    (list ':current-state version index)
+                        :text   (getf block :text)
+                        :turn-p t))))
+
+(-> context--current-state-index (list &key (:turn-start (option (integer 0))))
+    (option (integer 0)))
+(defun context--current-state-index (items &key turn-start)
+  "Place fresh state before the newest correlated history suffix within this turn.
+
+Use the transcript's pure cutoff closure to keep calls, outputs and private
+reasoning together. This computes a boundary only; it does not compact or edit
+history. At a new user boundary, retain the initial post-user context placement."
+  (when items
+    (let* ((plan  (clinker-transcript:make-compaction-plan
+                   (clinker-transcript:make-projection :items items)
+                   :cutoff            (1- (length items))
+                   :repaired-output-p #'conversation-compaction--repaired-output-p))
+           (start (- (length items)
+                     (length (clinker-transcript:compaction-plan-items plan)))))
+      (cond
+        ((and turn-start (<= start turn-start))
+         (1- (length items)))
+        ((plusp start)
+         (1- start))
+        (t
+         nil)))))
 
 (-> context--anchor-index
     ((option list) simple-vector &key (:turn-start (option (integer 0))))
