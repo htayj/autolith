@@ -63,7 +63,8 @@
   test-compaction-summary-acceptance
   test-compaction-native-paid-rejection
   test-compaction-next-request-admission
-  test-compaction-repeated-continuation-accounting)
+  test-compaction-repeated-continuation-accounting
+  test-compaction-unissued-attempt-safety)
 
 (define-test-suite native-compaction-window
   test-native-compaction-window-validation
@@ -1917,3 +1918,24 @@
   test-expanded-native-idle-cancellation-refusal
   test-expanded-native-owner-finalization-errors
   test-expanded-native-scheduled-controller)
+
+(define-test-suite context-live-diagnostic
+  test-context-live-soft-anchor
+  test-context-live-changing-injected-anchor
+  test-context-live-owning-controls)
+
+(define-test-suite context-provenance-guards
+  test-context-provenance-snapshot-window
+  test-context-provenance-origin-completeness
+  test-context-provenance-complete-history
+  test-context-provenance-final-mapping
+  test-context-provenance-receipt-versions
+  test-context-provenance-encoder-semantics
+  test-context-prepared-candidate-once
+  test-context-provenance-projection-control
+  test-context-provenance-projection-reorder
+  test-context-provenance-projection-substitute
+  test-context-provenance-projection-duplicate)
+
+(define-test-suite compaction-provider-participation
+  test-compaction-provider-participation)

@@ -33,8 +33,13 @@
     ((provider compaction-admission-test-provider) (conversation conversation)
      &key tool-namespaces event-callback goal-context compaction-p)
   "Record the cap actually supplied to each ordinary request."
-  (declare (ignore conversation tool-namespaces event-callback goal-context))
+  (declare (ignore event-callback))
   (unless compaction-p
+    ;; Scripted transport must expose the same prepared-candidate decision boundary.
+    ;; Gap providers already traverse the actual open-response-stream methods.
+    (when (eq (class-name (class-of provider)) 'compaction-admission-test-provider)
+      (provider-call-prepared-request-decision
+       provider (provider-request-object provider conversation tool-namespaces :goal-context goal-context)))
     (push *provider-maximum-output-tokens* (compaction-admission-test-caps provider))
     (push *provider-tool-choice* (compaction-admission-test-ordinary-choices provider))))
 
@@ -212,16 +217,17 @@ the strict shape, and whether the only allowed request publishes it."
                                          :observer observer :tool-allowlist '("test.echo")
                                          :tool-restriction-p (oddp index)))
                   (setf conversation (conversation-load (conversation-pathname conversation))))))
+      ;; The unissued soft candidate consumes safety allowance, not a paid number.
       (test-assert (equal '((1 :summary) (2 nil) (1 :summary) (2 nil) (1 :summary) (2 nil))
                           (agent-tests--request-numbers conversation))
                    "every checkpoint and continuation contributes one paid record")
       (test-assert (equal '(1000 1000 1000) (compaction-admission-test-caps provider))
                    "ordinary requests reuse the cap checked before publication")
-      (test-assert (= 3 (length (compaction-admission-test-starts observer)))
-                   "compaction does not duplicate ordinary request-start notifications")
-      (test-assert (equal '("none" "auto" "none")
-                          (compaction-admission-test-encoded-choices provider))
-                   "candidate encoding includes the resolved restricted-round tool choice")
+      (test-assert (= 6 (length (compaction-admission-test-starts observer)))
+                   "each refused candidate and resumed ordinary request is announced once")
+      (test-assert (equal '("none" "none" "none" "auto" "auto" "auto" "none" "none" "none")
+                         (compaction-admission-test-encoded-choices provider))
+                   "initial, validation and resumed candidates retain the resolved tool choice")
       (test-assert (equal '(:none :auto :none)
                           (compaction-admission-test-ordinary-choices provider))
                    "ordinary requests use the same tool choice checked before publication")
@@ -393,7 +399,7 @@ the strict shape, and whether the only allowed request publishes it."
                                        (zerop (getf ledger :tokens-reserved))
                                        (zerop (getf ledger :requests-outstanding))
                                        (= (* 2 network-calls) (getf ledger :tokens-used))
-                                       (= (+ 1 network-calls) (getf ledger :turns-used)))
+                                      (= (+ (if proactive-p 2 1) network-calls) (getf ledger :turns-used)))
                                   "recovery settles all reservations without unknown usage")))))
           (when application (mission-detach application))))))
   nil)
@@ -656,4 +662,377 @@ the strict shape, and whether the only allowed request publishes it."
                (remhash view *mission-contexts*)))
         (mission-detach first-application)
         (mission-detach second-application))))
+  nil)
+
+
+;;;; -- Participating Agent Integration Boundary --
+
+(defclass prepared-scripted-credential-manager (credential-manager) ()
+  (:documentation "A fixture-local manager with synthetic credentials and no credential sources."))
+
+(defmethod credential-manager-load ((manager prepared-scripted-credential-manager))
+  "Return synthetic, nonexpiring authentication without reading credential storage."
+  (declare (ignore manager))
+  (make-instance 'oauth-credentials :access-token "inert-prepared-test"
+                 :account-id "prepared-test" :refresh-token nil :id-token nil
+                 :expires-at nil :source-path nil))
+
+(defclass prepared-scripted-provider (context-measured-test-provider)
+  ((results :initarg :results :accessor scripted-provider-results
+            :documentation "Responses consumed only by admitted transport.")
+   (input-counts :initform nil :accessor scripted-provider-input-counts
+                 :documentation "Durable input counts at admitted transport.")
+   (input-snapshots :initform nil :accessor scripted-provider-input-snapshots
+                    :documentation "Durable inputs at admitted transport.")
+   (compaction-flags :initform nil :accessor scripted-provider-compaction-flags
+                     :documentation "Compaction roles of admitted requests.")
+   (native-items :initarg :native-items :initform nil :accessor native-scripted-provider-native-items
+                 :documentation "Synthetic native checkpoints.")
+   (native-input-snapshots :initform nil :accessor native-scripted-provider-native-input-snapshots
+                           :documentation "Durable inputs at native transport."))
+  (:documentation "Production preparation and admission with inert scripted Responses I/O."))
+
+(defclass prepared-native-scripted-provider (prepared-scripted-provider) ()
+  (:documentation "A participating fixture exercising real native request preparation."))
+
+(defmethod initialize-instance :around
+    ((provider prepared-scripted-provider) &rest initargs &key configuration &allow-other-keys)
+  "Use a private synthetic manager, never the application's credential sources."
+  (declare (ignore configuration))
+  (apply #'call-next-method provider
+         :credential-manager (make-instance 'prepared-scripted-credential-manager) initargs))
+
+(defparameter *prepared-scripted-compaction-p* nil
+  "Role of the candidate currently passing through real preparation.")
+
+(defmethod provider-stream-turn :around
+    ((provider prepared-scripted-provider) (conversation conversation)
+     &key tool-namespaces event-callback goal-context compaction-p)
+  "Record the candidate role without replacing its production preparation."
+  (declare (ignore tool-namespaces event-callback goal-context))
+  (let ((*prepared-scripted-compaction-p* compaction-p))
+    (prepared-scripted--with-credentials (lambda () (call-next-method)))))
+
+(defmethod provider-open-response-stream
+    ((provider prepared-scripted-provider) (request hash-table)
+     &key credentials conversation)
+  "Consume a scripted response only after final preparation and hard admission."
+  (declare (ignore credentials))
+  (let* ((items  (conversation-input-items-for-family
+                  conversation (provider-family provider)
+                  :include-ephemeral-p (not *prepared-scripted-compaction-p*)))
+         (result (pop (scripted-provider-results provider)))
+         (output (coerce (provider-result-output-items result) 'vector))
+         (id     (provider-result-response-id result)))
+    (push request (context-measured-test-requests provider))
+    (push (copy-list items) (scripted-provider-input-snapshots provider))
+    (push (length items) (scripted-provider-input-counts provider))
+    (push *prepared-scripted-compaction-p* (scripted-provider-compaction-flags provider))
+    (values
+     (make-instance
+      'test-character-input-stream
+      :source
+      (concatenate
+       'string
+       (test-sse-event-string (json-object "type" "response.created" "response" (json-object "id" id)))
+       (with-output-to-string (stream)
+         (loop for item across output
+               do (write-string (test-sse-event-string
+                                 (json-object "type" "response.output_item.done" "item" item)) stream)))
+       (test-sse-event-string
+        (json-object "type" "response.completed"
+                     "response" (json-object "id" id "status" "completed" "output" output
+                                             "usage" (provider-result-usage result))))))
+     200 nil)))
+
+(defmethod provider-native-compact-conversation
+    ((provider prepared-scripted-provider) (conversation conversation)
+     &key tool-namespaces event-callback)
+  "Use production native preparation only for the native fixture."
+  (declare (ignore tool-namespaces event-callback))
+  (when (typep provider 'prepared-native-scripted-provider)
+    (prepared-scripted--with-credentials (lambda () (call-next-method)))))
+
+(defmethod provider-open-native-compaction
+    ((provider prepared-scripted-provider) (request hash-table)
+     &key credentials conversation)
+  "Return an inert checkpoint after genuine native hard admission."
+  (declare (ignore credentials conversation))
+  (test-assert (null *provider-input-measurement-context*) "native I/O cannot publish ordinary measurements")
+  (push (coerce (json-get request "input") 'list)
+        (native-scripted-provider-native-input-snapshots provider))
+  (values (json-encode (json-object "id" "prepared-native"
+                                   "output" (vector (pop (native-scripted-provider-native-items provider)))
+                                   "usage" (json-object "input_tokens" 1 "output_tokens" 1)))
+          200 nil))
+
+(-> prepared-scripted--with-credentials (function) t)
+(defun prepared-scripted--with-credentials (function)
+  "Forbid unhandled network I/O while the private manager supplies synthetic credentials."
+  (test-call-with-function-replacements
+   (list (list 'dexador:request
+               (lambda (&rest arguments)
+                 (declare (ignore arguments))
+                 (error "Prepared fixture forbids unhandled HTTP I/O."))))
+   function))
+
+(defmethod provider-final-request-participation-p ((provider prepared-scripted-provider))
+  "Opt the real-boundary fixture into final-candidate soft decisions."
+  (declare (ignore provider))
+  t)
+
+(-> test-compaction-provider-participation () null)
+(defun test-compaction-provider-participation ()
+  "Keep legacy proactive preflight while participants decide only on final prepared input."
+  (dolist (participating-p '(nil t))
+    (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "50000")
+                            ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "256"))
+      (with-test-configuration (configuration)
+        (let* ((conversation (conversation-create configuration))
+               (provider     (make-instance
+                              (if participating-p 'prepared-scripted-provider 'scripted-provider)
+                              :configuration configuration
+                              :results       (list (agent-test-result "compat-summary"
+                                                                      (list (agent-test-compaction-message))
+                                                                      :turn-completion ':end)
+                                                   (mission-test--result "Done."))))
+               (agent        (agent-create :configuration configuration :provider provider
+                                           :conversation conversation :tool-registry (agent-test-registry) :worker nil))
+               (raw-calls    0))
+          (conversation-append-user-message conversation "earlier context")
+          (test-call-with-function-replacements
+           (list (list 'context-estimate-known-tokens
+                       (lambda (&rest arguments)
+                         (declare (ignore arguments))
+                         (incf raw-calls)
+                         999999)))
+           (lambda () (agent-run-user-turn agent "hello")))
+          (test-assert (equal (reverse (scripted-provider-compaction-flags provider))
+                              (if participating-p '(nil) '(t nil)))
+                       "only the legacy path schedules proactive compaction from the raw estimate")
+          (test-assert (if participating-p (zerop raw-calls) (plusp raw-calls))
+                       "participation excludes the raw soft fallback, without removing legacy preflight")
+          (test-assert (= (length (scripted-provider-results provider)) (if participating-p 1 0))
+                       "each admitted request consumes exactly one response")))))
+  nil)
+
+(-> prepared-scripted--anchored-context (request-context) context-contribution)
+(defun prepared-scripted--anchored-context (context)
+  "Provide one stable block whose boundary must follow the compacted history."
+  (declare (ignore context))
+  (change-class
+   (make-context-contribution :identifier  "prepared-observer"
+                              :instruction "Retain the current continuation.")
+   'anchored-context-contribution))
+
+(-> prepared-scripted--run-observed (agent string) provider-result)
+(defun prepared-scripted--run-observed (agent message)
+  "Check each ordinary candidate before refusal unwinds and after native recovery."
+  (let ((counts                 (make-hash-table))
+        (decisions              nil)
+        (history                nil)
+        (anchor-items           nil)
+        (anchors-valid-p        nil)
+        (*context-contributors* nil)
+        (*context-resolver*     (cl-llm-provider-api:make-context-resolver))
+        (names                  '(provider-request-tool-namespaces context-resolve-request
+                                  context-delivery-project-items context-anchors-update)))
+    (register-context-contributor "prepared-observer" 'prepared-scripted--anchored-context)
+    (flet ((ordinary-p ()
+             (and *provider-input-measurement-context*
+                  (not *prepared-scripted-compaction-p*))))
+      (let ((result
+              (test-call-with-function-replacements
+               (append
+                (loop for name in names
+                      for original = (symbol-function name)
+                      collect
+                      (let ((name name) (original original))
+                        (list name
+                              (lambda (&rest arguments)
+                                (when (ordinary-p)
+                                  (incf (gethash name counts 0))
+                                  (when (eq name 'context-delivery-project-items)
+                                    (setf history (copy-list (third arguments)))))
+                                (multiple-value-prog1 (apply original arguments)
+                                  (when (and (ordinary-p) (eq name 'context-anchors-update))
+                                    (let ((anchors (second arguments)))
+                                      (setf anchor-items
+                                            (mapcar (lambda (anchor) (getf anchor :item)) anchors)
+                                            anchors-valid-p
+                                            (and anchors
+                                                 (equal anchors
+                                                        (conversation-context-anchors (first arguments)))
+                                                 (every
+                                                  (lambda (anchor)
+                                                    (let ((index (getf anchor :index)))
+                                                      (and (typep index '(integer 0))
+                                                           (< index (length history))
+                                                           (equal (getf anchor :item)
+                                                                  (context-anchors-item-digest
+                                                                   (nth index history))))))
+                                                  anchors))))))))))
+                (let ((original (symbol-function 'provider-call-prepared-request-decision)))
+                  (list
+                   (list 'provider-call-prepared-request-decision
+                         (lambda (provider request)
+                           (if (and (ordinary-p) *provider-prepared-request-decision*)
+                               (let ((decision
+                                       (list :request         request
+                                             :counts          (loop for name in names collect (gethash name counts 0))
+                                             :anchors-valid-p anchors-valid-p
+                                             :anchor-items    anchor-items
+                                             :refused-p       nil)))
+                                 ;; Snapshot before a soft refusal unwinds the candidate.
+                                 (push decision decisions)
+                                 (clrhash counts)
+                                 (setf history nil anchor-items nil anchors-valid-p nil)
+                                 (handler-bind
+                                     ((provider-proactive-compaction-required
+                                        (lambda (condition)
+                                          (declare (ignore condition))
+                                          (setf (getf decision :refused-p) t))))
+                                   (funcall original provider request)))
+                               (funcall original provider request)))))))
+               (lambda () (agent-run-user-turn agent message)))))
+        (test-assert (= 2 (length decisions))
+                     "the refused and resumed ordinary candidates each decide exactly once")
+        (dolist (decision decisions)
+          (format t "~&PREPARED-CANDIDATE-WITNESS refused=~S counts=~S anchors-valid=~S~%"
+                  (getf decision :refused-p) (getf decision :counts)
+                  (not (null (getf decision :anchors-valid-p))))
+          (test-assert (equal '(1 1 1 1) (getf decision :counts))
+                       "each ordinary candidate selects, resolves, projects and updates anchors once")
+          (test-assert (getf decision :anchors-valid-p)
+                       "each candidate's installed anchor names its own projected history"))
+        (when (= 2 (length decisions))
+          (let* ((admitted (first decisions))
+                 (refused  (second decisions))
+                 (requests (context-measured-test-requests (agent-provider agent))))
+            (format t "~&PREPARED-RETRY-WITNESS admitted-transport-eq=~S refused-transported=~S fresh-request=~S relocated-anchor=~S~%"
+                    (eq (getf admitted :request) (first requests))
+                    (not (null (member (getf refused :request) requests :test #'eq)))
+                    (not (eq (getf refused :request) (getf admitted :request)))
+                    (not (equal (getf refused :anchor-items) (getf admitted :anchor-items))))
+            (test-assert (and (getf refused :refused-p) (not (getf admitted :refused-p)))
+                         "the first ordinary candidate is refused and the retry is admitted")
+            (test-assert (eq (getf admitted :request) (first requests))
+                         "the admitted decision request is EQ to the inert transport request")
+            (test-assert (not (member (getf refused :request) requests :test #'eq))
+                         "the refused candidate never reaches inert transport")
+            (test-assert (not (eq (getf refused :request) (getf admitted :request)))
+                         "recovery prepares a fresh ordinary candidate")
+            (test-assert (not (equal (getf refused :anchor-items) (getf admitted :anchor-items)))
+                         "the retry anchor follows the native checkpoint rather than removed history")))
+        result))))
+
+
+;;;; -- Unissued Attempt Safety --
+
+(-> compaction-attempt-test--run
+    (&key (:mission-p boolean) (:limit (integer 1)) (:repeats (integer 1))
+     (:repeated-refusal-p boolean)) null)
+(defun compaction-attempt-test--run (&key mission-p limit (repeats 1) repeated-refusal-p)
+  "Exercise real soft refusal, native recovery and paid numbering at a bounded turn limit."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "50000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "256"))
+    (with-test-configuration (configuration)
+      (let* ((provider                                   (make-instance
+                                                          'prepared-native-scripted-provider :configuration configuration
+                                                          :native-items                                     (loop repeat (if repeated-refusal-p 2 repeats) collect
+                                                                                                              (json-object "type" "compaction" "encrypted_content" "attempt-native"))
+                                                          :results                                          (loop for round from 1 to (if repeated-refusal-p 2 repeats) append
+                                                                                                              (list (agent-test-result "attempt-summary"
+                                                                                                                                       (list (agent-test-compaction-message))
+                                                                                                                                       :turn-completion ':end)
+                                                                                                                    (agent-test-result "attempt-answer"
+                                                                                                                                       (list (if (and repeated-refusal-p (= round 1))
+                                                                                                                                                 (agent-test-call :call-id   "attempt-continue"
+                                                                                                                                                                  :arguments "{\"value\":\"continue\"}")
+                                                                                                                                                 (agent-test-message "Done.")))
+                                                                                                                                       :usage           (json-object "input_tokens" 2 "output_tokens" 3)
+                                                                                                                                       :turn-completion (if (and repeated-refusal-p (= round 1))
+                                                                                                                                                            ':continue ':end))))))
+             (application                                (when mission-p (mission-inference-test--application configuration provider)))
+             (conversation                               (if application (application-conversation application)
+                                                               (conversation-create configuration)))
+             (agent                                      (agent-create :configuration configuration :conversation conversation
+                                                                       :provider provider :tool-registry (agent-test-registry) :worker nil))
+             (*agent-maximum-provider-requests-per-turn* limit)
+             (soft-count                                 0)
+             (stream-turn                                (symbol-function 'provider-stream-turn))
+             (pending                                    nil))
+        (when application
+          (application-mission-start application (mission-test--specification :turns 8 :tokens 8000)))
+        (unwind-protect
+             (test-call-with-function-replacements
+              (list (list 'agent-should-compact-p
+                          (lambda (candidate)
+                            (declare (ignore candidate))
+                            (or repeated-refusal-p (prog1 pending (setf pending nil)))))
+                    (list 'provider-stream-turn
+                          (lambda (&rest arguments)
+                            (handler-bind ((provider-proactive-compaction-required
+                                             (lambda (condition)
+                                               (declare (ignore condition))
+                                               (incf soft-count))))
+                              (apply stream-turn arguments)))))
+              (lambda ()
+                (loop for turn from 1 to repeats
+                      do (setf pending t soft-count 0)
+                         (let ((failure nil)
+                               (paid    (cond ((= limit 1)
+                                               nil)
+                                              ((= limit 2)
+                                               '((1 :native)))
+                                              ((= limit 3)
+                                               '((1 :native) (2 :summary)))
+                                              (repeated-refusal-p
+                                               '((1 :native) (2 :summary) (3 nil) (4 :native)))
+                                              (t
+                                               '((1 :native) (2 :summary) (3 nil))))))
+                           (handler-case (agent-run-user-turn agent "attempt continuation"
+                                                              :tools-p repeated-refusal-p)
+                             (agent-loop-error (condition) (setf failure condition)))
+                           (format t "~&ATTEMPT-SAFETY mission=~S limit=~D turn=~D soft=~D paid=~S failure=~S~%"
+                                   mission-p limit turn soft-count (agent-tests--request-numbers conversation)
+                                   (not (null failure)))
+                           (test-assert (= soft-count (if repeated-refusal-p 2 1))
+                                        "each real unissued soft refusal is observed once and recovery is bounded")
+                           (test-assert (eq (not (null failure)) (or (< limit 4) repeated-refusal-p))
+                                        "the original safety allowance includes unissued attempts")
+                           (test-assert (equal (loop repeat turn append paid)
+                                               (agent-tests--request-numbers conversation))
+                                        "paid native, summary and ordinary records are contiguous and reset each turn")
+                           (when application
+                             (let ((ledger (mission-context-goal (mission-context-find conversation)))
+                                   (used   (cond ((= limit 1)
+                                                  0)
+                                                 ((= limit 2)
+                                                  2)
+                                                 ((= limit 3)
+                                                  4)
+                                                 (repeated-refusal-p
+                                                  11)
+                                                 (t
+                                                  9))))
+                               (test-assert (= (* turn used) (getf ledger :tokens-used))
+                                            "unissued soft safety attempts add no paid usage")
+                               (test-assert (= (* turn (if repeated-refusal-p 6 (min limit 4)))
+                                               (getf ledger :turns-used))
+                                            "mission attempts retain their existing ledger charge")
+                               (test-assert (and (zerop (getf ledger :tokens-reserved))
+                                                 (zerop (getf ledger :requests-outstanding)))
+                                            "bounded recovery settles every mission reservation")))))))
+          (when application (mission-detach application))))))
+  nil)
+
+(-> test-compaction-unissued-attempt-safety () null)
+(defun test-compaction-unissued-attempt-safety ()
+  "Keep mission and ordinary native recovery bounded without gaps in paid numbering."
+  (dolist (mission-p '(nil t))
+    (dolist (limit '(1 2 3 4))
+      (compaction-attempt-test--run :mission-p mission-p :limit limit
+                                   :repeats (if (= limit 4) 2 1)))
+    (compaction-attempt-test--run :mission-p mission-p :limit 6 :repeated-refusal-p t))
   nil)
