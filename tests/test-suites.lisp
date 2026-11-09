@@ -1770,6 +1770,10 @@
   test-mission-tool-result-presentation
   test-mission-tool-refusal-reporting
   test-mission-accounting
+  test-mission-exhausted-resume
+  test-mission-exhausted-resume-refusals
+  test-mission-resume-status-controls
+
   test-mission-unknown-usage-and-recovery
   test-mission-gate-retries
   test-mission-acceptance-proof
