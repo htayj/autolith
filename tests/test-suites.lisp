@@ -1753,6 +1753,8 @@
   test-mission-exhaustion-interrupted-restore
   test-mission-exhaustion-durable-trace
   test-mission-exhaustion-independent-candidates
+  test-mission-exhaustion-actionable-notice
+
   test-mission-exhaustion-private-redaction)
 
 (define-test-suite missions

@@ -178,12 +178,26 @@
   "Read CHILD's durable unknown-usage count, including requests settled against reservations."
   (getf (mission-task-job-accounting-summary child) :unknown-usage))
 
+(-> mission--exhaustion-notice (mission-context t) string)
+(defun mission--exhaustion-notice (context evidence)
+  "Describe authorized ceiling changes and the available local recovery."
+  (let ((goal (mission-context-goal context)))
+    (format nil "~A~%Deadline ~D (now ~D); turns ~D/~D; tokens ~D + ~D reserved/~D. With authorization, raise the exhausted deadline, turn-limit or token-limit above current usage. ~A"
+            (mission--bounded-text evidence) (getf goal :deadline) (get-universal-time)
+            (getf goal :turns-used) (getf goal :turn-limit)
+            (getf goal :tokens-used) (getf goal :tokens-reserved) (getf goal :token-limit)
+            (if (fboundp 'mission--validate-exhausted-resume)
+                "Then run (mission :resume). Resume requires settled requests, known usage and no pending exhaustion review."
+                "Inspect (mission :status) for the mission's limits and exhaustion review."))))
+
 (-> mission--present-terminal-notice (mission-context keyword t) null)
 (defun mission--present-terminal-notice (context status evidence)
   "Persist a bounded terminal notice while holding CONTEXT's mission lock."
   (let* ((application (mission-context-application context))
          (header      (format nil "■ mission ~A" status))
-         (body        (sanitize-text (mission--bounded-text evidence)))
+         (body        (sanitize-text (if (eq status ':exhausted)
+                                        (mission--exhaustion-notice context evidence)
+                                        (mission--bounded-text evidence))))
          (style       (if (eq status ':blocked) ':notice ':failure)))
     (application-side-status-present
      application (format nil "mission ~A" (string-downcase status))

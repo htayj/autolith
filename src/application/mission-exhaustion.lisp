@@ -498,7 +498,8 @@ Structural pre-redaction checks are a filter, not a claim of complete redaction.
                                                  reason (getf record :new-papercuts))))))
                   (t
                    (mission--transition context :exhausted
-                                        (format nil "~A; ~D papercuts recorded"
+                                        (format nil "Mission ~A limit exhausted; ~A; ~D papercuts recorded"
+                                                 (getf pending :trigger)
                                                 reason (getf record :new-papercuts))))))))))
   nil)
 
