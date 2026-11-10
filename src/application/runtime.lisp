@@ -67,6 +67,35 @@ Clicking the rendered call's header inserts it into the composer.")
     :accessor      application-deferred-goal-continuation
     :type          list
     :documentation "Transient authority to resume the goal that yielded to queued input.")
+   (mission-draft
+    :initform      nil
+    :accessor      application-mission-draft
+    :type          list
+    :documentation "Independent nonworking candidate mission; never implicit work authority.")
+   (mission-draft-context
+    :initform      nil
+    :accessor      application-mission-draft-context
+    :documentation "Exact candidate accounting context, distinct from the working registry.")
+   (candidate-active-p
+    :initarg       :candidate-active-p
+    :initform      t
+    :accessor      application-candidate-active-p
+    :documentation "Whether this application may publish or admit candidate work.")
+   (candidate-origins
+    :initarg       :candidate-origins
+    :initform      (make-hash-table :test #'equal)
+    :reader        application-candidate-origins
+    :documentation "Application-local canonical candidate writers indexed by storage and origin.")
+   (candidate-origins-lock
+    :initarg       :candidate-origins-lock
+    :initform      (make-lock "Candidate origin ownership")
+    :reader        application-candidate-origins-lock
+    :documentation "Protects owner registration and primary lease retirement.")
+   (candidate-request-lock
+    :initarg       :candidate-request-lock
+    :initform      (make-recursive-lock "Candidate requests")
+    :reader        application-candidate-request-lock
+    :documentation "Shared candidate request gate, taken before any individual candidate state lock.")
    (context-estimate-cache
     :initform      nil
     :accessor      application-context-estimate-cache
@@ -963,6 +992,284 @@ the conversation. A warning follows if the previous runtime was not fully restor
           (error failure)))
     (values added-tools removed-tools)))
 
+
+;;;; -- Candidate Origin Ownership --
+
+(defclass candidate-origin ()
+  ((application :initarg :application :accessor candidate-origin-application
+                :documentation "Application exclusively owning this writer.")
+   (key :initarg :key :reader candidate-origin-key
+        :documentation "Canonical storage directory and normalized conversation identifier.")
+   (writer :initarg :writer :reader candidate-origin-writer
+           :documentation "Sole conversation instance permitted to append candidate records.")
+   (lease :initarg :lease :reader candidate-origin-lease
+          :documentation "Existing primary lease retained through pending settlement.")
+   (selected-p :initarg :selected-p :initform nil :accessor candidate-origin-selected-p
+               :documentation "Selected-session ownership pin, including runtime rollback.")
+   (pending :initform (make-hash-table :test #'eq) :reader candidate-origin-pending
+            :documentation "Exact host pins, never token amounts or restored counters.")
+   (uncertain-p :initform nil :accessor candidate-origin-uncertain-p
+                :documentation "Unreconciled callback outcome forbids further candidate mutation or admission.")
+   (uncertainty :initform nil :accessor candidate-origin-uncertainty
+                :documentation "Exact original condition and staged append evidence, without a durability conclusion.")
+   (views :initform nil :accessor candidate-origin-views
+          :documentation "Candidate accounting contexts registered with this writer."))
+  (:documentation "One canonical candidate writer and its application-owned primary lease."))
+
+(defclass candidate-origin-pin ()
+  ((owner :initarg :owner :reader candidate-origin-pin-owner
+          :documentation "Exact primary owner retained by this host pin.")
+   (context :initarg :context :reader candidate-origin-pin-context
+            :documentation "Exact originating accounting view.")
+   (evidence :initform nil :accessor candidate-origin-pin-evidence
+             :documentation "Unresolved callback evidence retained until durable reconciliation."))
+  (:documentation "Opaque ownership pin, which grants no provider admission authority."))
+
+(-> application--candidate-origin-key (configuration string) list)
+(defun application--candidate-origin-key (configuration identifier)
+  "Resolve canonical storage and normalized origin without selecting a writer."
+  (let* ((normalized (conversation-identifier-migration-resolve configuration identifier))
+         (path       (conversation-pathname-for-id configuration normalized)))
+    (ensure-directories-exist path)
+    (list (namestring (platform-truename *platform* (uiop:pathname-directory-pathname path)))
+          normalized)))
+
+(-> application-candidate-origin-find (application configuration string) (option candidate-origin))
+(defun application-candidate-origin-find (application configuration identifier)
+  "Look up APPLICATION's retained writer for the exact storage and origin."
+  (let ((key (application--candidate-origin-key configuration identifier)))
+    (with-lock-held ((application-candidate-origins-lock application))
+      (gethash key (application-candidate-origins application)))))
+
+(-> candidate-origin-validate (candidate-origin) conversation)
+(defun candidate-origin-validate (owner)
+  "Require registered ownership and a current canonical active append head."
+  (when (candidate-origin-uncertain-p owner)
+    (mission--reject ':candidate-origin-uncertain "Candidate origin requires exact durable reconciliation before mutation."))
+  (let* ((application (candidate-origin-application owner))
+         (writer      (candidate-origin-writer owner)))
+    (with-lock-held ((application-candidate-origins-lock application))
+      (unless (and (eq owner (gethash (candidate-origin-key owner) (application-candidate-origins application)))
+                   (conversation-lease-held-p (candidate-origin-lease owner)))
+        (mission--reject ':candidate-origin "Candidate origin no longer has primary ownership.")))
+    (with-recursive-lock-held ((conversation-append-lock writer))
+      (when (conversation-persisted-p writer)
+        (unless (equal (conversation-log-pathname writer)
+                       (conversation-storage-active-pathname (conversation-pathname writer)))
+          (mission--reject ':candidate-origin "Candidate active segment changed outside its owner."))
+        (let ((last-sequence nil))
+          (multiple-value-bind (end incomplete-p count)
+              (sexp-store:log-map
+               (lambda (record) (setf last-sequence (getf (rest record) :seq)))
+               (conversation-log-pathname writer))
+            (declare (ignore end count))
+            (unless (and (not incomplete-p) last-sequence
+                         (= (1+ last-sequence) (conversation-next-sequence writer)))
+              (mission--reject ':candidate-origin "Candidate append head changed outside its owner."))))))
+    writer))
+
+(-> application--candidate-require-active (application) null)
+(defun application--candidate-require-active (application)
+  "Reject candidate authority from an application replaced by reconnection."
+  (unless (application-candidate-active-p application)
+    (mission--reject ':candidate-authority "This application no longer owns candidate admission."))
+  nil)
+
+(-> application--candidate-adopt-origin (application conversation conversation-lease) candidate-origin)
+(defun application--candidate-adopt-origin (application conversation lease)
+  "Register a preclaimed installation writer without acquiring an OS lease."
+  (let* ((configuration (application-configuration application))
+         (identifier    (conversation-identifier conversation))
+         (key           (application--candidate-origin-key configuration identifier))
+         (existing      (application-candidate-origin-find application configuration identifier)))
+    (unless (and (conversation-lease-matches-p lease identifier)
+                 (equal key (list (namestring (platform-truename *platform* (uiop:pathname-directory-pathname (conversation-pathname conversation)))) identifier))
+                 (equal (platform-truename *platform* (conversation-lease--lock-pathname lease))
+                        (platform-truename *platform* (conversation--lease-pathname configuration identifier))))
+      (mission--reject ':candidate-origin "Installation does not own this exact candidate storage."))
+    (when existing
+      (unless (eq lease (candidate-origin-lease existing))
+        (mission--reject ':candidate-origin "Installation supplied a foreign primary lease."))
+      (candidate-origin-validate existing)
+      (return-from application--candidate-adopt-origin existing))
+    (let ((owner (make-instance 'candidate-origin :application application :key key :writer conversation :lease lease)))
+      (with-lock-held ((application-candidate-origins-lock application))
+        (when (gethash key (application-candidate-origins application))
+          (mission--reject ':candidate-origin "Candidate installation ownership changed."))
+        (setf (gethash key (application-candidate-origins application)) owner))
+      (candidate-origin-validate owner)
+      owner)))
+
+(-> application--candidate-transfer (application application) null)
+(defun application--candidate-transfer (previous replacement)
+  "Transfer the explicitly shared owner domain under its shared request gate."
+  (unless (and (application-candidate-active-p previous)
+               (eq (application-candidate-origins previous) (application-candidate-origins replacement))
+               (eq (application-candidate-origins-lock previous) (application-candidate-origins-lock replacement))
+               (eq (application-candidate-request-lock previous) (application-candidate-request-lock replacement)))
+    (mission--reject ':candidate-origin "Reconnect did not retain the exact ownership domain."))
+  (with-lock-held ((application-candidate-origins-lock previous))
+    (maphash (lambda (key owner)
+               (declare (ignore key))
+               (unless (eq previous (candidate-origin-application owner))
+                 (mission--reject ':candidate-origin "Reconnect origin has a foreign application owner.")))
+             (application-candidate-origins previous))
+    (maphash (lambda (key owner)
+               (declare (ignore key))
+               (setf (candidate-origin-application owner) replacement
+                     (candidate-origin-selected-p owner)
+                     (eq (candidate-origin-writer owner) (application-conversation replacement))))
+             (application-candidate-origins previous))
+    (setf (application-candidate-active-p previous) nil
+          (application-candidate-active-p replacement) t))
+  nil)
+
+(-> application-candidate-origin (application conversation) candidate-origin)
+(defun application-candidate-origin (application conversation)
+  "Adopt the selected writer with its primary lease outside all mission locks."
+  (application--candidate-require-active application)
+  (let* ((configuration (application-configuration application))
+         (identifier    (conversation-identifier conversation))
+         (key           (application--candidate-origin-key configuration identifier))
+         (existing      (application-candidate-origin-find application configuration identifier)))
+    (unless (equal key (list (namestring (platform-truename *platform* (uiop:pathname-directory-pathname (conversation-pathname conversation))))
+                             (conversation-identifier conversation)))
+      (mission--reject ':candidate-origin "Candidate conversation belongs to different storage."))
+    (when existing
+      (candidate-origin-validate existing)
+      (return-from application-candidate-origin existing))
+    (unless (eq conversation (application-conversation application))
+      (mission--reject ':candidate-origin "Only the selected primary may establish candidate ownership."))
+    (let* ((current (application-conversation-lease application))
+           (lease   (if (and current (conversation-lease-matches-p current identifier))
+                        current
+                        (conversation-lease-acquire configuration identifier)))
+           (checked-lease
+            (progn
+              (unless (and (conversation-lease-matches-p lease identifier)
+                           (equal (platform-truename *platform* (conversation-lease--lock-pathname lease))
+                                  (platform-truename *platform* (conversation--lease-pathname configuration identifier))))
+                (mission--reject ':candidate-origin "Candidate primary lease belongs to different storage."))
+              lease))
+           (owner   (make-instance 'candidate-origin :application application :key key
+                                   :writer conversation :lease checked-lease :selected-p t)))
+      (with-lock-held ((application-candidate-origins-lock application))
+        (when (gethash key (application-candidate-origins application))
+          (mission--reject ':candidate-origin "Concurrent candidate owner publication requires reconciliation."))
+        (setf (gethash key (application-candidate-origins application)) owner
+              (application-conversation-lease application) lease))
+      owner)))
+
+(-> candidate-origin-register-view (candidate-origin t) null)
+(defun candidate-origin-register-view (owner context)
+  "Register one exact candidate accounting view under the shared request gate."
+  (with-recursive-lock-held ((application-candidate-request-lock (candidate-origin-application owner)))
+    (pushnew context (candidate-origin-views owner) :test #'eq))
+  nil)
+
+(-> candidate-origin-pin (candidate-origin t) candidate-origin-pin)
+(defun candidate-origin-pin (owner context)
+  "Retain exact host operation ownership, without granting paid authority."
+  (candidate-origin-validate owner)
+  (let ((pin (make-instance 'candidate-origin-pin :owner owner :context context)))
+    (with-lock-held ((application-candidate-origins-lock (candidate-origin-application owner)))
+      (unless (member context (candidate-origin-views owner) :test #'eq)
+        (mission--reject ':candidate-origin "Candidate view is not registered with this owner."))
+      (setf (gethash pin (candidate-origin-pending owner)) t))
+    pin))
+
+(-> candidate-origin-retire (candidate-origin) null)
+(defun candidate-origin-retire (owner)
+  "Release unpinned ownership outside request and state locks; uncertainty retains its pin."
+  (let ((application (candidate-origin-application owner))
+        (release-p   nil))
+    (with-lock-held ((application-candidate-origins-lock application))
+      (when (and (eq owner (gethash (candidate-origin-key owner) (application-candidate-origins application)))
+                 (not (candidate-origin-selected-p owner))
+                 (not (candidate-origin-uncertain-p owner))
+                 (zerop (hash-table-count (candidate-origin-pending owner))))
+        (remhash (candidate-origin-key owner) (application-candidate-origins application))
+        (setf release-p t)))
+    (when release-p (conversation-lease-release (candidate-origin-lease owner))))
+  nil)
+
+(-> candidate-origin-unpin (candidate-origin-pin) null)
+(defun candidate-origin-unpin (pin)
+  "Remove only the exact completed host pin; caller retires outside mission locks."
+  (let* ((owner       (candidate-origin-pin-owner pin))
+         (application (candidate-origin-application owner)))
+    (with-lock-held ((application-candidate-origins-lock application))
+      (unless (gethash pin (candidate-origin-pending owner))
+        (mission--reject ':candidate-origin "Candidate operation pin is foreign or already released."))
+      (remhash pin (candidate-origin-pending owner))))
+  nil)
+
+(-> candidate-origin-append (candidate-origin list) (values list keyword t))
+(defun candidate-origin-append (owner record)
+  "Append through the canonical writer; return record, outcome and recovered cause."
+  (let ((writer (candidate-origin-writer owner)))
+    (with-recursive-lock-held ((conversation-append-lock writer))
+      (candidate-origin-validate owner)
+      (handler-case (conversation-candidate-origin-append writer record)
+        (candidate-ledger-consistency-error (condition)
+          (when (eq :uncertain (candidate-ledger-error-outcome condition))
+            (setf (candidate-origin-uncertain-p owner) t
+                  (candidate-origin-uncertainty owner)
+                  (list :condition condition :record record)))
+          (error condition))))))
+
+(-> application--candidate-retire-lease (application conversation-lease) null)
+(defun application--candidate-retire-lease (application lease)
+  "Release LEASE unless a registered candidate owner retains pending pins."
+  (let ((owner nil))
+    (with-lock-held ((application-candidate-origins-lock application))
+      (maphash (lambda (key value)
+                 (declare (ignore key))
+                 (when (eq lease (candidate-origin-lease value))
+                   (setf owner value (candidate-origin-selected-p value) nil)))
+               (application-candidate-origins application)))
+    (if owner (candidate-origin-retire owner) (conversation-lease-release lease)))
+  nil)
+
+(defvar *candidate-origin-staged-views* nil
+  "Exact views prepared by the dynamically enclosing session transaction.")
+
+(-> candidate-origin-discard-staged-view (candidate-origin t) null)
+(defun candidate-origin-discard-staged-view (owner context)
+  "Discard only unpublished staging with no host authority or uncertain outcome."
+  (let ((application (candidate-origin-application owner)))
+    (with-recursive-lock-held ((application-candidate-request-lock application))
+      (with-lock-held ((application-candidate-origins-lock application))
+        (unless (or (eq context (application-mission-draft-context application))
+                    (candidate-origin-uncertain-p owner)
+                    (mission-context-candidate-ticket context)
+                    (loop for pin being the hash-keys of (candidate-origin-pending owner)
+                          thereis (eq context (candidate-origin-pin-context pin))))
+          (setf (candidate-origin-views owner)
+                (remove context (candidate-origin-views owner) :test #'eq))))))
+  nil)
+
+(-> application--candidate-session-call (application string function) t)
+(defun application--candidate-session-call (application identifier function)
+  "Pin a retained writer across runtime preparation and rollback, outside mission locks."
+  (application--candidate-require-active application)
+  (let* ((owner                           (application-candidate-origin-find application (application-configuration application) identifier))
+         (pin                             (and owner (make-instance 'candidate-origin-pin :owner owner :context nil)))
+         (*candidate-origin-staged-views* (list nil)))
+    (when pin
+      (with-lock-held ((application-candidate-origins-lock application))
+        (unless (and (eq owner (gethash (candidate-origin-key owner) (application-candidate-origins application)))
+                     (conversation-lease-held-p (candidate-origin-lease owner)))
+          (mission--reject ':candidate-origin "Candidate ownership changed before session installation."))
+        (setf (candidate-origin-pin-evidence pin) ':session-install
+              (gethash pin (candidate-origin-pending owner)) t)))
+    (unwind-protect (funcall function)
+      (dolist (entry (remove nil *candidate-origin-staged-views*))
+        (candidate-origin-discard-staged-view (first entry) (second entry)))
+      (when pin
+        (candidate-origin-unpin pin)
+        (candidate-origin-retire owner)))))
+
 (-> application--conversation-lease-select
     ((option application) configuration string)
     (values conversation-lease boolean))
@@ -972,6 +1279,10 @@ the conversation. A warning follows if the previous runtime was not fully restor
 
 The second value is true only when the caller owns cleanup of a newly acquired
 lease."
+  (let ((owner (and application (application-candidate-origin-find application configuration identifier))))
+    (when owner
+      (candidate-origin-validate owner)
+      (return-from application--conversation-lease-select (values (candidate-origin-lease owner) nil))))
   (let* ((normalized
            (conversation-identifier-migration-resolve
             configuration identifier))
@@ -995,6 +1306,10 @@ lease."
 
 Return the conversation, its lease, and whether the caller owns cleanup of a
 newly acquired lease."
+  (let ((owner (and application (application-candidate-origin-find application configuration identifier))))
+    (when owner
+      (return-from application--conversation-load-owned
+        (values (candidate-origin-validate owner) (candidate-origin-lease owner) nil))))
   (multiple-value-bind (lease acquired-p)
       (application--conversation-lease-select
        application configuration identifier)
@@ -1041,7 +1356,7 @@ newly acquired lease."
     (let ((lease (application-conversation-lease application)))
       (when lease
         (setf (application-conversation-lease application) nil)
-        (conversation-lease-release lease))))
+        (application--candidate-retire-lease application lease))))
   nil)
 
 (-> application-create
@@ -1241,11 +1556,22 @@ lineage instead of loading it again."
          (configuration-group-values previous ':management)))
 
 (-> application-reconnect
+    (application &key (:conversation-id (option string)) (:immutable-p boolean)
+                     (:permission-mode (member :ask :auto :sandboxed :full-access))) application)
+(defun application-reconnect (application &rest arguments &key conversation-id immutable-p permission-mode)
+  "Retain candidate installation pins while preparing a replacement application."
+  (declare (ignore immutable-p permission-mode))
+  (application--candidate-require-active application)
+  (application--candidate-session-call
+   application (or conversation-id (conversation-identifier (application-conversation application)))
+   (lambda () (apply #'application--reconnect-unpinned application arguments))))
+
+(-> application--reconnect-unpinned
     (application &key (:conversation-id (option string))
                       (:immutable-p boolean)
                       (:permission-mode (member :ask :auto :sandboxed :full-access)))
     application)
-(defun application-reconnect
+(defun application--reconnect-unpinned
     (application &key conversation-id
                    (immutable-p nil immutable-p-supplied-p)
                    (permission-mode ':ask))
@@ -1367,6 +1693,10 @@ lineage instead of loading it again."
                               (make-instance
                                'application
                                :configuration           configuration
+                               :candidate-active-p      nil
+                               :candidate-origins       (application-candidate-origins application)
+                               :candidate-origins-lock  (application-candidate-origins-lock application)
+                               :candidate-request-lock  (application-candidate-request-lock application)
                                :conversation            conversation
                                :conversation-lease      selected-conversation-lease
                                :provider                provider
@@ -1401,7 +1731,9 @@ lineage instead of loading it again."
                            restored-history-floor-sequence
                            (application-mutation-replay-failures new-application) nil))
                         (application-refresh-context-meter new-application)
-                        (application--load-goal new-application)
+                        (when (conversation-latest-mission-draft-record conversation)
+                          (application--candidate-adopt-origin application conversation selected-conversation-lease))
+                        (application--load-goal new-application :draft-p nil)
                         (image-state-reconnect)
                         (setf retirement-started-p t
                               failure-stage ':retire)
@@ -1420,12 +1752,19 @@ lineage instead of loading it again."
                         (telemetry--call-safely
                          (lambda () (telemetry-attach
                                      (application-configuration new-application))))
+                        (with-recursive-lock-held ((application-candidate-request-lock application))
+                          (multiple-value-bind (draft context)
+                              (mission-draft--prepare new-application conversation
+                                :owner (application-candidate-origin-find application configuration (conversation-identifier conversation)))
+                            (setf (application-mission-draft new-application) draft
+                                  (application-mission-draft-context new-application) context))
+                          (application--candidate-transfer application new-application))
                         (setf completed-p t)
                         (when (and retained-conversation-lease
                                    (not
                                     (eq retained-conversation-lease
                                         selected-conversation-lease)))
-                          (conversation-lease-release retained-conversation-lease)
+                          (application--candidate-retire-lease new-application retained-conversation-lease)
                           (setf (application-conversation-lease application) nil))
                         (when (and (slot-boundp application 'worker)
                                    (application-worker application))
@@ -1442,7 +1781,7 @@ lineage instead of loading it again."
                   (application--discard-connection-resources
                    new-application registry worker))
             (when selected-conversation-lease-acquired-p
-              (conversation-lease-release selected-conversation-lease))
+              (application--candidate-retire-lease application selected-conversation-lease))
             (when retirement-started-p
               (setf rollback-failures
                     (nconc
@@ -1885,11 +2224,30 @@ retiring the old registry."
         conversation :start start :limit *terminal-history-page-size*)))))
 
 (-> application--install-owned-conversation
+    (application conversation &key (:conversation-lease conversation-lease)) application)
+(defun application--install-owned-conversation (application conversation &key conversation-lease)
+  "Prepare candidate ownership before the short session publication."
+  (application--candidate-require-active application)
+  (let ((owner (and (conversation-latest-mission-draft-record conversation)
+                    (application--candidate-adopt-origin application conversation conversation-lease))))
+    (unwind-protect
+         (application--candidate-session-call
+          application (conversation-identifier conversation)
+          (lambda () (application--install-owned-conversation-body application conversation :conversation-lease conversation-lease)))
+      (when owner (candidate-origin-retire owner)))))
+
+(-> application--install-owned-conversation-body
     (application conversation &key (:conversation-lease conversation-lease))
     application)
-(defun application--install-owned-conversation
+(defun application--install-owned-conversation-body
     (application conversation &key conversation-lease)
   "Atomically install owned CONVERSATION with a fresh tool runtime and agent."
+  (let ((owner (application-candidate-origin-find
+                application (application-configuration application) (conversation-identifier conversation))))
+    (when owner
+      (unless (eq conversation-lease (candidate-origin-lease owner))
+        (mission--reject ':candidate-origin "Session installation supplied a foreign candidate lease."))
+      (setf conversation (candidate-origin-validate owner))))
   (let* ((configuration
            (application--configuration-for-conversation
             (application-configuration application)
@@ -1913,7 +2271,9 @@ retiring the old registry."
            (application-transcript-synchronized-p application))
          (previous-history-floor-sequence
            (application-history-floor-sequence application))
-         (previous-goal               (copy-list (application-goal application)))
+         (previous-goal               (application-goal application))
+         (previous-draft              (application-mission-draft application))
+         (previous-draft-context      (application-mission-draft-context application))
          (provider                    nil)
          (registry                    nil)
          (agent                       nil)
@@ -1944,13 +2304,19 @@ retiring the old registry."
                    (error retirement-failure)))
                (setf failure-stage ':install
                      application-swapped-p t)
-               (setf (application-configuration application) configuration
-                     (application-conversation application) conversation
-                     (application-conversation-lease application)
-                     conversation-lease
-                     (application-provider application) provider
-                     (application-tool-registry application) registry
-                     (application-agent application) agent)
+               (with-recursive-lock-held ((application-candidate-request-lock application))
+                (multiple-value-bind (draft context)
+                    (mission-draft--prepare application conversation
+                      :owner (application-candidate-origin-find application configuration (conversation-identifier conversation)))
+                 (setf (application-mission-draft application) draft
+                       (application-mission-draft-context application) context))
+                (setf (application-configuration application) configuration
+                      (application-conversation application) conversation
+                      (application-conversation-lease application)
+                      conversation-lease
+                      (application-provider application) provider
+                      (application-tool-registry application) registry
+                      (application-agent application) agent))
                (application-connect-task-presentation application)
                (setf (application-rendered-sequence application) 0
                      (application-render-position application) 0
@@ -1958,7 +2324,7 @@ retiring the old registry."
                      (conversation-log-generation conversation)
                      (application-transcript-synchronized-p application) nil
                      (application-history-floor-sequence application) nil)
-               (application--load-goal application)
+               (application--load-goal application :draft-p nil)
                (context-runtime-reset)
                (when ui
                  (application--load-conversation-input-history ui conversation))
@@ -1973,30 +2339,35 @@ retiring the old registry."
               (application-disconnect-task-presentation application)
             (serious-condition (condition)
               (push condition rollback-failures)))
-          (setf (application-configuration application)
-                previous-configuration
-                (application-conversation application)
-                previous-conversation
-                (application-conversation-lease application)
-                previous-conversation-lease
-                (application-provider application)
-                previous-provider
-                (application-tool-registry application)
-                previous-registry
-                (application-agent application)
-                previous-agent
-                (application-rendered-sequence application)
-                previous-rendered-sequence
-                (application-render-position application)
-                previous-render-position
-                (application-render-generation application)
-                previous-render-generation
-                (application-transcript-synchronized-p application)
-                previous-transcript-synchronized-p
-                (application-history-floor-sequence application)
-                previous-history-floor-sequence
-                (application-goal application)
-                previous-goal)
+          (with-recursive-lock-held ((application-candidate-request-lock application))
+           (setf (application-configuration application)
+                 previous-configuration
+                 (application-conversation application)
+                 previous-conversation
+                 (application-conversation-lease application)
+                 previous-conversation-lease
+                 (application-provider application)
+                 previous-provider
+                 (application-tool-registry application)
+                 previous-registry
+                 (application-agent application)
+                 previous-agent
+                 (application-rendered-sequence application)
+                 previous-rendered-sequence
+                 (application-render-position application)
+                 previous-render-position
+                 (application-render-generation application)
+                 previous-render-generation
+                 (application-transcript-synchronized-p application)
+                 previous-transcript-synchronized-p
+                 (application-history-floor-sequence application)
+                 previous-history-floor-sequence
+                 (application-goal application)
+                 previous-goal
+                 (application-mission-draft application)
+                 previous-draft
+                 (application-mission-draft-context application)
+                 previous-draft-context))
           (handler-case
               (application-localgroup-sync-conversation application)
             (serious-condition (condition)
@@ -2021,18 +2392,22 @@ retiring the old registry."
        :stage           failure-stage
        :cause           failure
        :rollback-causes rollback-failures))
+    (let ((owner (application-candidate-origin-find application configuration (conversation-identifier conversation))))
+      (when owner
+        (with-lock-held ((application-candidate-origins-lock application))
+          (setf (candidate-origin-selected-p owner) t))))
     (when (and previous-conversation
                (not (eq previous-conversation conversation)))
       (conversation-picker-search-close previous-conversation))
     (when (and previous-conversation-lease
                (not
                 (eq previous-conversation-lease conversation-lease)))
-      (conversation-lease-release previous-conversation-lease))
+      (application--candidate-retire-lease application previous-conversation-lease))
     (application-refresh-context-meter application)
     application))
 
-(-> application-install-conversation (application conversation) application)
-(defun application-install-conversation (application conversation)
+(-> application--install-conversation-unpinned (application conversation) application)
+(defun application--install-conversation-unpinned (application conversation)
   "Claim and atomically install CONVERSATION with a fresh runtime and agent."
   (multiple-value-bind (lease acquired-p)
       (application--conversation-lease-select
@@ -2046,11 +2421,12 @@ retiring the old registry."
                 application conversation :conversation-lease lease)
              (setf completed-p t))
         (unless completed-p
-          (when acquired-p
-            (conversation-lease-release lease)))))))
+          (when (and acquired-p
+                     (not (eq lease (application-conversation-lease application))))
+            (application--candidate-retire-lease application lease)))))))
 
-(-> application-resume-conversation (application string) application)
-(defun application-resume-conversation (application identifier)
+(-> application--resume-conversation-unpinned (application string) application)
+(defun application--resume-conversation-unpinned (application identifier)
   "Claim IDENTIFIER before loading and atomically install its conversation."
   (multiple-value-bind (conversation lease acquired-p)
       (application--conversation-load-owned
@@ -2064,8 +2440,27 @@ retiring the old registry."
                 application conversation :conversation-lease lease)
              (setf completed-p t))
         (unless completed-p
-          (when acquired-p
-            (conversation-lease-release lease)))))))
+          (when (and acquired-p
+                     (not (eq lease (application-conversation-lease application))))
+            (application--candidate-retire-lease application lease)))))))
+
+(-> application-install-conversation (application conversation) application)
+(defun application-install-conversation (application conversation)
+  "Normalize a raw view to its canonical owner while retaining installation ownership."
+  (let* ((configuration (application-configuration application))
+         (identifier    (conversation-identifier conversation))
+         (expected      (application--candidate-origin-key configuration identifier))
+         (actual        (list (namestring (platform-truename *platform* (uiop:pathname-directory-pathname (conversation-pathname conversation)))) identifier)))
+    (unless (equal expected actual)
+      (mission--reject ':candidate-origin "Session conversation belongs to different storage."))
+    (application--candidate-session-call
+     application identifier (lambda () (application--install-conversation-unpinned application conversation)))))
+
+(-> application-resume-conversation (application string) application)
+(defun application-resume-conversation (application identifier)
+  "Resume the canonical retained writer with a temporary installation pin."
+  (application--candidate-session-call
+   application identifier (lambda () (application--resume-conversation-unpinned application identifier))))
 
 
 ;;;; -- Transcript Projection --
@@ -3476,8 +3871,8 @@ A fullscreen transcript evicts its oldest output; those records page in again."
                :created-at    nil))))
   nil)
 
-(-> application--load-goal (application) null)
-(defun application--load-goal (application)
+(-> application--load-goal (application &key (:draft-p boolean)) null)
+(defun application--load-goal (application &key (draft-p t))
   "Restore APPLICATION's goal from the newest durable goal record."
   (let* ((record
            (conversation-latest-goal-record
@@ -3510,6 +3905,7 @@ A fullscreen transcript evicts its oldest output; those records page in again."
                    (let ((sequence (getf (rest record) :last-response-sequence)))
                      (and (typep sequence '(integer 0)) sequence))))))))
   (mission-restore application)
+  (when draft-p (mission-draft-restore application))
   (application-mission-schedules application)
   nil)
 

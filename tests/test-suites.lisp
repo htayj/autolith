@@ -2114,3 +2114,6 @@
 
 (define-test-suite mission-specification
   test-mission-specification-validation)
+
+(define-test-suite mission-draft
+  test-mission-draft-coexistence)

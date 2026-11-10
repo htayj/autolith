@@ -22,6 +22,12 @@
                 :documentation "Application owning the durable goal.")
    (goal :initarg :goal :accessor mission-context-goal
          :documentation "Exact goal identity, including after replacement.")
+   (conversation :initarg :conversation :initform nil :reader mission-context-conversation
+                 :documentation "Original durable conversation, including after a session switch.")
+   (origin-owner :initarg :origin-owner :initform nil :reader mission-context-origin-owner
+                 :documentation "Canonical candidate writer owner, absent for ordinary working contexts.")
+   (candidate-ticket :initform nil :accessor mission-context-candidate-ticket
+                     :documentation "Exact host candidate admission, never model data.")
    (lock :initform (make-recursive-lock "Mission state") :reader mission-context-lock
          :documentation "Serializes counters, transitions and persistence.")
    (transition-revision :initform      0
@@ -31,7 +37,8 @@
    (evaluation-lock :initform      (make-lock "Mission exhaustion evaluation")
                     :reader        mission-context-evaluation-lock
                     :documentation "Serializes independent exhaustion evaluations.")
-   (request-lock :initform      (make-recursive-lock "Mission requests")
+   (request-lock :initarg       :request-lock
+                 :initform      (make-recursive-lock "Mission requests")
                  :reader        mission-context-request-lock
                  :documentation "Serializes provider admission and settlement.")
    (threads :initform (make-hash-table :test #'eq) :reader mission-context-threads
@@ -114,12 +121,40 @@
 
 (-> mission--record (mission-context) null)
 (defun mission--record (context)
-  "Persist CONTEXT's exact mission without changing a replacement goal."
-  (let ((application (mission-context-application context))
-        (goal        (mission-context-goal context)))
-    (when (eq goal (application-goal application))
-      (conversation-append-record (application-conversation application)
-                                  (cons :goal (copy-tree goal)))))
+  "Publish candidate specification, claim or audit only through its canonical owner."
+  (let* ((application  (mission-context-application context))
+         (goal         (mission-context-goal context))
+         (owner        (mission-context-origin-owner context))
+         (conversation (or (mission-context-conversation context)
+                           (application-conversation application))))
+    (cond
+      ((getf goal :candidate-id)
+       (unless owner
+         (mission--reject ':candidate-origin "Candidate context has no canonical writer owner."))
+       (handler-case
+           (multiple-value-bind (stored outcome original)
+               (candidate-origin-append
+                owner
+                (if (and (application-candidate-active-p application)
+                         (eq (candidate-origin-application owner) application)
+                         (eq (candidate-origin-writer owner) (application-conversation application))
+                         (eq goal (application-mission-draft application))
+                         (eq context (application-mission-draft-context application)))
+                    (cons :mission-draft (copy-tree goal))
+                    (list :mission-draft-audit :candidate-id (getf goal :candidate-id)
+                          :snapshot            (copy-tree goal))))
+             (declare (ignore stored outcome))
+             (when original
+               (if *mission-candidate-policy-audit*
+                   (setf (first *mission-candidate-policy-audit*) original)
+                   (error original))))
+         (serious-condition (condition)
+          (if *mission-candidate-policy-audit*
+              (setf (first *mission-candidate-policy-audit*) condition)
+              (error condition)))))
+      ((eq goal (application-goal application))
+       (with-recursive-lock-held ((conversation-append-lock conversation))
+         (conversation-append-record conversation (cons :goal (copy-tree goal)))))))
   nil)
 
 (-> mission--evidence (mission-context keyword t) null)
@@ -997,3 +1032,144 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
 (defmethod initialize-instance :after ((job session-job) &key mission-context &allow-other-keys)
   "Capture exact mission identity before a session job can enter its worker queue."
   (mission-context-bind mission-context job))
+
+(defparameter *mission-candidate-policy-audit* nil
+  "Optional original candidate audit failure after confirmed durable publication.")
+
+(defclass mission-draft-ticket ()
+  ((context :initarg :context :reader mission-draft-ticket-context
+            :documentation "Exact originating candidate context.")
+   (revision :initarg :revision :reader mission-draft-ticket-revision
+             :documentation "Monotonic specification revision captured at admission.")
+   (digest :initarg :digest :reader mission-draft-ticket-digest
+           :documentation "Canonical normalized specification digest.")
+   (review-id :initarg :review-id :reader mission-draft-ticket-review-id
+              :documentation "Host-generated review attempt identity.")
+   (job :initarg :job :accessor mission-draft-ticket-job
+        :documentation "Exact registered job owner, never a model item flag."))
+  (:documentation "Ephemeral authority for one purpose-bound candidate review."))
+
+(-> mission-draft--digest (list) string)
+(defun mission-draft--digest (normalized)
+  "Hash canonical normalized fields without counters, clocks or review outcomes."
+  (let ((*print-readably* t) (*print-pretty* nil) (*print-circle* nil)
+        (*package* (find-package :keyword)))
+    (ironclad:byte-array-to-hex-string
+     (ironclad:digest-sequence ':sha256 (babel:string-to-octets (write-to-string normalized) :encoding ':utf-8)))))
+
+(-> mission-draft--context (application list) mission-context)
+(defun mission-draft--context (application goal)
+  "Register a candidate view with the canonical owner and shared request gate."
+  (let* ((owner   (application-candidate-origin application (application-conversation application)))
+         (context (make-instance 'mission-context :application application :goal goal
+                                 :conversation (candidate-origin-writer owner) :origin-owner owner
+                                 :request-lock (application-candidate-request-lock application))))
+    (candidate-origin-register-view owner context)
+    context))
+
+(-> application-mission-draft-edit (application list &key (:replace-p boolean)) null)
+(defun application-mission-draft-edit (application specification &key replace-p)
+  "Create or edit a nonworking candidate without changing the working mission."
+  (application-candidate-origin application (application-conversation application))
+  (with-recursive-lock-held ((application-candidate-request-lock application))
+   (let* ((normalized (mission--normalize-specification specification))
+          (policy     (or (getf specification :exhaustion-policy)
+                          (config :mission-exhaustion-policy (application-configuration application))))
+          (old        (application-mission-draft application))
+          (context    (application-mission-draft-context application)))
+     (nconc normalized (list :exhaustion-policy policy))
+     (if (and old context (not replace-p))
+         (with-recursive-lock-held ((mission-context-request-lock context))
+           (with-recursive-lock-held ((mission-context-lock context))
+             (with-recursive-lock-held ((conversation-append-lock (application-conversation application)))
+               (unless (eq old (application-mission-draft application))
+                 (mission--reject ':replaced "Candidate changed before editing."))
+               (let ((before (copy-tree old)))
+                 (handler-case
+                     (progn
+                       (loop for (key value) on normalized by (lambda (tail) (nthcdr 2 tail))
+                             do (setf (getf old key) value))
+                       (incf (getf old :specification-revision))
+                       (setf (getf old :specification-digest) (mission-draft--digest normalized))
+                       (mission--record context))
+                   (serious-condition (condition)
+                     (loop for (key value) on before by (lambda (tail) (nthcdr 2 tail))
+                           do (setf (getf old key) value))
+                     (error condition)))))))
+         (let* ((goal         (mission--allocate-goal normalized))
+                (new-context  (mission-draft--context application goal))
+                (conversation (application-conversation application)))
+           (nconc goal (list :candidate-id (make-identifier) :specification-revision 1
+                            :specification-digest (mission-draft--digest normalized) :candidate-claim nil))
+           (with-recursive-lock-held ((conversation-append-lock conversation))
+             (candidate-origin-append (mission-context-origin-owner new-context) (cons :mission-draft (copy-tree goal)))
+             (setf (application-mission-draft application) goal
+                   (application-mission-draft-context application) new-context)))))
+   nil))
+
+(-> application-mission-draft-clear (application &key (:reason keyword)) null)
+(defun application-mission-draft-clear (application &key (reason ':cleared))
+  "Persist an explicit tombstone without cancelling any working mission."
+  (unless (member reason '(:cleared :promoted))
+    (mission--reject ':invalid "Invalid candidate tombstone."))
+  (let ((owner (application-candidate-origin application (application-conversation application))))
+    (with-recursive-lock-held ((application-candidate-request-lock application))
+      (let ((goal (application-mission-draft application)))
+          (multiple-value-bind (stored outcome original)
+              (candidate-origin-append owner (list :mission-draft :status reason
+                                                  :candidate-id   (getf goal :candidate-id)
+                                                  :snapshot       (copy-tree goal)))
+            (declare (ignore stored outcome))
+            (setf (application-mission-draft application) nil
+                  (application-mission-draft-context application) nil)
+            (when original (error original))))))
+  nil)
+
+(-> mission-draft--prepare (application conversation &key (:owner (option candidate-origin))) (values list (option mission-context)))
+(defun mission-draft--prepare (application conversation &key owner)
+  "Prepare a candidate pair using preclaimed ownership, without publishing session slots."
+  (let* ((record (conversation-latest-mission-draft-record conversation))
+         (goal   (and record (copy-tree (rest record)))))
+    (when goal (remf goal :seq) (remf goal :time))
+    (unless (and (mission-goal-p goal) (non-empty-string-p (getf goal :candidate-id))
+                 (not (member (getf goal :status) '(:cleared :promoted))))
+      (return-from mission-draft--prepare (values nil nil)))
+    (unless (and owner (eq conversation (candidate-origin-writer owner)))
+      (mission--reject ':candidate-origin "Candidate restoration requires the exact preclaimed writer."))
+    (let ((context     (make-instance 'mission-context :application application :goal goal
+                                      :conversation conversation :origin-owner owner
+                                      :request-lock (application-candidate-request-lock application)))
+          (outstanding (getf goal :requests-outstanding 0)))
+      (candidate-origin-register-view owner context)
+      (when *candidate-origin-staged-views*
+        (push (list owner context) *candidate-origin-staged-views*))
+      (mission--ensure-reservations goal)
+      (unless (mission-candidate--restore context)
+        (incf (getf goal :unknown-usage) outstanding)
+        (setf (getf goal :tokens-reserved) 0 (getf goal :requests-outstanding) 0)
+        (when (plusp outstanding)
+          (when (mission--unknown-usage-blocks-p goal) (setf (getf goal :status) ':blocked))
+          (mission--evidence context ':unknown-usage "Interrupted candidate review has no reported usage.")))
+      (when (eq (getf (getf goal :candidate-claim) :state) ':registered)
+        (setf (getf (getf goal :candidate-claim) :state) ':interrupted))
+      (let ((record (cons :mission-draft (copy-tree goal))))
+        (handler-case (candidate-origin-append owner record)
+          (serious-condition (condition)
+            ;; An append exception is not evidence of absence or commitment.
+            (setf (candidate-origin-uncertain-p owner) t
+                  (candidate-origin-uncertainty owner)
+                  (list :restore-append :condition condition :context context :record record))
+            (error condition))))
+      (values goal context))))
+
+(-> mission-draft-restore (application) null)
+(defun mission-draft-restore (application)
+  "Restore the separately indexed candidate with one exact candidate publication."
+  (let* ((conversation (application-conversation application))
+         (owner        (and (conversation-latest-mission-draft-record conversation)
+                            (application-candidate-origin application conversation))))
+    (with-recursive-lock-held ((application-candidate-request-lock application))
+      (multiple-value-bind (goal context) (mission-draft--prepare application conversation :owner owner)
+        (setf (application-mission-draft application) goal
+              (application-mission-draft-context application) context))))
+  nil)
