@@ -447,7 +447,17 @@ not yet been told that work from the previous process is gone.")
     :initform      nil
     :accessor      conversation-latest-goal-record
     :type          (option list)
-    :documentation "The newest durable goal record observed in this conversation."))
+    :documentation "The newest durable goal record observed in this conversation.")
+   (latest-mission-draft-record
+    :initform      nil
+    :accessor      conversation-latest-mission-draft-record
+    :type          (option list)
+    :documentation "The newest candidate snapshot or explicit clear/promotion tombstone.")
+   (candidate-ledger-records
+    :initform      nil
+    :accessor      conversation--candidate-ledger-records
+    :type          list
+    :documentation "All unique versioned candidate events, independent of specification snapshots."))
   (:documentation "An append-only conversation and its provider projection."))
 
 (defmethod initialize-instance
@@ -1084,13 +1094,480 @@ a crash may leave one that a later lease acquisition can reuse safely."
   (conversation--note-usage-totals conversation record)
   nil)
 
+
+;;;; -- Durable Candidate Operation Ledger --
+
+(define-condition candidate-ledger-consistency-error (conversation-invariant-error)
+  ((event :initarg :event :reader candidate-ledger-error-event
+          :documentation "Rejected portable evidence, when available.")
+   (outcome :initarg :outcome :initform :refused
+            :reader        candidate-ledger-error-outcome
+            :documentation "REFUSED, ABSENT or UNCERTAIN durable append outcome.")
+   (original-condition :initarg :original-condition :initform nil
+                       :reader        candidate-ledger-error-original-condition
+                       :documentation "Original append failure, preserved without replacement."))
+  (:documentation "Fail-closed candidate schema, identity or durable append disagreement."))
+
+(-> candidate-ledger--refuse (conversation t string &key (:outcome keyword) (:cause t)) nil)
+(defun candidate-ledger--refuse (conversation event message &key (outcome ':refused) cause)
+  "Signal a typed refusal retaining EVENT and the original append CAUSE."
+  (error 'candidate-ledger-consistency-error
+         :message message :pathname (conversation-pathname conversation)
+         :sequence (conversation-next-sequence conversation)
+         :event event :outcome outcome :original-condition cause))
+
+(-> candidate-ledger--fields-p (t list) boolean)
+(defun candidate-ledger--fields-p (value keys)
+  "Recognize an exact finite plist in canonical schema order."
+  (handler-case
+      (and (listp value) (eql (list-length value) (* 2 (length keys)))
+           (equal (loop for tail on value by (lambda (tail) (rest (rest tail)))
+                        collect (first tail)) keys))
+    (type-error () nil)))
+
+(-> candidate-ledger--uuid-p (t) boolean)
+(defun candidate-ledger--uuid-p (value)
+  "Recognize the lowercase UUIDv4 representation emitted by OS-random allocation."
+  (and (stringp value) (= 36 (length value))
+       (char= #\4 (char value 14))
+       (not (null (find (char value 19) "89ab")))
+       (loop for character across value for index from 0
+             always (if (member index '(8 13 18 23))
+                        (char= character #\-)
+                        (not (null (find character "0123456789abcdef")))))))
+
+(-> candidate-ledger--rows-p (t list function) boolean)
+(defun candidate-ledger--rows-p (rows keys valid-p)
+  "Validate finite keyed ROWS with distinct first-field identities."
+  (handler-case
+      (and (listp rows) (or (null rows) (list-length rows))
+           (every (lambda (row)
+                    (and (candidate-ledger--fields-p row keys)
+                         (non-empty-string-p (second row)) (funcall valid-p row)))
+                  rows)
+           (= (length rows) (length (remove-duplicates rows :key #'second :test #'equal))))
+    (type-error () nil)))
+
+(-> candidate-ledger--baseline-p (t) boolean)
+(defun candidate-ledger--baseline-p (value)
+  "Validate immutable migration counters and explicit unresolved legacy ownership."
+  (and (or (candidate-ledger--fields-p
+             value '(:migration-version :turns-used :tokens-used
+                     :reservation-charged-tokens :unknown-usage :child-charges :legacy-reservations))
+           (and (candidate-ledger--fields-p
+                 value '(:migration-version :turns-used :tokens-used
+                         :reservation-charged-tokens :unknown-usage :child-charges :legacy-reservations
+                         :child-unknown-usage :child-charge-requests :legacy-requests))
+                (candidate-ledger--rows-p
+                 (getf value :child-unknown-usage) '(:child-id :requests)
+                 (lambda (row) (typep (getf row :requests) '(integer 0))))
+                (candidate-ledger--rows-p
+                 (getf value :child-charge-requests) '(:child-id :requests)
+                 (lambda (row) (typep (getf row :requests) '(integer 0))))
+                (typep (getf value :legacy-requests) '(integer 0))))
+       (eql 1 (getf value :migration-version))
+       (every (lambda (key) (typep (getf value key) '(integer 0)))
+              '(:turns-used :tokens-used :reservation-charged-tokens :unknown-usage))
+       (candidate-ledger--rows-p
+        (getf value :child-charges) '(:child-id :tokens)
+        (lambda (row) (typep (getf row :tokens) '(integer 0))))
+       (candidate-ledger--rows-p
+        (getf value :legacy-reservations) '(:id :reserved :quarantined)
+        (lambda (row)
+          (and (typep (getf row :reserved) '(integer 0))
+               (eq t (getf row :quarantined)))))))
+
+(-> candidate-ledger--admission-p (t) boolean)
+(defun candidate-ledger--admission-p (value)
+  "Validate the immutable admission evidence, without granting host authority."
+  (and (candidate-ledger--fields-p
+        value '(:revision :digest :reserved :review-id :job-id :execution-id))
+       (typep (getf value :revision) '(integer 1))
+       (non-empty-string-p (getf value :digest))
+       (typep (getf value :reserved) '(integer 0))
+       (every (lambda (key)
+                (or (null (getf value key)) (non-empty-string-p (getf value key))))
+              '(:review-id :job-id :execution-id))))
+
+(-> candidate-ledger--terminal-p (t) boolean)
+(defun candidate-ledger--terminal-p (value)
+  "Validate genuine measured, exact-child or unknown terminal evidence."
+  (and (or (candidate-ledger--fields-p value '(:kind))
+           (candidate-ledger--fields-p value '(:kind :tokens))
+           (candidate-ledger--fields-p value '(:kind :tokens :child-id :evidence))
+           (candidate-ledger--fields-p value '(:kind :child-id :evidence)))
+       (case (getf value :kind)
+         (:measured
+          (and (candidate-ledger--fields-p value '(:kind :tokens))
+               (typep (getf value :tokens) '(integer 0))))
+         (:exact-child
+          (and (candidate-ledger--fields-p value '(:kind :tokens :child-id :evidence))
+               (typep (getf value :tokens) '(integer 0))
+               (non-empty-string-p (getf value :child-id))
+               (non-empty-string-p (getf value :evidence))))
+         (:unknown
+          (or (candidate-ledger--fields-p value '(:kind))
+              (and (candidate-ledger--fields-p value '(:kind :child-id :evidence))
+                   (non-empty-string-p (getf value :child-id))
+                   (non-empty-string-p (getf value :evidence)))))
+         (otherwise
+          nil))))
+
+(-> conversation-candidate-ledger-origin (conversation) list)
+(defun conversation-candidate-ledger-origin (conversation)
+  "Return canonical storage root and normalized conversation ID for this stream.
+
+The caller owns the canonical writer and its primary lease. This does not acquire
+application locks or confer writer authority on an old loaded object."
+  (list :storage      (namestring (platform-truename
+                                   *platform*
+                                   (ensure-directories-exist
+                                    (uiop:pathname-directory-pathname
+                                     (conversation-pathname conversation)))))
+        :conversation (conversation-identifier conversation)))
+
+(-> candidate-ledger--properties (list) list)
+(defun candidate-ledger--properties (record)
+  "Remove only the store-assigned sequence/time envelope from RECORD."
+  (let ((properties (rest record)))
+    (if (eq (first properties) :seq)
+        (nthcdr 4 properties)
+        properties)))
+
+(-> candidate-ledger--validate (conversation list) list)
+(defun candidate-ledger--validate (conversation record)
+  "Validate exact schema and origin, returning semantic event properties."
+  (unless (and (listp record) (handler-case (list-length record) (type-error () nil))
+               (candidate-ledger--fields-p
+                (candidate-ledger--properties record)
+                '(:version :origin :candidate-id :operation-id :event :baseline :payload)))
+    (candidate-ledger--refuse conversation record "Malformed candidate event properties."))
+  (let* ((properties (candidate-ledger--properties record))
+         (event      (getf properties :event))
+         (baseline   (getf properties :baseline))
+         (payload    (getf properties :payload)))
+    (unless (and (eq (first record) :candidate-ledger)
+                 (candidate-ledger--fields-p
+                  properties '(:version :origin :candidate-id :operation-id :event :baseline :payload))
+                 (eql 1 (getf properties :version))
+                 (equal (getf properties :origin) (conversation-candidate-ledger-origin conversation))
+                 (non-empty-string-p (getf properties :candidate-id))
+                 (candidate-ledger--uuid-p (getf properties :operation-id))
+                 (or (not (eq (second record) :seq))
+                     (and (typep (getf (rest record) :seq) '(integer 1))
+                          (eq (fourth record) :time)
+                          (typep (getf (rest record) :time) 'timestamp)))
+                 (case event
+                   (:admission
+                    (and (or (null baseline) (candidate-ledger--baseline-p baseline))
+                         (candidate-ledger--admission-p payload)))
+                   (:terminal
+                    (and (null baseline) (candidate-ledger--terminal-p payload)))
+                   (:recovery
+                    (and (null baseline)
+                         (candidate-ledger--fields-p payload '(:kind :evidence))
+                         (eq (getf payload :kind) :interrupted)
+                         (non-empty-string-p (getf payload :evidence))))
+                   (:conflict
+                    (and (null baseline)
+                         (candidate-ledger--fields-p payload '(:event :baseline :payload))
+                         (case (getf payload :event)
+                           (:admission
+                            (and (or (null (getf payload :baseline))
+                                     (candidate-ledger--baseline-p (getf payload :baseline)))
+                                 (candidate-ledger--admission-p (getf payload :payload))))
+                           (:terminal
+                            (and (null (getf payload :baseline))
+                                 (candidate-ledger--terminal-p (getf payload :payload)))))))
+                   (otherwise
+                    nil)))
+      (candidate-ledger--refuse conversation record "Invalid candidate ledger schema or foreign origin."))
+    properties))
+
+(-> conversation-candidate-ledger-lookup (conversation string &optional (option string)) (option list))
+(defun conversation-candidate-ledger-lookup (conversation candidate-id &optional operation-id)
+  "Return a detached candidate entry, or its exact operation when OPERATION-ID is supplied.
+
+The caller serializes with its candidate request gate. Accounting folds may read
+this data but must never copy specification or approval state from it."
+  (with-recursive-lock-held ((conversation-append-lock conversation))
+    (let ((entry nil))
+      (dolist (record (conversation--candidate-ledger-records conversation))
+        (let* ((properties (candidate-ledger--properties record))
+               (key        (getf properties :operation-id))
+               (event      (getf properties :event))
+               (payload    (getf properties :payload)))
+          (when (equal candidate-id (getf properties :candidate-id))
+            (unless entry
+              (setf entry (list :candidate-id candidate-id :baseline (getf properties :baseline)
+                                :baseline-sequence (getf (rest record) :seq)
+                                :quarantined-p nil :operations nil)))
+            (let ((operation (find key (getf entry :operations)
+                                   :key (lambda (operation) (getf operation :operation-id)) :test #'equal)))
+              (case event
+                (:admission
+                 (setf (getf entry :operations)
+                       (append (getf entry :operations)
+                               (list (list :operation-id key :admission payload
+                                          :baseline           (getf properties :baseline)
+                                          :admission-sequence (getf (rest record) :seq)
+                                           :terminal nil :recoveries nil :conflicts nil)))))
+                (:terminal
+                 (setf (getf operation :terminal) payload))
+                (:recovery
+                 (push payload (getf operation :recoveries)))
+                (:conflict
+                 (setf (getf entry :quarantined-p) t)
+                 (push payload (getf operation :conflicts))))))))
+      (copy-tree (if operation-id
+                     (find operation-id (getf entry :operations)
+                           :key (lambda (operation) (getf operation :operation-id)) :test #'equal)
+                     entry)))))
+
+(-> candidate-ledger--disposition (conversation list) keyword)
+(defun candidate-ledger--disposition (conversation record)
+  "Classify valid event as NEW, DUPLICATE or CONFLICT without publishing it."
+  (let* ((properties (candidate-ledger--validate conversation record))
+         (entry      (conversation-candidate-ledger-lookup conversation (getf properties :candidate-id)))
+         (operation  (find (getf properties :operation-id) (getf entry :operations)
+                           :key (lambda (operation) (getf operation :operation-id)) :test #'equal))
+         (event      (getf properties :event))
+         (baseline   (getf properties :baseline))
+         (payload    (getf properties :payload)))
+    (when (find-if (lambda (stored)
+                     (let ((other (candidate-ledger--properties stored)))
+                       (and (equal (getf properties :operation-id) (getf other :operation-id))
+                            (not (equal (getf properties :candidate-id) (getf other :candidate-id))))))
+                   (conversation--candidate-ledger-records conversation))
+      (candidate-ledger--refuse conversation record "Operation UUID already belongs to another candidate."))
+    (case event
+      (:admission
+       (cond
+         (operation
+          (if (and (equal payload (getf operation :admission))
+                   (equal baseline (getf operation :baseline)))
+              :duplicate
+              :conflict))
+         ((or (and entry baseline) (and (null entry) (null baseline))
+              (getf entry :quarantined-p))
+          (candidate-ledger--refuse conversation record "Baseline must be established exactly once on first admission; quarantine blocks admission."))
+         (t
+          :new)))
+      ((:terminal :recovery :conflict)
+       (unless operation
+         (candidate-ledger--refuse conversation record "Candidate event has no matching admission."))
+       (ecase event
+         (:terminal
+          (let ((terminal (getf operation :terminal)))
+            (cond ((null terminal)
+                   :new)
+                  ((equal terminal payload)
+                   :duplicate)
+                  (t
+                   :conflict))))
+         (:recovery
+          (cond ((member payload (getf operation :recoveries) :test #'equal)
+                 :duplicate)
+                ((getf operation :terminal)
+                 (candidate-ledger--refuse conversation record "Recovery cannot replace genuine terminal evidence."))
+                (t
+                 :new)))
+         (:conflict
+          (let ((original (getf operation (getf payload :event))))
+            (unless (and original
+                         (or (not (equal original (getf payload :payload)))
+                             (and (eq (getf payload :event) :admission)
+                                  (not (equal (getf payload :baseline) (getf operation :baseline))))))
+              (candidate-ledger--refuse conversation record "Conflict marker lacks contradictory semantic evidence."))
+            (if (member payload (getf operation :conflicts) :test #'equal) :duplicate :new)))))
+      (otherwise
+       (candidate-ledger--refuse conversation record "Unsupported candidate event.")))))
+
+(-> candidate-ledger--publish (conversation list) null)
+(defun candidate-ledger--publish (conversation record)
+  "Validate and retain a unique sequenced ledger event, including during replay."
+  (unless (eq :new (candidate-ledger--disposition conversation record))
+    (candidate-ledger--refuse conversation record "Durable candidate ledger contains a duplicate or contradiction without a conflict marker."))
+  (setf (conversation--candidate-ledger-records conversation)
+        (append (conversation--candidate-ledger-records conversation) (list (copy-tree record))))
+  nil)
+
+(-> conversation-candidate-ledger-snapshot (conversation) list)
+(defun conversation-candidate-ledger-snapshot (conversation)
+  "Return self-contained versioned ledger history, without truncating operations."
+  (with-recursive-lock-held ((conversation-append-lock conversation))
+    (list :version 1 :records (copy-tree (conversation--candidate-ledger-records conversation)))))
+
+(-> candidate-ledger--restore (conversation t integer) null)
+(defun candidate-ledger--restore (conversation snapshot before-sequence)
+  "Strictly restore checkpoint SNAPSHOT; every event precedes BEFORE-SEQUENCE."
+  (unless (and (candidate-ledger--fields-p snapshot '(:version :records))
+               (eql 1 (getf snapshot :version))
+               (listp (getf snapshot :records))
+               (or (null (getf snapshot :records)) (list-length (getf snapshot :records))))
+    (candidate-ledger--refuse conversation snapshot "Malformed or unsupported candidate ledger checkpoint."))
+  (let ((previous 0))
+    (dolist (record (getf snapshot :records))
+      (unless (and (listp record) (eq (second record) :seq)
+                   (typep (getf (rest record) :seq) '(integer 1))
+                   (< previous (getf (rest record) :seq) before-sequence))
+        (candidate-ledger--refuse conversation record "Candidate checkpoint sequence is invalid."))
+      (candidate-ledger--publish conversation record)
+      (setf previous (getf (rest record) :seq))))
+  nil)
+
+(-> candidate-ledger--durable-records (conversation) list)
+(defun candidate-ledger--durable-records (conversation)
+  "Read an intact active segment and verify its header and contiguous sequence.
+
+The caller holds append then source locks with canonical writer authority. An
+incomplete tail is uncertainty, never evidence that a proposed event is absent."
+  (let ((pathname (conversation-log-pathname conversation))
+        (records  nil))
+    (when (and (not (probe-file pathname))
+               (conversation-storage-active-pathname (conversation-pathname conversation)))
+      (candidate-ledger--refuse conversation nil "Candidate active segment is absent beside occupied storage." :outcome ':uncertain))
+    (when (probe-file pathname)
+      (unless (equal pathname (conversation-storage-active-pathname
+                               (conversation-pathname conversation)))
+        (candidate-ledger--refuse conversation nil "Active candidate origin segment changed." :outcome ':uncertain))
+      (multiple-value-bind (end incomplete-p count)
+          (sexp-store:log-map (lambda (record) (push record records)) pathname)
+        (declare (ignore end count))
+        (when incomplete-p
+          (candidate-ledger--refuse conversation nil "Candidate origin has an incomplete tail." :outcome ':uncertain)))
+      (setf records (nreverse records))
+      (let* ((header     (first records))
+             (properties (rest header))
+             (next       (getf properties :chunk-start-sequence)))
+        (unless (and (rest records)
+                     (eq (first header) :conversation) (eql 2 (getf properties :version))
+                     (equal (getf properties :id) (conversation-identifier conversation))
+                     (typep next '(integer 1)))
+          (candidate-ledger--refuse conversation nil "Unsupported candidate origin segment header." :outcome ':uncertain))
+        (dolist (record (rest records))
+          (unless (and (conversation--record-form-p record)
+                       (eql next (getf (rest record) :seq)))
+            (candidate-ledger--refuse conversation record "Candidate origin sequence is not contiguous." :outcome ':uncertain))
+          (incf next))))
+    records))
+
+(-> candidate-ledger--same-event-p (list list) boolean)
+(defun candidate-ledger--same-event-p (left right)
+  "Compare semantic event identity, excluding assigned clocks and sequence."
+  (and (eq (first left) :candidate-ledger) (eq (first right) :candidate-ledger)
+       (equal (candidate-ledger--properties left) (candidate-ledger--properties right))))
+
+(-> candidate-ledger--append-checked (conversation list function &key (:origin-record-p boolean)) (values list keyword t))
+(defun candidate-ledger--append-checked (conversation record append-function &key origin-record-p)
+  "Append RECORD and reconcile a signaled durable outcome under existing locks.
+
+Return record, APPENDED or COMMITTED, and original failure when recovered.
+Signal ABSENT only after validating an unchanged complete prefix. Unsupported,
+partial or conflicting outcomes signal UNCERTAIN and require owner quarantine."
+  (let* ((pathname (conversation-log-pathname conversation))
+         (before   (candidate-ledger--durable-records conversation))
+         (sequence (conversation-next-sequence conversation))
+         (expected (if before (1+ (getf (rest (first (last before))) :seq)) 1))
+         (status   (platform-path-status *platform* pathname))
+         (original nil))
+    (unless (and (= expected sequence)
+                 (or before (not (conversation-persisted-p conversation))))
+      (candidate-ledger--refuse conversation record "Candidate writer head is not current." :outcome ':uncertain))
+    (handler-case
+        (handler-bind ((error (lambda (condition) (unless original (setf original condition)))))
+          (values (funcall append-function record) ':appended nil))
+      (error (condition)
+        (unless original (setf original condition))
+        (let* ((after    (handler-case (candidate-ledger--durable-records conversation)
+                           (error () (candidate-ledger--refuse conversation record "Cannot validate failed candidate append tail." :outcome ':uncertain :cause original))))
+               (current  (platform-path-status *platform* pathname))
+               (prefix-p (if before
+                             (and (<= (length before) (length after))
+                                  (equal before (subseq after 0 (length before)))
+
+                                  status current
+                                  (platform-file-status-same-object-p status current))
+                             (or (null after)
+                                 (and (= 2 (length after))
+                                      (eq (first (first after)) :conversation)))))
+               (new      (if before (nthcdr (length before) after) (rest after))))
+          (cond
+            ((and prefix-p (null new) (equal before after))
+             (candidate-ledger--refuse conversation record "Candidate event is definitely absent after append failure." :outcome ':absent :cause original))
+            ((and prefix-p (= 1 (length new))
+                  (eql sequence (getf (rest (first new)) :seq))
+                  (if origin-record-p
+                      (and (eq (first record) (first (first new)))
+                           (eq :time (fourth (first new)))
+                           (equal (rest record) (nthcdr 5 (first new))))
+                      (candidate-ledger--same-event-p record (first new))))
+             (let ((committed (first new)))
+               (if origin-record-p
+                   (progn
+                     (when (<= (conversation-next-sequence conversation) sequence)
+                       (conversation--note-activity conversation committed))
+                     (conversation--publish-mission-slots conversation committed))
+                   (unless (find sequence (conversation--candidate-ledger-records conversation)
+                                 :key (lambda (entry) (getf (rest entry) :seq)))
+                     (candidate-ledger--publish conversation committed)
+                     (conversation--note-activity conversation committed)))
+               (setf (conversation-next-sequence conversation) (1+ sequence)
+                     (conversation-persisted-p conversation) t
+                     (conversation-incomplete-tail-p conversation) nil)
+               (values committed ':committed original)))
+            (t
+             (candidate-ledger--refuse conversation record "Candidate append has an unsupported or contradictory durable outcome." :outcome ':uncertain :cause original))))))))
+
+(-> candidate-ledger--call-with-append (conversation list function) (values list keyword t))
+(defun candidate-ledger--call-with-append (conversation record append-function)
+  "Validate, deduplicate and append candidate evidence under append/source locks."
+  (when (eq (second record) :seq)
+    (candidate-ledger--refuse conversation record "Callers cannot assign candidate event sequence or time."))
+  (let ((disposition (candidate-ledger--disposition conversation record)))
+    (when (eq disposition :duplicate)
+      (let* ((durable (candidate-ledger--durable-records conversation))
+             (head    (and durable (getf (rest (first (last durable))) :seq))))
+        (unless (and head (= (1+ head) (conversation-next-sequence conversation)))
+          (candidate-ledger--refuse conversation record "Duplicate candidate writer head is not current." :outcome ':uncertain)))
+      (return-from candidate-ledger--call-with-append
+        (values (copy-tree (find record (conversation--candidate-ledger-records conversation)
+                                 :test #'candidate-ledger--same-event-p)) ':duplicate nil)))
+    (if (eq disposition :conflict)
+        (let* ((properties (copy-tree (candidate-ledger--properties record)))
+               (conflict   (copy-tree record)))
+          (setf (getf (rest conflict) :event) :conflict
+                (getf (rest conflict) :baseline) nil
+                (getf (rest conflict) :payload)
+                (list :event (getf properties :event) :baseline (getf properties :baseline)
+                      :payload (getf properties :payload)))
+          (let ((original nil))
+            (unless (eq :duplicate (candidate-ledger--disposition conversation conflict))
+              (setf original (nth-value 2 (candidate-ledger--append-checked conversation conflict append-function))))
+            (candidate-ledger--refuse conversation record "Contradictory candidate evidence was quarantined." :cause original)))
+        (candidate-ledger--append-checked conversation record append-function))))
+
+(-> conversation-candidate-ledger-append (conversation list) (values list keyword t))
+(defun conversation-candidate-ledger-append (conversation event)
+  "Append exact portable candidate EVENT using the existing append/source locks.
+
+Caller precondition: canonical writer authority and primary lease are retained;
+application request gate precedes its context state lock, then this append lock
+and source lock. Do not hold an application lock across provider work or waits.
+Return sequenced event, APPENDED/DUPLICATE/COMMITTED and original error, if any.
+On ABSENT grant no admission authority. On UNCERTAIN retain evidence and pins;
+no new UUID, paid replay, tail repair or automatic retry is authorized here."
+  (unless (eq (first event) :candidate-ledger)
+    (candidate-ledger--refuse conversation event "Expected a candidate ledger event."))
+  (conversation-append-record conversation event))
+
 (-> conversation--header-record
     (conversation &key (:chunk-start-sequence (integer 1)))
     list)
 (defun conversation--header-record
     (conversation &key (chunk-start-sequence 1))
   "Return a self-contained portable chunk header for CONVERSATION."
-  (list :conversation
+  (list* :conversation
         :version 2
         :id                   (conversation-identifier conversation)
         :created-at           (conversation-created-at conversation)
@@ -1127,7 +1604,12 @@ a crash may leave one that a later lease acquisition can reuse safely."
         (copy-tree (deque->list
                     (conversation-pending-async-lisp-events conversation)))
         :latest-goal-record
-        (copy-tree (conversation-latest-goal-record conversation))))
+        (copy-tree (conversation-latest-goal-record conversation))
+        :latest-mission-draft-record
+        (copy-tree (conversation-latest-mission-draft-record conversation))
+         ;; An unused optional extension must not contaminate legacy migrations.
+        (when (conversation--candidate-ledger-records conversation)
+          (list :candidate-ledger (conversation-candidate-ledger-snapshot conversation)))))
 
 (-> conversation--initial-publication-lock-pathname (conversation) pathname)
 (defun conversation--initial-publication-lock-pathname (conversation)
@@ -1573,6 +2055,21 @@ this append's original EOF, including when publication failed after the write."
                     (conversation-persisted-p conversation) t)
               (conversation--note-activity conversation published))))))))
 
+(defparameter *conversation-candidate-origin-append* nil
+  "Exact writer scoped by canonical ownership for specification and audit reconciliation.")
+
+(-> conversation-candidate-origin-append (conversation list) (values list keyword t))
+(defun conversation-candidate-origin-append (conversation record)
+  "Append an owned candidate specification or audit, reconciling exact durable evidence.
+Caller retains the canonical primary lease. Return record, outcome and recovered
+original condition. Absent and uncertain outcomes retain typed evidence."
+  (unless (and (member (first record) '(:mission-draft :mission-draft-audit))
+               (not (eq :seq (second record))))
+    (candidate-ledger--refuse conversation record "Expected an unsequenced candidate specification or audit."))
+  (conversation--activation-goal conversation record)
+  (let ((*conversation-candidate-origin-append* conversation))
+   (conversation-append-record conversation record)))
+
 (defgeneric conversation-append-record (conversation record)
   (:documentation "Append portable RECORD to CONVERSATION and return the sequenced form."))
 
@@ -1582,12 +2079,21 @@ this append's original EOF, including when publication failed after the write."
     (call-with-file-lock
      (conversation-picker-source-lock-pathname (conversation-pathname conversation))
      (lambda ()
-       (if (and (eq (first record) :provider)
+        (cond
+          ((eq conversation *conversation-candidate-origin-append*)
+           (candidate-ledger--append-checked
+            conversation record (lambda (replacement) (call-next-method conversation replacement))
+            :origin-record-p t))
+          ((eq (first record) :candidate-ledger)
+           (candidate-ledger--call-with-append
+            conversation record (lambda (replacement) (call-next-method conversation replacement))))
+          ((and (eq (first record) :provider)
                 (conversation--usage-totals-p
                  (getf (getf (rest record) :metadata) :usage-checkpoint)))
            (conversation--call-with-usage-checkpoint
-            conversation record (lambda () (call-next-method)))
-           (call-next-method))))))
+            conversation record (lambda () (call-next-method))))
+          (t
+           (call-next-method)))))))
 
 (defmethod conversation-append-record ((conversation conversation) (record list))
   "Assign metadata, initialize persistence if needed, and append RECORD."
@@ -1638,6 +2144,10 @@ this append's original EOF, including when publication failed after the write."
               (ignore-errors
                 (conversation-sidecars-delete
                  (conversation-pathname conversation))))
+            ;; The ledger reconciler must retain this exact failure as evidence.
+            ;; Ordinary append callers keep the invariant wrapper below.
+            (when (or (eq (first record) :candidate-ledger) (eq conversation *conversation-candidate-origin-append*))
+              (error condition))
             (error 'conversation-invariant-error
                    :message
                    (format nil
@@ -1651,8 +2161,9 @@ this append's original EOF, including when publication failed after the write."
         (when picker-search-message
           (conversation--note-picker-search-message
            conversation picker-search-message))
-        (when (eq (first sequenced) :goal)
-          (setf (conversation-latest-goal-record conversation) sequenced)))
+        (conversation--publish-mission-slots conversation sequenced)
+        (when (eq (first sequenced) :candidate-ledger)
+          (candidate-ledger--publish conversation sequenced)))
       (conversation-input-history--publish conversation sequenced)
       (conversation-picker-metadata-publish conversation)
       sequenced)))
@@ -3273,8 +3784,9 @@ later picker searches read it without scanning the log."
     (when picker-search-message
       (conversation--note-picker-search-message
        conversation picker-search-message))
-    (when (eq kind :goal)
-      (setf (conversation-latest-goal-record conversation) record))
+    (conversation--publish-mission-slots conversation record)
+    (when (eq kind :candidate-ledger)
+      (candidate-ledger--publish conversation record))
     (when (and (eq kind :tool-result) (eq (getf properties :status) ':error))
       (conversation-note-failed-call conversation (getf properties :call-id)))
     (when (integerp sequence)
@@ -3411,6 +3923,9 @@ later picker searches read it without scanning the log."
            (latest-goal-record
              (and (= version 2)
                   (getf properties :latest-goal-record)))
+           (latest-mission-draft-record
+             (and (= version 2)
+                  (getf properties :latest-mission-draft-record)))
            (input-history-last-sequence
              (if (= version 2) (getf properties :input-history-last-sequence 0) 0))
            (prompt-cache-usage
@@ -3458,7 +3973,10 @@ later picker searches read it without scanning the log."
                            (conversation--usage-totals-p usage-totals))
                        (or (null latest-goal-record)
                            (and (conversation--record-form-p latest-goal-record)
-                                (eq (first latest-goal-record) :goal))))
+                                (eq (first latest-goal-record) :goal)))
+                       (or (null latest-mission-draft-record)
+                           (and (conversation--record-form-p latest-mission-draft-record)
+                                (eq (first latest-mission-draft-record) :mission-draft))))
             (invalid
              "The conversation chunk header contains invalid resumable state.")))
       (let ((conversation
@@ -3484,7 +4002,14 @@ later picker searches read it without scanning the log."
                              :input-items       nil)))
         ;; Headers written before usage totals existed leave them unknown.
         (setf (conversation-usage-totals conversation) (copy-list usage-totals))
+        (when (and (= version 1)
+                   (conversation--property-present-p properties :candidate-ledger))
+          (candidate-ledger--refuse conversation (getf properties :candidate-ledger)
+                                    "Legacy conversation headers cannot carry candidate ledgers."))
         (when (= version 2)
+          (when (conversation--property-present-p properties :candidate-ledger)
+            (candidate-ledger--restore conversation (getf properties :candidate-ledger)
+                                       chunk-start-sequence))
           (conversation--note-input-measurement
            conversation (getf properties :input-measurement))
           (setf (conversation-working-seconds conversation) working-seconds
@@ -3495,7 +4020,9 @@ later picker searches read it without scanning the log."
                 (conversation-picker-preview conversation)
                 (and preview (copy-seq preview))
                 (conversation-latest-goal-record conversation)
-                (copy-tree latest-goal-record))
+                (copy-tree latest-goal-record)
+                (conversation-latest-mission-draft-record conversation)
+                (copy-tree latest-mission-draft-record))
           (conversation--restore-pending-input-identifiers conversation pending-identifiers)
           (setf (conversation-prompt-cache-usage conversation)
                 (copy-tree prompt-cache-usage)
@@ -3773,3 +4300,43 @@ storage is missing, IDENTIFIER is invalid, or another process owns it."
       (when lease
         (conversation-lease-release lease)))
     pathname))
+
+(-> conversation--activation-goal (conversation list) (option list))
+(defun conversation--activation-goal (conversation record)
+  "Validate the complete activation payload before durable slot publication."
+  (when (eq :mission-draft (first record))
+    (let* ((properties (rest record)) (goal (getf properties :activated-goal)))
+      (when goal
+        (unless (and (eq :promoted (getf properties :status))
+                     (equal (getf properties :candidate-id) (getf goal :candidate-id))
+                     (integerp (getf goal :activated-at))
+                     (integerp (getf goal :deadline))
+                     (eq :active (getf goal :status))
+                     (getf properties :snapshot) (getf properties :predecessor))
+          (error 'conversation-invariant-error :message "Invalid atomic mission activation record."
+                 :pathname (conversation-pathname conversation) :sequence (getf properties :seq)))
+        (let* ((snapshot (getf properties :snapshot)) (expected (copy-tree snapshot)))
+          (when (getf snapshot :activated-at)
+            (error 'conversation-invariant-error :message "Candidate activation clock already started."
+                   :pathname (conversation-pathname conversation) :sequence (getf properties :seq)))
+          (setf (getf expected :status) :active
+                (getf expected :activated-at) (getf goal :activated-at)
+                (getf expected :deadline) (+ (getf goal :activated-at) (getf snapshot :wall-seconds)))
+          (unless (equal expected goal)
+            (error 'conversation-invariant-error :message "Activation must preserve the exact candidate snapshot."
+                   :pathname (conversation-pathname conversation) :sequence (getf properties :seq))))
+        goal))))
+
+(-> conversation--publish-mission-slots (conversation list) null)
+(defun conversation--publish-mission-slots (conversation record)
+  "Publish both slot indices from one record, also during reconciliation and replay."
+  (let ((goal (conversation--activation-goal conversation record)))
+    (case (first record)
+      (:goal
+       (setf (conversation-latest-goal-record conversation) record))
+      (:mission-draft
+       (setf (conversation-latest-mission-draft-record conversation) record)
+       (when goal
+         (setf (conversation-latest-goal-record conversation)
+               (list* :goal :seq (getf (rest record) :seq) :time (getf (rest record) :time) (copy-tree goal)))))))
+  nil)

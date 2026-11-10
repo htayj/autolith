@@ -953,6 +953,22 @@
   test-conversation-input-history-recovery
   test-conversation-input-history-interruption)
 
+(define-test-suite candidate-ledger-store
+  test-candidate-ledger-admission
+  test-candidate-ledger-terminal
+  test-candidate-ledger-schema
+  test-candidate-ledger-admission-conflict
+  test-candidate-ledger-checkpoint
+  test-candidate-ledger-baseline-schema
+  test-candidate-ledger-terminal-kinds
+  test-candidate-ledger-headers
+  test-candidate-ledger-isolation
+  test-candidate-ledger-append-absent
+  test-candidate-ledger-append-committed
+  test-candidate-ledger-collision test-candidate-ledger-terminal-matrix test-candidate-ledger-evidence-unavailable test-candidate-ledger-append-partial
+  test-candidate-ledger-native-writer
+  test-candidate-ledger-native-reader)
+
 (define-test-suite conversation-replay
   test-conversation-replay-navigation
   test-conversation-replay-projection
