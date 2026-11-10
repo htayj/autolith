@@ -154,6 +154,112 @@
                            "Contract: replayed reasoning retains family metadata.")))))))
   nil)
 
+(-> test-compaction-recovery-turn-context-anchors () null)
+(defun test-compaction-recovery-turn-context-anchors ()
+  "Re-anchor Codex turn context once in the current turn after mid-turn emergency compaction."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "5000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "256"))
+    (with-test-configuration (configuration)
+      (let* ((conversation                              (conversation-create configuration))
+             (provider                                  (make-instance 'compaction-recovery-test-provider
+                                                         :configuration configuration
+                                                         :results       (list (agent-test-result
+                                                                               "summary" (list (agent-test-compaction-message))))))
+             (agent                                     (agent-create :configuration configuration :conversation conversation
+                                                         :provider provider :tool-registry (make-instance 'tool-registry)))
+             (*conversation-compaction-tail-characters* 256)
+             (texts                                     '("Anchored current block." "current goal" "Stable current block."))
+             (failure                                   nil))
+        (labels ((contribute (context)
+                   "Return one anchored and one turn-lasting block."
+                   (declare (ignore context))
+                   (list (change-class
+                          (make-context-contribution :identifier  "anchored-block"
+                                                     :instruction "Anchored current block.")
+                          'anchored-context-contribution)
+                         (make-context-contribution :identifier  "stable-block"
+                                                    :instruction "Stable current block."
+                                                    :lifetime    ':turn)))
+
+                 (input (&optional (target conversation))
+                   "Return the projected Codex input of TARGET's next ordinary request."
+                   (let ((*context-contributors*        nil)
+                         (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+                         (*context-last-deliveries*     (make-hash-table :test #'equal))
+                         (*context-last-delivery-order* nil))
+                     (register-context-contributor "compaction-turn-anchor-test" #'contribute)
+                     (json-get (provider-request-object provider target #()
+                                                        :goal-context "current goal")
+                               "input")))
+
+                 (tool-round (call-id)
+                   "Append one durable tool exchange."
+                   (conversation-append-provider-item conversation (compaction-tail-tests--call call-id))
+                   (conversation-append-tool-result conversation call-id
+                                                    :tool-name "test.inspect" :output "current output"
+                                                    :success-p t))
+
+                 (prefix-p (previous current)
+                   "Return true when every item of PREVIOUS starts CURRENT unchanged."
+                   (and (<= (length previous) (length current))
+                        (string= (json-encode previous)
+                                 (json-encode (subseq current 0 (length previous))))))
+
+                 (turn-context-p (input)
+                   "Return true when each block appears once and the turn's follow the latest user message."
+                   (let ((start (position-if (lambda (item) (json-string= (json-get item "role") "user"))
+                                             input :from-end t)))
+                     (and start
+                          (every (lambda (text)
+                                   (= 1 (count-if (lambda (item) (search text (json-encode item))) input)))
+                                 texts)
+                          (every (lambda (text)
+                                   (search text (json-encode (subseq input start))))
+                                 (rest texts))))))
+          (conversation-append-user-message conversation "older exchange")
+          (conversation-append-provider-item
+           conversation (json-object "type" "reasoning" "id" "old-secret"
+                                     "encrypted_content" (make-string 40000 :initial-element #\e)))
+          (conversation-append-provider-item conversation (agent-test-message "old answer"))
+          (conversation-append-user-message conversation "continue")
+          (compaction-recovery-test-small-context
+           (lambda ()
+             (input)
+             (tool-round "before-0")
+             (test-assert (turn-context-p (input)) "Fixture: the turn carries its context once.")
+             (handler-case (agent-compact-conversation agent (make-instance 'agent-observer))
+               (provider-context-budget-error (condition) (setf failure condition)))
+             (test-assert (null failure) "Path: emergency compaction publishes mid-turn.")
+             (test-assert (getf (rest (find :summary (conversation-records-newest conversation 20) :key #'first))
+                                :recovery)
+                          "Path: publication went through emergency recovery.")
+             (let ((previous (input)))
+               (test-assert
+                (and (turn-context-p previous)
+                     (every (lambda (text item) (search text (json-encode item)))
+                            texts (subseq previous (- (length previous) (length texts)))))
+                "Contract: relocated context follows the newest compacted item once, in order.")
+               (dolist (call-id '("after-0" "after-1"))
+                 (tool-round call-id)
+                 (let ((current (input)))
+                   (test-assert
+                    (and (prefix-p previous current)
+                         (turn-context-p current)
+                         (equal (json-get (aref current (1- (length current))) "type")
+                                "function_call_output"))
+                    "Contract: tool rounds after compaction extend the previous input unchanged.")
+                   (setf previous current)))
+               (tool-round "after-2")
+               (let ((live (input)))
+                 (test-assert
+                  (and (prefix-p previous live)
+                       (string= (json-encode live)
+                                (json-encode
+                                 (input (conversation-load-by-id
+                                         configuration (conversation-identifier conversation))))))
+                  "Replay: a resumed compacted conversation rebuilds the same request.")))))))))
+  nil)
+
 (-> test-compaction-recovery-metadata-permit () null)
 (defun test-compaction-recovery-metadata-permit ()
   "Use strictly larger route metadata once at either actual transport boundary."
