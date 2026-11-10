@@ -3122,9 +3122,11 @@
                          "context placement preserves root cache identity")
             (test-assert (and (= (length changed) (1+ count))
                               (not (search "current goal" (json-encode changed)))
-                              (equalp (aref changed (1- (length changed)))
-                                      (responses-developer-message "updated goal")))
-                         "a changed goal replaces the old one behind the newest history")
+                              (find (responses-developer-message "updated goal") changed
+                                    :test #'equalp)
+                              (equal (json-get (aref changed (1- (length changed))) "type")
+                                     "function_call_output"))
+                         "a changed goal replaces the old one before the complete tool exchange")
             (let ((request (provider-request-object
                             provider conversation #()
                             :goal-context "ignored during compaction" :compaction-p t)))
@@ -3419,11 +3421,11 @@
                  (encoded (json-encode current)))
             (test-assert
              (and (not (search "Stable current block" encoded))
-                  (search "Changed stable block"
-                          (json-encode (aref current (1- (length current)))))
+                  (search "Changed stable block" encoded)
+                  (equal (last-type current) "function_call_output")
                   (search "Anchored current block" (json-encode (aref current 1)))
                   (search "current goal" encoded))
-             "changed context moves behind the newest history while unchanged context stays")
+             "changed current state precedes the final tool exchange while anchored context stays")
             (test-assert
              (string= history (json-encode (conversation-input-items-for-family
                                             conversation (provider-family provider))))

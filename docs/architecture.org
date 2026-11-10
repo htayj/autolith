@@ -241,10 +241,10 @@ are reported through =preferences-load-warning= during configuration creation.
   events in the terminal and record projected provider history in conversations.
 - =src/provider/wire-protocol.lisp= asks =context-delivery-project-items= to
   anchor Codex's goal and lasting context blocks inside the history, so a tool
-  round's request ends with its durable history. Each block is keyed by its
-  text in the conversation's context anchor sidecar and keeps its boundary only
-  within the current turn; a new or changed block, and every block at a new
-  user message, follows the newest item. One-request context and other
+  round's request ends with its durable history. Lasting blocks retain their
+  anchored boundaries. Current-state blocks are jointly versioned in the context
+  anchor sidecar; fresh state is inserted before the newest protocol-complete
+  suffix by =context--current-state-index=. One-request context and other
   Responses providers' context still follow the history. Only the current
   request's objects are placed; durable history and compaction input are
   unchanged.

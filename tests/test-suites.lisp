@@ -75,7 +75,9 @@
 
 (define-test-suite cache-review
   test-cache-review-retention
-  test-cache-review-final-wire)
+  test-cache-review-final-wire
+  test-cache-hourly-mission-request-prefix-growth
+  test-cache-current-state-group-lifecycle)
 
 (define-test-suite compaction-acceptance
   test-compaction-request-view-isolation
