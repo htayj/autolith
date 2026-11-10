@@ -19,6 +19,37 @@
   test-usage-display-command)
 
 (define-test-suite context-admission
+  test-context-boundary-prepare-change
+  test-context-boundary-headroom-change
+  test-context-boundary-observer-change
+  test-context-boundary-prepare-refresh
+  test-context-boundary-headroom-refresh
+  test-context-boundary-observer-refresh
+  test-context-measured-route-switch
+  test-context-measured-route-headroom
+  test-context-measured-route-refresh
+  test-context-measured-route-unknown
+  test-context-measured-route-completion-change
+  test-context-measured-current-images
+  test-context-measured-headroom-images
+  test-context-measured-distributed-images
+  test-context-measured-estimate-controls
+  test-context-measured-durable-controls
+  test-context-measured-owner-controls
+  test-context-measured-failure-lifecycle
+  test-context-measured-automatic-retry
+  test-context-measured-overlapping-completions
+  test-context-measured-paid-summary-rejection
+  test-context-measured-mission-accounting
+  test-context-measured-replay-admission
+  test-context-measured-publication-lineage
+  test-context-measured-effective-identity
+  test-context-measured-volatile-projection
+  test-context-measured-storage-lifecycle
+  test-context-measured-legacy-refusal
+  test-context-measured-native-mechanical
+  test-context-measured-child-ownership
+  test-context-measured-child-accounting
   test-context-admission-mission-large-budget
   test-context-admission-mission-wire-ceiling
   test-context-admission-mission-explicit-policy
@@ -32,6 +63,7 @@
   test-context-admission-mission-handoff-reasons
   test-context-admission-boundary
   test-context-admission-fresh-projection
+  test-context-admission-usage-ownership
   test-context-admission-measured-reasoning
   test-context-admission-measured-request-tails
   test-context-admission-measured-invalidation

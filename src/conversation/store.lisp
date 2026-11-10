@@ -394,6 +394,25 @@ not yet been told that work from the previous process is gone.")
     :accessor      conversation-input-history-last-sequence
     :type          (integer 0)
     :documentation "Newest editable input observed in authoritative conversation records.")
+   (context-usage-request
+    :initform      nil
+    :accessor      conversation-context-usage-request
+    :documentation "Exact newest ordinary usage request in this heap.")
+   (input-measurement
+    :initform      nil
+    :accessor      conversation-input-measurement
+    :type          list
+    :documentation "Validated bounded receipt for an ordinary measured input prefix.")
+   (input-measurement-issuance
+    :initform      0
+    :accessor      conversation-input-measurement-issuance
+    :type          (integer 0)
+    :documentation "Monotone ordinary-attempt issuance within this owner.")
+   (input-measurement-generation
+    :initform      0
+    :accessor      conversation-input-measurement-generation
+    :type          (integer 0)
+    :documentation "Invalidation epoch for replacement of this owner's projection.")
    (prompt-cache-usage
     :initform      nil
     :accessor      conversation-prompt-cache-usage
@@ -451,13 +470,53 @@ not yet been told that work from the previous process is gone.")
 (defun (setf conversation-input-items) (items conversation)
   "Replace CONVERSATION's provider projection and prune discarded metadata."
   (with-recursive-lock-held ((conversation-append-lock conversation))
+    (incf (conversation-input-measurement-generation conversation))
+    (unless (equal items (conversation-input-items conversation))
+      (setf (conversation-input-measurement conversation) nil))
     (clinker-transcript:projection-replace (conversation-projection conversation) items))
   items)
+
+(-> conversation-input-measurement-valid-p (t) boolean)
+(defun conversation-input-measurement-valid-p (receipt)
+  "Recognize the constant-size versioned receipt; malformed metadata is not an error."
+  (handler-case
+      (and (listp receipt) (eql (list-length receipt) 14)
+           (equal (loop for tail on receipt by (lambda (tail) (rest (rest tail)))
+                        collect (first tail))
+                  '(:version :input :count :root :identity :issued :layout))
+           (eql (getf receipt :version) 1)
+           (typep (getf receipt :input) '(integer 1))
+           (typep (getf receipt :count) '(integer 1))
+           (typep (getf receipt :issued) '(integer 1))
+           (eq (getf receipt :layout) :responses)
+           (every (lambda (value)
+                    (and (stringp value) (= (length value) 64)
+                         (every (lambda (character) (digit-char-p character 16)) value)))
+                  (list (getf receipt :root) (getf receipt :identity)))
+           t)
+    (type-error () nil)))
+
+(-> conversation--note-input-measurement (conversation t) null)
+(defun conversation--note-input-measurement (conversation receipt)
+  "Restore a valid newer receipt without admitting malformed or future metadata."
+  (when (and (conversation-input-measurement-valid-p receipt)
+             (> (getf receipt :issued)
+                (getf (conversation-input-measurement conversation) :issued 0)))
+    (setf (conversation-input-measurement conversation) (copy-tree receipt)
+          (conversation-input-measurement-issuance conversation)
+          (max (conversation-input-measurement-issuance conversation)
+               (getf receipt :issued))))
+  nil)
 
 (-> conversation--note-prompt-cache-usage (conversation list) null)
 (defun conversation--note-prompt-cache-usage (conversation record)
   "Retain the newest valid numeric provider usage for startup without history scans."
+  (when (member (first record) '(:summary :native-compaction))
+    (incf (conversation-input-measurement-generation conversation))
+    (setf (conversation-input-measurement conversation) nil))
   (when (eq (first record) ':provider)
+    (conversation--note-input-measurement
+     conversation (getf (getf (rest record) :metadata) :input-measurement))
     (let* ((usage         (getf (getf (rest record) :metadata) :usage))
            (prompt-tokens (conversation--usage-field usage "input_tokens"))
            (cached-tokens (conversation--usage-field usage "cached_input_tokens")))
@@ -1051,6 +1110,7 @@ a crash may leave one that a later lease acquisition can reuse safely."
         (if (= chunk-start-sequence 1)
             0
             (conversation-input-history-last-sequence conversation))
+        :input-measurement    (copy-tree (conversation-input-measurement conversation))
         :prompt-cache-usage   (copy-tree (conversation-prompt-cache-usage conversation))
         :usage-totals         (copy-list (conversation-usage-totals conversation))
         :pending-async-lisp-events
@@ -2950,7 +3010,12 @@ later picker searches read it without scanning the log."
 (defun conversation-context-usage-sample-p (sample)
   "Validate bounded fingerprint-only measured context evidence loaded from storage."
   (and (proper-list-p sample)
-       (= 16 (length sample))
+       (or (= 16 (length sample))
+           (and (= 18 (length sample))
+                (stringp (getf sample :route))
+                (= 64 (length (getf sample :route)))
+                (every (lambda (character) (digit-char-p character 16))
+                       (getf sample :route))))
        (loop for tail on sample by (partial #'nthcdr 2)
              always (keywordp (first tail)))
        (eql 1 (getf sample :format))
@@ -3410,6 +3475,8 @@ later picker searches read it without scanning the log."
         ;; Headers written before usage totals existed leave them unknown.
         (setf (conversation-usage-totals conversation) (copy-list usage-totals))
         (when (= version 2)
+          (conversation--note-input-measurement
+           conversation (getf properties :input-measurement))
           (setf (conversation-working-seconds conversation) working-seconds
                 (conversation-user-turn-count conversation) user-turn-count
                 (conversation-last-activity-at conversation) last-activity-at

@@ -897,6 +897,12 @@ are request-scoped and included in transport and result redaction."))
   (declare (ignore credentials conversation))
   (funcall function provider nil))
 
+(defparameter *provider-input-measurement-credentials* nil
+  "Credentials available only inside the current measurement route scope.")
+
+(defparameter *provider-input-measurement-route* nil
+  "A request-local digest of attested credential-owned routing, never a bearer token.")
+
 (defmethod provider-attempt-turn
     ((provider subscription-provider) (conversation conversation)
      &key tool-namespaces event-callback force-refresh goal-context compaction-p)
@@ -911,28 +917,36 @@ are request-scoped and included in transport and result redaction."))
       (provider-call-with-request-adapter
        provider credentials
        (lambda (adapter additional-secrets)
-         (let* ((*provider-active-credential-values*
-                  (append additional-secrets *provider-active-credential-values*))
-                (*provider-active-credential-redaction-marker*
-                  (safe-redaction-marker *provider-credential-redaction-marker*
-                                         *provider-active-credential-values*)))
-           (handler-case
-               (multiple-value-bind (request delivery)
-                   (provider-request-object adapter conversation tool-namespaces
-                                            :goal-context goal-context
-                                            :compaction-p compaction-p)
-                 (when (and delivery event-callback)
-                   (context-delivery-notify delivery event-callback))
-                 (cl-llm-provider-api::provider-execute-request
-                  adapter request :secrets *provider-active-credential-values*
-                  :event-callback          event-callback
-                  :transport               (lambda (request)
-                                             (provider--open-response-stream
-                                              adapter request :credentials credentials
-                                              :conversation                conversation))
-                  :completion              (lambda () (context-delivery-complete delivery))))
-            (http-request-failed (condition)
-              (provider-signal-transport-failure adapter condition)))))
+         (let ((*provider-input-measurement-credentials* credentials)
+               (*provider-input-measurement-route*
+                 (provider-input-measurement--begin-route adapter credentials)))
+          (let* ((*provider-active-credential-values*
+                   (append additional-secrets *provider-active-credential-values*))
+                 (*provider-active-credential-redaction-marker*
+                   (safe-redaction-marker *provider-credential-redaction-marker*
+                                          *provider-active-credential-values*)))
+            (handler-case
+                (multiple-value-bind (request delivery)
+                    (provider-request-object adapter conversation tool-namespaces
+                                             :goal-context goal-context
+                                             :compaction-p compaction-p)
+                  (when (and delivery event-callback)
+                    (context-delivery-notify delivery event-callback))
+                  (cl-llm-provider-api::provider-execute-request
+                   adapter request :secrets *provider-active-credential-values*
+                   :event-callback          event-callback
+                   :cleanup                 (lambda (stream)
+                                              (unwind-protect
+                                                   (provider-input-measurement-close-stream stream)
+                                                (provider-input-measurement--end-route
+                                                 adapter credentials *provider-input-measurement-route*)))
+                   :transport               (lambda (request)
+                                              (provider--open-response-stream
+                                               adapter request :credentials credentials
+                                               :conversation                conversation))
+                   :completion              (lambda () (context-delivery-complete delivery))))
+             (http-request-failed (condition)
+                (provider-signal-transport-failure adapter condition))))))
        :conversation conversation))))
 
 (define-condition provider--authentication-failure (authentication-error)
