@@ -3081,7 +3081,7 @@
 
 (-> test-codex-context-request () null)
 (defun test-codex-context-request ()
-  "Keep Codex request context after the history, so changing it never splits a cached prefix."
+  "Anchor the Codex goal where it first appeared, moving it only when it changes."
   (with-test-configuration (configuration)
     (let* ((*context-contributors*        nil)
            (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
@@ -3102,7 +3102,7 @@
                (cache-key   (json-get first "prompt_cache_key")))
           (test-assert (equalp (aref first-input (1- (length first-input)))
                                (responses-developer-message "current goal"))
-                       "request context follows the history")
+                       "a new goal follows the newest history")
           (conversation-append-provider-item
            conversation (json-object "type" "function_call" "name" "sample"
                                      "call_id" "a" "arguments" "{}"))
@@ -3113,18 +3113,18 @@
                  (count   (history-count))
                  (second  (input "current goal"))
                  (changed (input "updated goal")))
-            (test-assert (equalp (subseq first-input 0 (1- (length first-input)))
-                                 (subseq second 0 (1- (length first-input))))
-                         "a tool round extends the prior history")
+            (test-assert (equalp first-input (subseq second 0 (length first-input)))
+                         "a tool round extends the prior input, goal included")
             (test-assert (equal cache-key (json-get (provider-request-object
                                                      provider conversation #()
                                                      :goal-context "current goal")
                                                     "prompt_cache_key"))
                          "context placement preserves root cache identity")
-            (test-assert (and (equalp (subseq second 0 count) (subseq changed 0 count))
+            (test-assert (and (= (length changed) (1+ count))
+                              (not (search "current goal" (json-encode changed)))
                               (equalp (aref changed (1- (length changed)))
                                       (responses-developer-message "updated goal")))
-                         "changed context leaves the complete history as the shared prefix")
+                         "a changed goal replaces the old one behind the newest history")
             (let ((request (provider-request-object
                             provider conversation #()
                             :goal-context "ignored during compaction" :compaction-p t)))
@@ -3198,18 +3198,20 @@
                       (json-encode (subseq second-input 0 (- (length first-input) 2))))
              "a tool round keeps the preceding history as the shared prefix")
             (test-assert
-             (string= (json-encode (subseq first-input (- (length first-input) 2)))
-                      (json-encode (subseq second-input (- (length second-input) 2))))
-             "unchanged goal and rendered context follow the extended history")
+             (and (string= (json-encode first-input)
+                           (json-encode (subseq second-input 0 (length first-input))))
+                  (equal (json-get (aref second-input (1- (length second-input))) "type")
+                         "function_call_output"))
+             "unchanged goal and rendered context keep their place before the tool round")
             (multiple-value-bind (partial partial-delivery)
                 (provider-request-object provider conversation #())
               (let ((input (json-get partial "input")))
                 (test-assert
-                 (string= (json-encode (aref input (1- (length input))))
+                 (string= (json-encode (aref input 1))
                           (json-encode
                            (responses-developer-message
                             (context-delivery-rendered partial-delivery))))
-                 "omitting the goal leaves the rendered context at the tail")
+                 "omitting the goal leaves the rendered context in its place")
                 (test-assert (not (search "current goal" (json-encode input)))
                              "partial omission never replays the former goal")))
             (setf instruction nil)
@@ -3222,8 +3224,8 @@
              "rendered context placement leaves durable history unchanged"))))))
   nil)
 
-(-> test-codex-anchored-contributions-request () null)
-(defun test-codex-anchored-contributions-request ()
+(-> test-openai-api-anchored-contributions-request () null)
+(defun test-openai-api-anchored-contributions-request ()
   "Keep anchored context in its history place while the goal and ordinary context follow."
   (with-test-configuration (configuration)
     (let* ((*context-contributors*        nil)
@@ -3233,9 +3235,9 @@
            (anchored-p                    t)
            (tail-text                     "Trailing current block.")
            (conversation                  (conversation-create configuration))
-           (provider                      (provider-create configuration)))
+           (provider                      (openai-api-provider-create configuration)))
       (register-context-contributor
-       "codex-anchored-placement-test"
+       "openai-api-anchored-placement-test"
        (lambda (context)
          (declare (ignore context))
          (append
@@ -3248,19 +3250,26 @@
             (list (make-context-contribution :identifier  "trailing-block"
                                              :instruction tail-text))))))
       (conversation-append-user-message conversation "synthetic task")
-      (flet ((input (&optional (goal "current goal"))
-               (json-get (provider-request-object provider conversation #() :goal-context goal)
-                         "input"))
-             (tool-round (call-id)
-               (conversation-append-provider-item
-                conversation (json-object "type" "function_call" "name" "sample"
-                                          "call_id" call-id "arguments" "{}"))
-               (conversation-append-provider-item
-                conversation (json-object "type" "function_call_output"
-                                          "call_id" call-id "output" "one"))))
+      (labels ((history (request)
+                 "Return REQUEST's input after its leading system instructions."
+                 (subseq (json-get request "input") 1))
+
+               (input (&optional (goal "current goal"))
+                 "Return the input history of the next request with GOAL."
+                 (history (provider-request-object provider conversation #()
+                                                   :goal-context goal)))
+
+               (tool-round (call-id)
+                 "Append one durable tool exchange."
+                 (conversation-append-provider-item
+                  conversation (json-object "type" "function_call" "name" "sample"
+                                            "call_id" call-id "arguments" "{}"))
+                 (conversation-append-provider-item
+                  conversation (json-object "type" "function_call_output"
+                                            "call_id" call-id "output" "one"))))
         (multiple-value-bind (first delivery)
             (provider-request-object provider conversation #() :goal-context "current goal")
-          (let ((previous (json-get first "input")))
+          (let ((previous (history first)))
             (test-assert
              (and (= 4 (length previous))
                   (search "Anchored current block" (json-encode (aref previous 1)))
@@ -3299,6 +3308,126 @@
                (string= history (json-encode (conversation-input-items-for-family
                                               conversation (provider-family provider))))
                "projection and omission leave durable history untouched")))))))
+  nil)
+
+(-> test-codex-tool-round-context-prefix () null)
+(defun test-codex-tool-round-context-prefix ()
+  "End each Codex tool round with durable history so its whole input is the next prefix."
+  (with-test-configuration (configuration)
+    (let* ((*context-contributors*        nil)
+           (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+           (*context-last-deliveries*     (make-hash-table :test #'equal))
+           (*context-last-delivery-order* nil)
+           (stable-text                   "Stable current block.")
+           (volatile-text                 nil)
+           (conversation                  (conversation-create configuration))
+           (provider                      (provider-create configuration)))
+      (register-context-contributor
+       "codex-tool-round-prefix-test"
+       (lambda (context)
+         (declare (ignore context))
+         (append
+          (list (change-class
+                 (make-context-contribution :identifier  "anchored-block"
+                                            :instruction "Anchored current block.")
+                 'anchored-context-contribution)
+                (make-context-contribution :identifier  "stable-block"
+                                           :instruction stable-text
+                                           :lifetime    ':turn))
+          (when volatile-text
+            (list (make-context-contribution :identifier  "volatile-block"
+                                             :instruction volatile-text
+                                             :lifetime    ':next-request))))))
+      (conversation-append-user-message conversation "synthetic task")
+      (labels ((input ()
+                 "Return the projected Codex input of the next request."
+                 (json-get (provider-request-object provider conversation #()
+                                                    :goal-context "current goal")
+                           "input"))
+
+               (tool-round (call-id)
+                 "Append one durable tool exchange."
+                 (conversation-append-provider-item
+                  conversation (json-object "type" "function_call" "name" "sample"
+                                            "call_id" call-id "arguments" "{}"))
+                 (conversation-append-provider-item
+                  conversation (json-object "type" "function_call_output"
+                                            "call_id" call-id "output" "one")))
+
+               (prefix-p (previous current)
+                 "Return true when every item of PREVIOUS starts CURRENT unchanged."
+                 (and (<= (length previous) (length current))
+                      (string= (json-encode previous)
+                               (json-encode (subseq current 0 (length previous))))))
+
+               (last-type (input)
+                 "Return the wire type of INPUT's final item."
+                 (json-get (aref input (1- (length input))) "type")))
+        (let ((previous (input)))
+          (test-assert
+           (and (search "current goal" (json-encode previous))
+                (search "Stable current block" (json-encode previous)))
+           "the first request of a turn carries the goal and stable context")
+          (dolist (call-id '("round-0" "round-1"))
+            (tool-round call-id)
+            (let ((current (input)))
+              (test-assert (and (prefix-p previous current)
+                                (equal (last-type current) "function_call_output"))
+                           "a tool round sends the previous input unchanged and ends with its output")
+              (setf previous current)))
+          (setf volatile-text "One request notice.")
+          (tool-round "round-2")
+          (let ((current (input)))
+            (test-assert
+             (and (prefix-p previous current)
+                  (search "One request notice"
+                          (json-encode (aref current (1- (length current))))))
+             "one-request context follows the newest tool output")
+            (setf previous (subseq current 0 (1- (length current)))))
+          (setf volatile-text nil)
+          (tool-round "round-3")
+          (let ((current (input)))
+            (test-assert
+             (and (prefix-p previous current)
+                  (not (search "One request notice" (json-encode current))))
+             "delivered one-request context is never replayed into the prefix")
+            (setf previous current))
+          (conversation-append-user-message conversation "new instruction")
+          (let* ((current (input))
+                 (start   (position "new instruction" current
+                                    :key  #'json-encode
+                                    :test (lambda (text encoded) (search text encoded)))))
+            (test-assert
+             (and start
+                  (prefix-p (subseq previous 0 2) current)
+                  (search "Anchored current block" (json-encode (aref current 1)))
+                  (search "current goal" (json-encode (subseq current start)))
+                  (search "Stable current block" (json-encode (subseq current start)))
+                  (= start (- (length previous) 2)))
+             "a new user message moves turn context behind it and keeps earlier history")
+            (setf previous current))
+          (tool-round "round-4")
+          (let ((current (input)))
+            (test-assert (and (prefix-p previous current)
+                              (equal (last-type current) "function_call_output"))
+                         "the new turn's tool rounds extend its first request")
+            (setf previous current))
+          (setf stable-text "Changed stable block.")
+          (let* ((history (json-encode (conversation-input-items-for-family
+                                        conversation (provider-family provider))))
+                 (current (input))
+                 (encoded (json-encode current)))
+            (test-assert
+             (and (not (search "Stable current block" encoded))
+                  (search "Changed stable block"
+                          (json-encode (aref current (1- (length current)))))
+                  (search "Anchored current block" (json-encode (aref current 1)))
+                  (search "current goal" encoded))
+             "changed context moves behind the newest history while unchanged context stays")
+            (test-assert
+             (string= history (json-encode (conversation-input-items-for-family
+                                            conversation (provider-family provider))))
+             "context placement leaves durable history unchanged"))))))
   nil)
 
 (defclass test-error-body-character-stream (test-character-input-stream)

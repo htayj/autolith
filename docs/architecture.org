@@ -239,22 +239,15 @@ are reported through =preferences-load-warning= during configuration creation.
 - =src/provider/client.lisp= integrates product providers with
   =cl-llm-provider-api= wire clients and request execution. Render semantic stream
   events in the terminal and record projected provider history in conversations.
-- =src/provider/wire-protocol.lisp= anchors Codex's identical, currently supplied
-  goal and remaining developer-context tail before appended assistant/tool
-  rounds, after =context-delivery-project-items= has placed opted-in anchored
-  contributions. Exact suffix validation uses that assembly's actual tail,
-  not the full delivery rendering that also contains anchored blocks.
-  Only the current request's objects are moved; durable history is unchanged.
-  Weak conversation-keyed state retains two positions and case-sensitive
-  SHA-256 digests, not prompt text. Reuse requires the complete preceding
-  history to remain an exact prefix and no intervening user, developer, or
-  system message. Changed, omitted, partially omitted or unrecognized context,
-  rewritten/shortened history, and direct compaction requests reset placement.
-  When compaction uses a detached request view, the original conversation
-  resets on the changed history at its next ordinary request.
-  Compaction wire input itself is unchanged. The placement-state mutex does
-  not serialize conversation mutation or network requests: concurrent
-  constructors can reset cache continuity, but each uses only its own context.
+- =src/provider/wire-protocol.lisp= asks =context-delivery-project-items= to
+  anchor Codex's goal and lasting context blocks inside the history, so a tool
+  round's request ends with its durable history. Each block is keyed by its
+  text in the conversation's context anchor sidecar and keeps its boundary only
+  within the current turn; a new or changed block, and every block at a new
+  user message, follows the newest item. One-request context and other
+  Responses providers' context still follow the history. Only the current
+  request's objects are placed; durable history and compaction input are
+  unchanged.
 - Tools have metadata, namespaces, validation, and a result for every
   call, including failed ones
 - =src/tools/defaults.lisp= assembles the registry

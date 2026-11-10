@@ -221,9 +221,14 @@
                       "Capture the prefix of the actual Responses request with temporary TAIL."
                       (let* ((prefix nil)
                              (*provider-cache-prefix-function*
-                               (lambda (value) (setf prefix value))))
+                               (lambda (value) (setf prefix value)))
+                             (*context-request-contributions*
+                               (list (make-context-contribution :identifier  "temporary-tail"
+                                                                :instruction tail
+                                                                :class       ':mandatory
+                                                                :lifetime    ':next-request))))
                         (provider-cache-prefix-observe
-                         (provider-request-object provider conversation #() :goal-context tail))
+                         (provider-request-object provider conversation #()))
                         prefix))
 
                     (exchange (number)
@@ -299,7 +304,7 @@
                   (equal (mapcar #'terminal-span-text counts)
                          (mapcar #'application--token-count-description '(45000 75400)))
                   "stall notices present only measured cache and input token quantities")))
-             (complete 100000 45000 (project (make-string 180000 :initial-element #\z)))
+             (complete 100000 45000 (project (make-string 120000 :initial-element #\z)))
              (test-assert (not (noticed-p))
                           "a larger temporary tail cannot create another shared-growth notice"))
         (ignore-errors (terminal-ui-stop ui)))))
@@ -314,6 +319,7 @@
            (agent        (agent-create :configuration configuration :provider provider
                                        :conversation conversation :worker ':unused))
            (completed    nil)
+           (sent         0)
            (observer
              (callback-agent-observer-create
               :status-callback
@@ -326,9 +332,11 @@
               (lambda (provider conversation &key tool-namespaces event-callback
                                                   goal-context compaction-p)
                 (declare (ignore event-callback))
-                (provider-cache-prefix-observe
-                 (provider-request-object provider conversation tool-namespaces
-                                          :goal-context goal-context :compaction-p compaction-p))
+                (let ((request (provider-request-object provider conversation tool-namespaces
+                                                        :goal-context goal-context
+                                                        :compaction-p compaction-p)))
+                  (setf sent (length (json-get request "input")))
+                  (provider-cache-prefix-observe request))
                 (make-instance 'provider-result
                                :response-id     "cache-observation"
                                :output-items nil :tool-calls nil
@@ -337,9 +345,11 @@
        (lambda ()
          (agent-run-user-turn agent "observe this request" :tools-p nil :observer observer)))
       (test-assert
-       (and completed (= (length (getf completed :items)) 1)
+       (and completed
+            (= (length (getf completed :items))
+               (- sent (getf completed :volatile-items)))
             (plusp (provider-cache-prefix-characters completed)))
-       "agent completion carries the fingerprinted user history, excluding temporary context")
+       "agent completion fingerprints the sent history, excluding one-request context")
       (test-assert (and (getf (getf completed :wire) :items)
                         (assoc "model" (getf (getf completed :wire) :fields) :test #'string=))
                    "agent completion carries the plan of the final request")))

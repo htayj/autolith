@@ -625,22 +625,32 @@ CONTEXT-DELIVERY-PROJECT-ITEMS, which already put the anchored blocks in history
                                    (context-delivery-contributions delivery)))))
 
 (-> context-delivery-project-items
-    ((option context-delivery) conversation list)
+    ((option context-delivery) conversation list
+     &key (:goal-context (option string)) (:anchor-trailing-p boolean))
     (values list list (option string)))
-(defun context-delivery-project-items (delivery conversation items)
+(defun context-delivery-project-items
+    (delivery conversation items &key goal-context anchor-trailing-p)
   "Return ITEMS with active anchored context, the stable context tail, and the volatile one.
 
 Only identities and history boundaries survive assembly. Render current selected
 contributions afresh, dropping inactive blocks and relocating anchors whose
 history was removed or compacted. Never append context to durable history.
 
-The second value renders each remaining contribution that outlives one request
-as its own block, in priority order, so an unchanged block can keep its place
-in a provider's cached prefix while another changes. The third value renders
-the one-request contributions together: they change on every delivery."
-  (unless delivery
-    (return-from context-delivery-project-items (values items nil nil)))
-  (let* ((contributions (context-delivery-contributions delivery))
+The second value lists GOAL-CONTEXT and then renders each remaining contribution
+that outlives one request as its own block, in priority order. The third value
+renders the one-request contributions together: they change on every delivery.
+
+With ANCHOR-TRAILING-P, the goal and those blocks are anchored instead and the
+second value is NIL, so a tool round's request ends with its durable history,
+as a provider that reuses no cached input past trailing developer messages
+needs. Each is keyed by its text and keeps its place only within the current
+turn: a new or changed block, and every block at a new user message, starts
+after the newest item. A change therefore splits a cached prefix no earlier than
+the latest user message."
+  (unless (or delivery (and anchor-trailing-p goal-context))
+    (return-from context-delivery-project-items
+      (values items (and goal-context (list goal-context)) nil)))
+  (let* ((contributions (and delivery (context-delivery-contributions delivery)))
          (anchored      (stable-sort
                          (remove-if-not
                           (lambda (contribution)
@@ -650,42 +660,41 @@ the one-request contributions together: they change on every delivery."
          (trailing      (remove-if
                          (lambda (contribution)
                            (typep contribution 'anchored-context-contribution))
-                         contributions)))
+                         contributions))
+         (stable        (stable-sort (remove ':next-request trailing
+                                             :key #'context-contribution-lifetime)
+                                     #'< :key #'context-contribution-priority))
+         (placements
+           (append (mapcar (lambda (contribution)
+                             (list :key    (context--contribution-key contribution)
+                                   :text   (context--render (list contribution))
+                                   :turn-p nil))
+                           anchored)
+                   (when anchor-trailing-p
+                     (context--trailing-placements goal-context stable)))))
     (with-recursive-lock-held ((conversation-append-lock conversation))
-      (let ((previous  (context-anchors-current conversation))
-            (history   (coerce items 'simple-vector))
-            (groups    (make-hash-table :test #'eq))
-            (anchors   nil)
-            (projected nil))
-        (dolist (contribution anchored)
-          (let* ((key   (context-anchors-key-digest
-                         (list (context-contribution-contributor contribution)
-                               (context-contribution-source contribution)
-                               (context-contribution-identifier contribution))))
-                 (old   (find key previous :key  (lambda (anchor) (getf anchor :key))
-                                           :test #'equal))
-                 ;; A boundary survives while the item at its index is unchanged,
-                 ;; across tool rounds, user messages and resumed conversations.
-                 (index (cond
-                          ((and old (null (getf old :index)))
-                           nil)
-                          ((and old
-                                (< (getf old :index) (length history))
-                                (equal (getf old :item)
-                                       (context-anchors-item-digest
-                                        (aref history (getf old :index)))))
-                           (getf old :index))
-                          ((plusp (length history))
-                           (1- (length history)))
-                          (t
-                           nil)))
+      (let* ((previous   (context-anchors-current conversation))
+             (history    (coerce items 'simple-vector))
+             (turn-start (position-if (lambda (item)
+                                        (json-string= (json-get item "role") "user"))
+                                      history :from-end t))
+             (groups     (make-hash-table :test #'eq))
+             (anchors    nil)
+             (projected  nil))
+        (dolist (placement placements)
+          (let* ((key   (context-anchors-key-digest (getf placement :key)))
+                 (index (context--anchor-index
+                         (find key previous :key  (lambda (anchor) (getf anchor :key))
+                                            :test #'equal)
+                         history
+                         :turn-start (and (getf placement :turn-p) turn-start)))
                  (after (and index (aref history index))))
             (push (list :key   key
                         :index index
                         :item  (and after (context-anchors-item-digest after)))
                   anchors)
             ;; A typed message, so every provider's history serializer keeps it.
-            (push (responses-developer-message (context--render (list contribution)))
+            (push (responses-developer-message (getf placement :text))
                   (gethash after groups))))
         (dolist (message (reverse (gethash nil groups)))
           (push message projected))
@@ -695,16 +704,63 @@ the one-request contributions together: they change on every delivery."
             (push message projected)))
         (context-anchors-update conversation (nreverse anchors))
         (values (nreverse projected)
-                (mapcar (lambda (contribution)
-                          (context--render (list contribution)))
-                        (stable-sort (remove ':next-request trailing
-                                             :key #'context-contribution-lifetime)
-                                     #'< :key #'context-contribution-priority))
+                (unless anchor-trailing-p
+                  (append (and goal-context (list goal-context))
+                          (mapcar (lambda (contribution)
+                                    (context--render (list contribution)))
+                                  stable)))
                 (context--render (remove-if-not
                                   (lambda (contribution)
                                     (eq (context-contribution-lifetime contribution)
                                         ':next-request))
                                   trailing)))))))
+
+(-> context--contribution-key (context-contribution) list)
+(defun context--contribution-key (contribution)
+  "Return the registration identity of CONTRIBUTION as an anchor key."
+  (list (context-contribution-contributor contribution)
+        (context-contribution-source contribution)
+        (context-contribution-identifier contribution)))
+
+(-> context--trailing-placements ((option string) list) list)
+(defun context--trailing-placements (goal-context contributions)
+  "Return turn-bound placements of GOAL-CONTEXT and then of each of CONTRIBUTIONS.
+
+Each key includes the rendered text, so a changed block is a new placement."
+  (append
+   (when goal-context
+     (list (list :key (list ':goal goal-context) :text goal-context :turn-p t)))
+   (mapcar (lambda (contribution)
+             (let ((text (context--render (list contribution))))
+               (list :key    (append (context--contribution-key contribution) (list text))
+                     :text   text
+                     :turn-p t)))
+           contributions)))
+
+(-> context--anchor-index
+    ((option list) simple-vector &key (:turn-start (option (integer 0))))
+    (option (integer 0)))
+(defun context--anchor-index (anchor history &key turn-start)
+  "Return the HISTORY index a block follows, keeping ANCHOR's while it is valid.
+
+A boundary survives while the item at its index is unchanged, across tool
+rounds, user messages and resumed conversations. With TURN-START, one before
+that index is abandoned too. A new block follows the newest item, or precedes
+an empty history."
+  (let ((index (and anchor (getf anchor :index))))
+    (cond
+      ((and anchor (null index) (null turn-start))
+       nil)
+      ((and index
+            (or (null turn-start) (>= index turn-start))
+            (< index (length history))
+            (equal (getf anchor :item)
+                   (context-anchors-item-digest (aref history index))))
+       index)
+      ((plusp (length history))
+       (1- (length history)))
+      (t
+       nil))))
 
 (-> context--invoke-contributors
     (request-context list)
