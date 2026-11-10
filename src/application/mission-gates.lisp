@@ -38,7 +38,11 @@
                          (every (lambda (character) (digit-char-p character 16))
                                 (getf specification :sha256)))))
       (mission--reject ':invalid "Artifact SHA-256 must contain 64 hexadecimal digits."))
-    (list :id (getf specification :id) :kind kind
+    (unless (or (and (null (getf specification :requires-tool)) (null (getf specification :requires-criterion)))
+                (and (non-empty-string-p (getf specification :requires-tool)) (non-empty-string-p (getf specification :requires-criterion))))
+      (mission--reject :tooling-prerequisite "Tool label and prerequisite criterion must be supplied together."))
+    (list :requires-tool (getf specification :requires-tool) :requires-criterion (getf specification :requires-criterion)
+          :id (getf specification :id) :kind kind
           :command   (getf specification :command)
           :directory (getf specification :directory)
           :path (getf specification :path) :sha256 (getf specification :sha256)
@@ -105,7 +109,17 @@ satisfied by an accepted explicit negation."
 (defun mission-gate-fingerprint (gate context)
   "Fingerprint GATE's relevant files and invalidation epoch atomically."
   (with-recursive-lock-held (*workspace-file-mutation-lock*)
-    (mission--gate-fingerprint-unlocked gate context)))
+    (let* ((fingerprint (mission--gate-fingerprint-unlocked gate context))
+           (required    (getf gate :requires-criterion))
+           (mission     (mission-context-find (tool-context-conversation context)))
+           (goal        (and mission (mission-context-goal mission)))
+           (criterion   (find required (getf goal :criteria) :key (lambda (c) (getf c :id)) :test #'equal)))
+      (if required
+          (append fingerprint (list (mapcar (lambda (id)
+                                             (let ((dependency (find id (getf goal :gates) :key (lambda (g) (getf g :id)) :test #'equal)))
+                                               (list id (copy-tree (getf dependency :fingerprint)))))
+                                           (getf criterion :gates))))
+          fingerprint))))
 
 (-> mission--gate-tool-result (tool-context string string &key (:arguments json-object)) tool-result)
 (defun mission--gate-tool-result (context namespace name &key arguments)
@@ -271,7 +285,7 @@ satisfied by an accepted explicit negation."
   "Revalidate every passed gate while workspace and mission state are locked."
   (let ((stale nil))
     (dolist (gate (getf goal :gates))
-      (let ((fingerprint (mission--gate-fingerprint-unlocked gate tool-context)))
+      (let ((fingerprint (mission-gate-fingerprint gate tool-context)))
         (unless (and (eq (getf gate :status) ':passed)
                      (equal fingerprint (getf gate :fingerprint)))
           (setf (getf gate :status) ':pending
@@ -280,7 +294,32 @@ satisfied by an accepted explicit negation."
     (when stale
       (mission--evidence context ':stale-gate (nreverse stale))
       (mission--record context))
-    (null stale)))
+    (and (null stale)
+         (every (lambda (gate) (mission-gate-prerequisites-current-p gate goal tool-context)) (getf goal :gates)))))
+
+(-> mission--completion-proof-p (mission-context tool-context &key (:revalidated-p boolean)) boolean)
+(defun mission--completion-proof-p (context tool-context &key revalidated-p)
+  "Check current proof only, without running gates or requesting review.
+The caller holds request, workspace mutation and mission locks in that order.
+REVALIDATED-P means gate fingerprints were checked in this same critical section."
+  (let* ((goal        (mission-context-goal context))
+         (application (mission-context-application context))
+         (runtime     (tool-context-execution-runtime tool-context)))
+    (and (eq goal (application-goal application))
+         (eq context (mission-context-find (application-conversation application)))
+         (eq (getf goal :status) ':active)
+         (zerop (getf goal :requests-outstanding 0))
+         (zerop (getf goal :tokens-reserved 0))
+         (not (mission--unknown-usage-blocks-p goal))
+         (not (mission-context-jobs context))
+         (not (and (typep runtime 'task-orchestrator)
+                   (some (lambda (job)
+                           (and (eq context (mission-context-find job)) (not (job-terminal-p job))))
+                         (task-orchestrator-list-visible-jobs runtime (application-agent application)))))
+         (or revalidated-p (mission--revalidate-gates context goal tool-context))
+         (application-mission-review-current-p application ':final-acceptance)
+         (mission--criteria-proven-p goal)
+         t)))
 
 (-> application-mission-verify (application) null)
 (defun application-mission-verify (application)
@@ -313,9 +352,11 @@ satisfied by an accepted explicit negation."
           (mission--evidence context ':pending-work "Delegated work is still live; collect its terminal result before verification.")
           (mission--record context)
           (return-from application-mission-verify nil))
-        (dolist (gate (getf goal :gates))
-          (unless (mission--check-gate context gate tool-context)
-            (return-from application-mission-verify nil)))
+        (if (some (lambda (gate) (getf gate :requires-criterion)) (getf goal :gates))
+            (unless (mission--check-ready-gates context goal tool-context) (return-from application-mission-verify nil))
+            (dolist (gate (getf goal :gates))
+              (unless (mission--check-gate context gate tool-context)
+                (return-from application-mission-verify nil))))
         ;; Hold the workspace mutation lock through the proof and transition.
         ;; Authorized edits therefore cannot land between the last digest and
         ;; the terminal status, while invalidation remains serialized by the
@@ -334,7 +375,66 @@ satisfied by an accepted explicit negation."
               (mission--record context)
               (return-from application-mission-verify nil))
             (mission--admit context :inference-p nil)
-            (if (mission--criteria-proven-p goal)
+            (if (mission--completion-proof-p context tool-context :revalidated-p t)
                 (mission--transition context ':verified "Every explicit acceptance criterion has configured evidence.")
                 (mission--transition context ':blocked "Gates passed; acceptance criteria still require user evidence.")))))
      nil)))
+
+
+;;;; -- Tooling prerequisites --
+
+(-> mission-gate-graph-validate (list list) null)
+(defun mission-gate-graph-validate (gates criteria)
+  "Validate criterion edges before allocating state or executing a gate."
+  (let ((visited nil) (active nil))
+    (labels ((visit (gate)
+               (let ((id (getf gate :id)) (required (getf gate :requires-criterion)))
+                 (when (member id active :test #'equal)
+                   (mission--reject :tooling-cycle "Tooling prerequisites contain a cycle."))
+                 (unless (member id visited :test #'equal)
+                   (push id active)
+                   (when required
+                     (let ((criterion (find required criteria :key (lambda (c) (getf c :id)) :test #'equal)))
+                       (unless (and criterion (getf criterion :gates))
+                         (mission--reject :tooling-prerequisite "Tooling requires an existing criterion with executable gates."))
+                       (dolist (dependency (getf criterion :gates))
+                         (visit (find dependency gates :key (lambda (g) (getf g :id)) :test #'equal)))))
+                   (pop active) (push id visited)))))
+      (dolist (gate gates)
+        (unless (some (lambda (criterion) (member (getf gate :id) (getf criterion :gates) :test #'equal)) criteria)
+          (mission--reject :tooling-unreferenced "Each gate must contribute to an acceptance criterion."))
+        (visit gate))))
+  nil)
+
+(-> mission-gate-prerequisites-current-p (list list tool-context) boolean)
+(defun mission-gate-prerequisites-current-p (gate goal context)
+  "Require actual fresh proof for every prerequisite, never reviewer coverage."
+  (let* ((required  (getf gate :requires-criterion))
+         (criterion (and required (find required (getf goal :criteria) :key (lambda (c) (getf c :id)) :test #'equal))))
+    (or (null required)
+        (and criterion (getf criterion :gates)
+             (every (lambda (id)
+                      (let ((dependency (find id (getf goal :gates) :key (lambda (g) (getf g :id)) :test #'equal)))
+                        (and dependency (eq :passed (getf dependency :status))
+                             (mission-gate-prerequisites-current-p dependency goal context)
+                             (equal (mission-gate-fingerprint dependency context) (getf dependency :fingerprint)))))
+                    (getf criterion :gates)) t))))
+
+(-> mission--check-ready-gates (mission-context list tool-context) boolean)
+(defun mission--check-ready-gates (context goal tool-context)
+  "Run ready gates in stable order. Waiting gates spend no attempts."
+  (dolist (gate (getf goal :gates))
+    (let ((tool (case (getf gate :kind) (:command
+                                         '("shell" "run"))
+                                        (:lisp
+                                         '("lisp" "eval")))))
+      (when (and tool (not (apply #'tool-registry-find (tool-context-registry tool-context) tool)))
+        (mission--reject :unavailable "A required gate execution tool is unavailable; no attempt was spent."))))
+  (let ((remaining (copy-list (getf goal :gates))) (passed t))
+    (loop for ready = (remove-if-not (lambda (gate) (mission-gate-prerequisites-current-p gate goal tool-context)) remaining)
+          while ready
+          do (dolist (gate ready)
+               (setf remaining (remove gate remaining :test #'eq))
+               (unless (mission--check-gate context gate tool-context) (setf passed nil))
+               (unless (eq :active (getf goal :status)) (return-from mission--check-ready-gates nil))))
+    (and passed (null remaining) t)))

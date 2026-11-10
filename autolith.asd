@@ -564,6 +564,7 @@
                                           (:file "onboarding-tests")
                                           (:file "mission-tests")
                                           (:file "mission-inference-tests")
+                                          (:file "mission-specification-tests")
                                           (:file "mission-exhaustion-tests")
                                           (:file "lisp-values-tests")
                                           (:file "lisp-machine-tests")

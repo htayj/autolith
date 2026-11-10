@@ -509,9 +509,74 @@ preserving the calling thread's provider bindings and authorization callbacks."
   (and (plusp (getf goal :unknown-usage 0))
        (not (eq (getf goal :unknown-usage-policy) ':record))))
 
-(-> mission--validate-specification (list) list)
-(defun mission--validate-specification (specification)
-  "Validate user acceptance policy and return a new durable goal."
+(-> mission--field-whitespace-p (character) boolean)
+(defun mission--field-whitespace-p (character)
+  "Recognize the explicit outer whitespace and sentence separator characters."
+  (not (null (find character '(#\Space #\Tab #\Newline #\Return #\Page)))))
+
+(-> mission--field-text (t) (option string))
+(defun mission--field-text (value)
+  "Trim supplied text once without coercing wrong types or changing internal text."
+  (when (stringp value)
+    (string-trim '(#\Space #\Tab #\Newline #\Return #\Page) value)))
+
+(-> mission--sentence-count (string) (integer 0))
+(defun mission--sentence-count (text)
+  "Count punctuation runs before whitespace/end and final unterminated text."
+  (let ((count 0) (pending nil) (length (length text)))
+    (loop for index below length
+          for character = (char text index)
+          do (unless (mission--field-whitespace-p character)
+               (setf pending t))
+             (when (and pending (find character ".!?")
+                        (or (= (1+ index) length)
+                            (mission--field-whitespace-p (char text (1+ index)))))
+               (incf count)
+               (setf pending nil)))
+    (+ count (if pending 1 0))))
+
+(-> mission--constraint-id-p (t) boolean)
+(defun mission--constraint-id-p (value)
+  "Accept the case-sensitive ASCII grammar [a-z0-9][a-z0-9-]*, at most64 characters."
+  (labels ((alphanumeric-p (character)
+             (or (char<= #\a character #\z) (char<= #\0 character #\9))))
+    (and (stringp value) (<= 1 (length value) 64)
+         (alphanumeric-p (char value 0))
+         (every (lambda (character) (or (alphanumeric-p character) (char= character #\-))) value))))
+
+(-> mission--constraints (t) list)
+(defun mission--constraints (value)
+  "Validate finite exact rule shapes and return independently owned normalized rules."
+  (unless (and (proper-list-p value) (<= (length value) 30))
+    (mission--reject ':invalid "Use at most30 constraints in a finite proper list."))
+  (let ((identifiers nil))
+    (loop for rule in value
+          collect
+          (progn
+            (unless (and (proper-list-p rule) (= (length rule) 4)
+                         (equal (sort (copy-list (plist-keys rule)) #'string< :key #'princ-to-string)
+                                '(:id :text)))
+              (mission--reject ':invalid "Each constraint is exactly (:id STRING :text STRING), without duplicate or unknown keys."))
+            (let ((id   (mission--field-text (getf rule :id)))
+                  (text (mission--field-text (getf rule :text))))
+              (unless (and (mission--constraint-id-p id) (not (member id identifiers :test #'equal)))
+                (mission--reject ':invalid "Constraint IDs must be unique case-sensitive ASCII [a-z0-9][a-z0-9-]*, 1-64 characters."))
+              (unless (and text (<= 1 (length text) 200) (= 1 (mission--sentence-count text)))
+                (mission--reject ':invalid "Each constraint requires one nonblank sentence of at most200 characters."))
+              (push id identifiers)
+              (list :id id :text text))))))
+
+(-> mission--normalize-specification (list) list)
+(defun mission--normalize-specification (specification)
+  "Normalize finite acceptance fields independently of identity, usage and activation."
+  (unless (mission--command-specification-p specification)
+    (mission--reject ':invalid "Mission specifications require finite, unique-key property lists."))
+  (let ((objective (mission--field-text (getf specification :objective))))
+    (unless (and objective (<= 1 (length objective) 300) (<= (mission--sentence-count objective) 2))
+      (mission--reject ':invalid "Use an outcome objective of at most 300 characters and one or two plain-English sentences. Move rules into :constraints and background into :notes.")))
+  (let ((notes (getf specification :notes)))
+    (unless (or (null notes) (and (stringp notes) (<= (length (mission--field-text notes)) 4000)))
+      (mission--reject ':invalid "Notes must be NIL or background text of at most4000 characters.")))
   (unless (and (non-empty-string-p (getf specification :objective))
                (consp (getf specification :criteria))
                (every (lambda (key) (typep (getf specification key) '(integer 1)))
@@ -541,15 +606,33 @@ preserving the calling thread's provider bindings and authorization callbacks."
       (push (getf criterion :id) criterion-identifiers))
     (unless (= (length gate-identifiers) (length (remove-duplicates gate-identifiers :test #'equal)))
       (mission--reject ':invalid "Gate IDs must be unique."))
-    (list :kind ':mission :version 1 :objective (getf specification :objective)
-          :status ':active :continuations 0 :created-at (get-universal-time)
-          :deadline             (+ (get-universal-time) (getf specification :wall-seconds))
+    (mission-gate-graph-validate gates criteria)
+    (list :kind ':mission :version 1 :objective (mission--field-text (getf specification :objective))
+          :constraints          (mission--constraints (getf specification :constraints))
+          :notes                (mission--field-text (getf specification :notes))
+          :wall-seconds         (getf specification :wall-seconds)
           :turn-limit           (getf specification :turn-limit)
           :token-limit          (getf specification :token-limit)
           :unknown-usage-policy (getf specification :unknown-usage-policy ':block)
-          :turns-used 0 :tokens-used 0 :tokens-reserved 0 :unknown-usage 0 :requests-outstanding 0
-          :unknown-usage-by-child nil :reservation-charged-tokens 0 :reservation-charges-by-child nil
           :model-complete-p nil :criteria criteria :gates gates :evidence nil)))
+
+(-> mission--allocate-goal (list) list)
+(defun mission--allocate-goal (normalized)
+  "Allocate counters once without starting a working clock."
+  (append (copy-tree normalized)
+          (list :status ':draft :continuations 0 :created-at (get-universal-time)
+                :activated-at nil :deadline nil
+                :turns-used 0 :tokens-used 0 :tokens-reserved 0 :unknown-usage 0 :requests-outstanding 0
+                :unknown-usage-by-child nil :reservation-charged-tokens 0 :reservation-charges-by-child nil)))
+
+(-> mission--validate-specification (list) list)
+(defun mission--validate-specification (specification)
+  "Allocate a normalized explicitly started working mission."
+  (let ((goal (mission--allocate-goal (mission--normalize-specification specification))))
+    (setf (getf goal :status) ':active
+          (getf goal :activated-at) (get-universal-time)
+          (getf goal :deadline) (+ (get-universal-time) (getf goal :wall-seconds)))
+    goal))
 
 (-> application-mission-start (application list) null)
 (defun application-mission-start (application specification)

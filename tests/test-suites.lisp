@@ -2111,3 +2111,6 @@
   test-goal-disposition-input-overhead
   test-goal-disposition-codex-controls
   test-goal-disposition-independent-context)
+
+(define-test-suite mission-specification
+  test-mission-specification-validation)
