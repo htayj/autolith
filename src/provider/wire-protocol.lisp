@@ -106,7 +106,8 @@ The encoder's second value counts its volatile suffix. One-response history
 may also change an earlier merged message, so compare its durable projection
 before bounding the prefix the next request may reuse."
   (declare (ignore goal-context))
-  (when (and *provider-context-request* (not compaction-p))
+  (when (and *provider-context-request* (not compaction-p)
+             (eq provider (getf *provider-context-request* :provider)))
     (setf (getf *provider-context-request* :encoder) provider
           (getf *provider-context-request* :projection) projection
           (getf *provider-context-request* :tools) tool-namespaces))
@@ -116,7 +117,8 @@ before bounding the prefix the next request may reuse."
           (progn
             (setf *provider-cache-request-prefix*
                   (provider-cache-prefix-create projection tool-namespaces))
-            (call-next-method))
+            (provider-input-measurement--encode
+             provider projection (lambda () (call-next-method))))
         (let ((volatile-items
                 (max (or volatile-items 0)
                      (provider-cache-prefix--volatile-count
@@ -139,13 +141,15 @@ Methods must preserve REQUEST, copying any fields they change."))
 
 (defmethod provider-open-response-stream :around
     ((provider model-provider) (request hash-table) &key credentials conversation)
-  "Finalize mission headroom and observe the actual request before transport."
-  (provider-call-with-mission-output-allowance
-   provider (provider-prepare-stream-request provider request credentials)
-   (lambda (final-request)
-     (provider-cache-prefix-observe final-request)
-     (call-next-method provider final-request :credentials credentials
-                                            :conversation  conversation))))
+  "Decide proactive input recovery before hard admission and output headroom."
+  (let ((prepared (provider-prepare-stream-request provider request credentials)))
+    (provider-call-prepared-request-decision provider prepared)
+    (provider-call-with-mission-output-allowance
+     provider prepared
+     (lambda (final-request)
+       (provider-cache-prefix-observe final-request)
+       (call-next-method provider final-request :credentials credentials
+                                              :conversation  conversation)))))
 
 (-> provider-shared-items-split (list list) (values list list))
 (defun provider-shared-items-split (items durable-items)
@@ -710,6 +714,7 @@ PROVIDER-RESPONSES-ANCHORED-CONTEXT-P anchors all but one-request context too."
                      :fields
                      (provider-responses-request-fields provider conversation
                                                         :compaction-p compaction-p)))))
+        (provider-input-measurement--project-history provider conversation :history history :items items)
         (values
          (provider-request-object provider projection effective-namespaces
                                   :compaction-p compaction-p)

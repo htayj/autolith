@@ -224,7 +224,7 @@
     (with-test-configuration (configuration)
       (let* ((original (conversation-create configuration :identifier "precompaction-full"))
              (provider (make-instance
-                        (if native-p 'native-scripted-provider 'scripted-provider)
+                         (if native-p 'prepared-native-scripted-provider 'prepared-scripted-provider)
                         :configuration configuration
                         :results       (list (agent-test-result "summary" (list (agent-test-compaction-message))
                                                                 :turn-completion ':end)

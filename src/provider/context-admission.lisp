@@ -413,6 +413,52 @@ messages that later change fail closed."
              (setf (rest *provider-context-admission-state*) condition)))))
     (provider-check-request-context provider request)))
 
+(defgeneric provider-final-request-participation-p (provider)
+  (:documentation "Return true when PROVIDER participates in final-request soft admission.
+
+Participants must call PROVIDER-CALL-PREPARED-REQUEST-DECISION once for each final
+ordinary candidate before transport, using the prepared request that hard admission
+will check. They receive no raw-estimate soft preflight. The default preserves the
+legacy proactive preflight for direct-return PROVIDER-STREAM-TURN extensions.
+Specialize this generic to opt in, or return NIL when overriding a participating
+provider with a direct-return implementation."))
+
+(defmethod provider-final-request-participation-p ((provider model-provider))
+  "Preserve proactive compaction for legacy direct-return providers."
+  (declare (ignore provider))
+  nil)
+
+(defmethod provider-final-request-participation-p ((provider session-preserving-provider-mixin))
+  "Opt Autolith's production final-preparation adapters into anchored decisions."
+  (declare (ignore provider))
+  t)
+
+(defparameter *provider-prepared-request-decision* nil
+  "An ordinary owner's input-only proactive decision, scoped to one candidate.")
+
+(define-condition provider-proactive-compaction-required (provider-context-budget-error)
+  ()
+  (:documentation "The ordinary owner requested recovery before final hard admission."))
+
+(-> provider-call-prepared-request-decision (model-provider hash-table) null)
+(defun provider-call-prepared-request-decision (provider request)
+  "Ask the ordinary owner about this final candidate without granting transport permission."
+  (when (and *provider-prepared-request-decision*
+             (funcall *provider-prepared-request-decision*
+                      (provider-request-input-token-estimate provider request)))
+    (let ((condition (make-condition
+                      'provider-proactive-compaction-required
+                      :message                "The prepared ordinary input reached its soft compaction threshold."
+                      :estimated-input-tokens (provider-request-input-token-estimate provider request)
+                      :output-reserve         (provider-request-output-reserve provider request)
+                      :context-window         (provider-effective-context-window provider)
+                      :non-text-estimate-p    t)))
+      (when (and *provider-context-admission-state*
+                 (eq (first *provider-context-admission-state*) :pending))
+        (setf (rest *provider-context-admission-state*) condition))
+      (error condition)))
+  nil)
+
 (-> provider-call-with-mission-output-allowance (model-provider hash-table function) t)
 (defun provider-call-with-mission-output-allowance (provider request continuation)
   "Limit mission output tokens to the available context before calling CONTINUATION.
@@ -529,6 +575,184 @@ credential scope; access-token refresh does not change a known account route."
              (json-get request "model")
              (json-get request "reasoning")))))
 
+(defparameter *provider-input-measurement-encoding* nil
+  "Actual item encoder calls for one Responses projection, never a replay encoding.")
+
+(-> provider-input-measurement--project-history
+    (model-provider conversation &key (:history list) (:items list)) null)
+(defun provider-input-measurement--project-history (provider conversation &key history items)
+  "Record origins at the trusted history/context assembly boundary by object identity.
+
+Require the complete raw sequence to survive family projection unchanged. Unsupported
+family transformations have no provenance authority. New assembly objects are injected
+context, including developer messages; durable developer messages retain history origin."
+  (let ((context *provider-input-measurement-context*))
+    (when (and context (eq provider (getf context :adapter))
+               (eq conversation (getf context :owner)))
+      (setf (getf context :provenance) nil)
+      (let ((raw     (conversation-input-items conversation))
+            (durable (conversation-input-items-for-request conversation :include-ephemeral-p nil)))
+        (when (and (= (length raw) (length history)) (every #'eq raw history)
+                   (= (length raw) (length (remove-duplicates raw :test #'eq))))
+          (let ((remaining history)
+                (origins   nil))
+            (dolist (item items)
+              (cond
+                ((and remaining (eq item (first remaining)))
+                 (push (position item durable :test #'eq) origins)
+                 (pop remaining))
+                ((member item history :test #'eq)
+                 (return-from provider-input-measurement--project-history nil))
+                (t
+                 (push nil origins))))
+            (unless remaining
+              (setf (getf context :provenance)
+                    (list :items (copy-list items) :origins (nreverse origins) :durable durable
+                          :history-root   (provider-input-measurement--items-root durable (length durable))
+                          :generation     (conversation-input-measurement-generation conversation)
+                          :log-generation (conversation-log-generation conversation))))))))
+   nil))
+
+(defmethod provider-wire-input-item :around ((provider codex-subscription-provider) item)
+  "Observe the actual encoder result paired with its source object, without re-encoding."
+  (let ((result (call-next-method)))
+    (when *provider-input-measurement-encoding*
+      (push (list item result (provider-cache-prefix--entry result))
+            (rest *provider-input-measurement-encoding*)))
+    result))
+
+(-> provider-input-measurement--encode
+    (model-provider cl-llm-provider-api:wire-request function) (values hash-table t))
+(defun provider-input-measurement--encode (provider projection continuation)
+  "Attest the pinned Responses encoder's complete sequence, including prefix and suffix.
+
+Every history/context item must have exactly one actual encoder call in order. Prefix
+and suffix spans originate in the supplied instruction lists, with the pinned encoder's
+known placement. Any extra, dropped, merged or substituted item fails closed."
+  (let* ((context                               *provider-input-measurement-context*)
+         (plan                                  (getf context :provenance))
+         (*provider-input-measurement-encoding* (and plan (list t))))
+    (multiple-value-bind (request volatile) (funcall continuation)
+      (when plan
+        (let* ((calls     (nreverse (rest *provider-input-measurement-encoding*)))
+               (items     (cl-llm-provider-api:wire-request-items projection))
+               (placement (cl-llm-provider-api:provider-responses-instructions-placement provider))
+               (prefix    (when (eq placement :input)
+                            (mapcar #'responses-developer-message
+                                    (remove-if-not #'non-empty-string-p
+                                                   (cl-llm-provider-api:wire-request-prefix projection)))))
+               (suffix    (mapcar #'responses-developer-message
+                                  (remove-if-not #'non-empty-string-p
+                                                 (cl-llm-provider-api:wire-request-suffix projection))))
+               (wire      (json-get request "input"))
+               (start     (length prefix)))
+          (setf (getf context :provenance) nil)
+          (when (and (member placement '(:input :top-level))
+                     (vectorp wire) (not (stringp wire))
+                     (= (length items) (length (getf plan :items)) (length calls))
+                     (every #'eq items (getf plan :items))
+                     (every #'eq (getf plan :items) (mapcar #'first calls))
+                     (= (length wire) (+ start (length calls) (length suffix)))
+                     (equal (mapcar #'provider-cache-prefix--entry prefix)
+                            (map 'list #'provider-cache-prefix--entry (subseq wire 0 start)))
+                     (equal (mapcar #'provider-cache-prefix--entry suffix)
+                            (map 'list #'provider-cache-prefix--entry
+                                 (subseq wire (+ start (length calls)))))
+                     (loop for call in calls for index from start
+                           always (and (eq (second call) (aref wire index))
+                                       (equal (third call) (provider-cache-prefix--entry (aref wire index))))))
+            (setf (getf plan :wire-items) (copy-seq wire)
+                  (getf plan :wire-entries) (map 'list #'provider-cache-prefix--entry wire)
+                  (getf plan :wire-origins) (append (make-list start) (getf plan :origins)
+                                                  (make-list (length suffix)))
+                  (getf context :provenance) plan))))
+      (values request volatile))))
+
+(-> provider-input-measurement--final-provenance (hash-table) list)
+(defun provider-input-measurement--final-provenance (request)
+  "Validate complete origin mapping against the actual final-prepared request and owner."
+  (let* ((context  *provider-input-measurement-context*)
+         (owner    (getf context :owner))
+         (plan     (getf context :provenance))
+         (wire     (json-get request "input"))
+         (expected (getf plan :wire-items)))
+    (when (and owner plan expected (vectorp wire) (not (stringp wire))
+               (= (getf context :issued) (conversation-input-measurement-issuance owner))
+               (= (getf plan :generation) (conversation-input-measurement-generation owner))
+               (= (getf plan :log-generation) (conversation-log-generation owner))
+               (= (length wire) (length expected)
+                  (length (getf plan :wire-origins)) (length (getf plan :wire-entries)))
+               ;; Every claimed durable item must occur once, in order, on this wire.
+               ;; NIL origins belong to injected spans and carry no durable authority.
+               (equal (remove nil (getf plan :wire-origins))
+                      (loop for index below (length (getf plan :durable)) collect index))
+               (every #'eq wire expected)
+               (equal (getf plan :wire-entries) (map 'list #'provider-cache-prefix--entry wire))
+               (equal (getf plan :history-root)
+                      (let ((durable (conversation-input-items-for-request owner :include-ephemeral-p nil)))
+                        (and (= (length durable) (length (getf plan :durable)))
+                             (provider-input-measurement--items-root durable (length durable))))))
+      plan)))
+
+(-> provider-input-measurement--durable-root (list integer) string)
+(defun provider-input-measurement--durable-root (plan count)
+  "Commit complete ordered source semantics together with their actual encoded results."
+  (provider-input-measurement--digest
+   (vector "codex-responses-durable-v3"
+           (coerce
+            (loop for item in (getf plan :durable) for index below count
+                  collect (list (provider-cache-prefix--entry item)
+                                (nth (position index (getf plan :wire-origins))
+                                     (getf plan :wire-entries))))
+            'vector))))
+
+(-> provider-input-measurement--provenance-estimate
+    (model-provider hash-table list) (values (option integer) keyword))
+(defun provider-input-measurement--provenance-estimate (provider request receipt)
+  "Credit only the complete old durable commitment; charge every other current span."
+  (declare (ignore provider))
+  (let* ((plan    (provider-input-measurement--final-provenance request))
+         (durable (getf plan :durable))
+         (count   (getf receipt :history-count)))
+    (cond
+      ((null plan)
+       (values nil :unattested-provenance))
+      ((or (>= (getf receipt :issued) (getf *provider-input-measurement-context* :issued))
+           (< (length durable) count)
+           (not (equal (getf receipt :history-root)
+                       (provider-input-measurement--durable-root plan count))))
+       (values nil :history-changed))
+      (t
+       (let ((unaccounted (json-object-copy request)))
+         (setf (gethash "input" unaccounted)
+               (coerce (loop for item across (json-get request "input")
+                             for origin in (getf plan :wire-origins)
+                             unless (and (integerp origin) (< origin count)) collect item)
+                       'vector))
+         (values (+ (getf receipt :input)
+                    (ceiling (provider-context--request-characters unaccounted) 4))
+                 :measured-history))))))
+
+(-> provider-input-measurement--provenance-receipt (model-provider hash-table list) list)
+(defun provider-input-measurement--provenance-receipt (provider request legacy)
+  "Earn v3 authority only at a qualifying ordinary success's final transport boundary.
+
+Retain the independent strict wire-prefix receipt when provenance is unsupported.
+Neither an old receipt nor current history alone can authorize a v3 upgrade."
+  (declare (ignore provider))
+  (let ((plan (provider-input-measurement--final-provenance request)))
+    (if (and plan (plusp (length (getf plan :durable))))
+        (append (list :version 3) (rest (rest legacy))
+                (list :history-count (length (getf plan :durable))
+                      :history-root  (provider-input-measurement--durable-root plan (length (getf plan :durable)))
+                      :attestation   (provider-input-measurement--digest
+                                      (vector "codex-responses-origins-v3"
+                                              (provider-input-measurement--durable-root plan (length (getf plan :durable)))
+                                              (coerce (getf plan :wire-origins) 'vector)
+                                              (coerce (getf plan :wire-entries) 'vector)))
+                      :provenance    :codex-responses-origins-v3))
+        legacy)))
+
 (-> provider-input-measurement--estimate (model-provider hash-table) (values (option integer) keyword))
 (defun provider-input-measurement--estimate (provider request)
   "Credit only a measured exact ordered prefix, charging all current overhead.
@@ -549,6 +773,8 @@ intentionally avoids subtracting any unproven old estimate."
        (values nil :unsupported-layout))
       ((not (equal identity (getf receipt :identity)))
        (values nil :identity-changed))
+      ((eql (getf receipt :version) 3)
+       (provider-input-measurement--provenance-estimate provider request receipt))
       (t
        (let* ((items   (json-get request "input"))
               (count   (getf receipt :count))
@@ -602,9 +828,11 @@ intentionally avoids subtracting any unproven old estimate."
              (count (getf plan :prefix-items)))
         (setf (getf *provider-input-measurement-context* :proof)
               (and (plusp count)
-                   (list :version 1 :input 1 :count count
-                         :root (provider-input-measurement--root (getf plan :items) count)
-                         :identity identity :issued (getf context :issued) :layout :responses))))))
+                   (let ((legacy
+                           (list :version 1 :input 1 :count count
+                                 :root (provider-input-measurement--root (getf plan :items) count)
+                                 :identity identity :issued (getf context :issued) :layout :responses)))
+                     (provider-input-measurement--provenance-receipt provider request legacy)))))))
   nil)
 
 (-> provider-input-measurement--usage (provider-result) (option integer))
@@ -673,7 +901,7 @@ paths. A concurrent replacement or completion cannot publish this stale attempt.
          (*provider-cache-prefix-function*
            (or *provider-cache-prefix-function* (constantly nil)))
          (*provider-input-measurement-context*
-           (list :owner conversation :issued issued :adapter nil :proof nil))
+           (list :owner conversation :issued issued :adapter nil :proof nil :provenance nil))
          (result                          (funcall continuation))
          (input                           (provider-input-measurement--usage result))
          (proof                           (getf *provider-input-measurement-context* :proof)))

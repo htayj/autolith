@@ -480,11 +480,19 @@ not yet been told that work from the previous process is gone.")
 (defun conversation-input-measurement-valid-p (receipt)
   "Recognize the constant-size versioned receipt; malformed metadata is not an error."
   (handler-case
-      (and (listp receipt) (eql (list-length receipt) 14)
+      (and (listp receipt) (member (list-length receipt) '(14 22))
            (equal (loop for tail on receipt by (lambda (tail) (rest (rest tail)))
                         collect (first tail))
-                  '(:version :input :count :root :identity :issued :layout))
-           (eql (getf receipt :version) 1)
+                  (case (getf receipt :version)
+                    (1
+                     '(:version :input :count :root :identity :issued :layout))
+                    (3
+                     '(:version :input :count :root :identity :issued :layout
+                       :history-count :history-root :attestation :provenance))))
+           (or (eql (getf receipt :version) 1)
+               (and (eql (getf receipt :version) 3)
+                    (typep (getf receipt :history-count) '(integer 1))
+                    (eq (getf receipt :provenance) :codex-responses-origins-v3)))
            (typep (getf receipt :input) '(integer 1))
            (typep (getf receipt :count) '(integer 1))
            (typep (getf receipt :issued) '(integer 1))
@@ -492,7 +500,9 @@ not yet been told that work from the previous process is gone.")
            (every (lambda (value)
                     (and (stringp value) (= (length value) 64)
                          (every (lambda (character) (digit-char-p character 16)) value)))
-                  (list (getf receipt :root) (getf receipt :identity)))
+                  (append (list (getf receipt :root) (getf receipt :identity))
+                          (when (eql (getf receipt :version) 3)
+                            (list (getf receipt :history-root) (getf receipt :attestation)))))
            t)
     (type-error () nil)))
 

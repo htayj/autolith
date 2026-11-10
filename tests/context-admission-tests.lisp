@@ -1200,7 +1200,7 @@
 (-> context-measured-tests--run (&key (:separate-p boolean) (:headroom-p boolean)) null)
 (defun context-measured-tests--run (&key separate-p headroom-p)
   "Earn a genuine ordinary input measurement, then admit appended evidence at 600K."
-  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "900000")
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "1200000")
                           ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
     (with-test-configuration (configuration)
       (let* ((configuration                       (configuration-copy configuration :model "gpt-6.1-sol" :provider-validation-p nil))
@@ -1344,9 +1344,15 @@
 
 (-> context-measured-tests--estimate (model-provider conversation hash-table) (values integer boolean))
 (defun context-measured-tests--estimate (provider conversation request)
-  "Estimate REQUEST in the exact ordinary owner scope after an earned success."
-  (let ((*provider-input-measurement-context* (list :owner conversation :adapter provider)))
-    (provider-request-input-token-estimate provider request)))
+  "Exercise the strict legacy proof from a genuinely earned receipt, without v3 upgrade."
+  (let* ((saved                                (conversation-input-measurement conversation))
+         (legacy                               (when saved (subseq saved 0 14)))
+         (*provider-input-measurement-context* (list :owner conversation :adapter provider)))
+    (when legacy (setf (getf legacy :version) 1))
+    (unwind-protect
+         (progn (setf (conversation-input-measurement conversation) legacy)
+                (provider-request-input-token-estimate provider request))
+      (setf (conversation-input-measurement conversation) saved))))
 
 (-> test-context-measured-estimate-controls () null)
 (defun test-context-measured-estimate-controls ()
@@ -1681,6 +1687,10 @@
           (test-assert (plusp (getf prefix :volatile-items 0)) "Actual encoder output contains an excluded volatile suffix.")
           (setf instruction (make-string 40000 :initial-element #\i)
                 volatile-text (make-string 4000 :initial-element #\v))
+          ;; Test the independent strict legacy suffix path with earned prefix fields.
+          (let ((legacy (subseq (conversation-input-measurement owner) 0 14)))
+            (setf (getf legacy :version) 1
+                  (conversation-input-measurement owner) legacy))
           (let* ((request     (provider-request-object provider owner schemas))
                  (receipt     (conversation-input-measurement owner))
                  (unaccounted (json-object-copy request)))
@@ -2479,3 +2489,1186 @@
 (defun test-context-boundary-observer-refresh ()
   "Admit same-account bearer refresh at the observer boundary."
   (context-boundary-tests--run :OBSERVER NIL T))
+
+
+;;;; -- Live Image Admission Diagnostics --
+
+
+(defparameter *context-live--state* "alpha"
+  "Current controlled stable contribution, or NIL when inactive.")
+
+(defparameter *context-live--log* nil
+  "Metadata collected from actual admission and soft decisions.")
+
+(defparameter *context-live--observe* nil
+  "Whether to record the candidate continuation after earning receipts.")
+
+(defparameter *context-live--last-request* nil
+  "Last successful final request used only for fixture diagnostics.")
+
+(defparameter *context-live--account* "c82-inert-account"
+  "Synthetic account identity used by inert fixture routing.")
+
+(defparameter *context-live--bearer* "c82-inert-bearer-one"
+  "Synthetic bearer value used to test same-account credential refresh.")
+
+(-> context-live--contributor (t) t)
+(defun context-live--contributor (context)
+  "Supply controlled stable and single-request context through real collection."
+  (declare (ignore context))
+  (append
+   (when *context-live--state*
+     (list
+      (make-context-contribution :identifier "c82-stable" :instruction *context-live--state*
+                                 :priority 50)))
+   (list
+    (make-context-contribution :identifier "c82-edge" :instruction "Fixture edge." :lifetime
+                               :next-request))))
+
+(-> context-live--u32 (t) t)
+(defun context-live--u32 (n)
+  "Encode an unsigned integer in PNG network byte order."
+  (map 'vector (lambda (shift) (ldb (byte 8 shift) n)) '(24 16 8 0)))
+
+(-> context-live--crc (t) t)
+(defun context-live--crc (bytes)
+  "Calculate the PNG chunk checksum over BYTES."
+  (let ((crc 4294967295))
+    (loop for byte across bytes
+          do (setf crc (logxor crc byte)) (dotimes (i 8)
+                                            (setf crc
+                                                    (logxor (ash crc -1)
+                                                            (if (oddp crc)
+                                                                3988292384
+                                                                0)))))
+    (logxor crc 4294967295)))
+
+(-> context-live--png (t t) t)
+(defun context-live--png (path padding)
+  "Write a valid inert 640x384 one-bit PNG with controlled ancillary payload."
+  (let* ((raw   (make-array (* 384 81) :element-type '(unsigned-byte 8) :initial-element 0))
+         (n     (length raw))
+         (adler (context-live--u32 (+ 1 (ash (mod n 65521) 16))))
+         (compressed
+          (concatenate 'vector #(120 1 1)
+                       (vector (logand n 255) (ash n -8) (logand (logxor n 65535) 255)
+                               (ash (logxor n 65535) -8))
+                       raw adler)))
+    (with-open-file
+        (s path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+      (write-sequence #(137 80 78 71 13 10 26 10) s)
+      (labels ((chunk (type data)
+                 (let ((body (concatenate 'vector (map 'vector #'char-code type) data)))
+                   (write-sequence (context-live--u32 (length data)) s)
+                   (write-sequence body s)
+                   (write-sequence (context-live--u32 (context-live--crc body)) s))))
+        (chunk "IHDR"
+         (concatenate 'vector (context-live--u32 640) (context-live--u32 384) #(1 0 0 0 0)))
+        (when (plusp padding)
+          (chunk "tEXt"
+           (concatenate 'vector #(102 105 120 116 117 114 101 0)
+                        (make-array padding :element-type '(unsigned-byte 8) :initial-element
+                                    65))))
+        (chunk "IDAT" compressed)
+        (chunk "IEND" #()))))
+  path)
+
+(defclass context-live--provider (context-measured-test-provider) nil
+          (:documentation "Inert SSE transport retaining production request admission methods."))
+
+(defmethod provider-open-response-stream
+           ((provider context-live--provider) (request hash-table) &key credentials conversation)
+  "Return inert SSE usage and output while retaining real admission around methods."
+  (declare (ignore credentials conversation))
+  (push request (context-measured-test-requests provider))
+  (incf (context-admission-test-provider-network-calls provider))
+  (let* ((n  (context-admission-test-provider-network-calls provider))
+         (id (format nil "c82-~D" n))
+         (item
+          (json-object "type" "message" "id" (format nil "c82-output-~D" n) "role" "assistant"
+                       "status" "completed" "content"
+                       (vector (json-object "type" "output_text" "text" "Fixture inspected."))))
+         (source
+          (concatenate 'string
+                       (test-sse-event-string
+                        (json-object "type" "response.created" "response" (json-object "id" id)))
+                       (test-sse-event-string
+                        (json-object "type" "response.output_item.done" "item" item))
+                       (test-sse-event-string
+                        (json-object "type" "response.completed" "response"
+                                     (json-object "id" id "status" "completed" "output"
+                                                  (vector item) "usage"
+                                                  (json-object "input_tokens" 200346
+                                                               "output_tokens" 219 "total_tokens"
+                                                               200565 "input_tokens_details"
+                                                               (json-object "cached_tokens"
+                                                                            199552))))))))
+    (values (make-instance 'test-character-input-stream :source source) 200 nil)))
+
+(-> context-live--images (t t t) t)
+(defun context-live--images (conversation path start)
+  "Append eight durable image artifact tool results through production preparation."
+  (dotimes (offset 8)
+    (let ((id (format nil "c82-image-~D" (+ start offset))))
+      (conversation-append-provider-item conversation
+                                         (json-object "type" "function_call" "call_id" id
+                                                      "namespace" "fs" "name" "view-image"
+                                                      "arguments"
+                                                      (json-encode
+                                                       (json-object "path" (namestring path)))))
+      (conversation-append-tool-result conversation id :tool-name "fs.view-image" :output
+                                       "Viewed fixture PNG." :content-blocks
+                                       (list "Viewed fixture PNG."
+                                             (image-input-prepare path
+                                                                  (conversation-image-artifact-root
+                                                                   conversation)))
+                                       :success-p t)))
+  nil)
+
+(-> context-live--small-result (t t t) t)
+(defun context-live--small-result (conversation id name)
+  "Append a durable ordinary tool result after the measured history."
+  (conversation-append-provider-item conversation
+                                     (json-object "type" "function_call" "call_id" id "name" name
+                                                  "arguments" "{}"))
+  (conversation-append-tool-result conversation id :tool-name name :output
+                                   "Fixture operation completed." :success-p t))
+
+(-> context-live--note-estimate (t t t) t)
+(defun context-live--note-estimate (original provider request)
+  "Observe the real estimator and record bounded diagnostic metadata."
+  (multiple-value-bind (estimate reason)
+      (funcall original provider request)
+    (when *context-live--observe*
+      (let* ((context *provider-input-measurement-context*)
+             (owner   (getf context :owner))
+             (receipt (and owner (conversation-input-measurement owner)))
+             (items   (json-get request "input"))
+             (prior
+              (and *context-live--last-request* (json-get *context-live--last-request* "input")))
+             (difference
+              (and (vectorp items) (vectorp prior)
+                   (position-if-not #'identity
+                                    (map 'vector
+                                         (lambda (a b) (equal (json-encode a) (json-encode b)))
+                                         items prior))))
+             (tail    (json-object-copy request)))
+        (when (and estimate receipt)
+          (setf (gethash "input" tail) (subseq items (getf receipt :count))))
+        (let ((row
+               (list :event :final-estimate :reason reason :estimate estimate :owner
+                     (not (null owner)) :adapter (eq provider (getf context :adapter)) :issued
+                     (getf receipt :issued) :count (getf receipt :count) :input
+                     (getf receipt :input) :bounded
+                     (ceiling (provider-context--request-characters request) 4) :generation
+                     (and owner (conversation-input-measurement-generation owner)) :log-generation
+                     (and owner (conversation-log-generation owner)) :issuance
+                     (and owner (conversation-input-measurement-issuance owner)) :identity-equal
+                     (equal (provider-input-measurement--identity provider request)
+                            (getf receipt :identity))
+                     :items (and (vectorp items) (length items)) :images
+                     (context-measured-tests--image-count request) :unaccounted
+                     (and estimate (ceiling (provider-context--request-characters tail) 4))
+                     :reserve (provider-request-output-reserve provider request) :window
+                     (config :context-window (provider-configuration provider)) :difference
+                     difference :old-length
+                     (and difference (length (json-encode (aref prior difference)))) :new-length
+                     (and difference (length (json-encode (aref items difference)))) :old-digest
+                     (and difference (context-anchors-item-digest (aref prior difference)))
+                     :new-digest
+                     (and difference (context-anchors-item-digest (aref items difference)))
+                     :old-provenance
+                     (and difference
+                          (if (json-string= (json-get (aref prior difference) "role") "developer")
+                              :injected
+                              :history))
+                     :new-provenance
+                     (and difference
+                          (if (json-string= (json-get (aref items difference) "role") "developer")
+                              :injected
+                              :history))
+                     :old-type (and difference (json-get (aref prior difference) "type")) :new-type
+                     (and difference (json-get (aref items difference) "type")) :old-role
+                     (and difference (json-get (aref prior difference) "role")) :new-role
+                     (and difference (json-get (aref items difference) "role")))))
+          (setf row (append row (context-live--provenance-metadata owner receipt :prior prior :request request)))
+          (push row *context-live--log*)
+          (format t "~&C82 ~S~%" row))))
+    (values estimate reason)))
+
+(-> context-live--with-observers (t) t)
+(defun context-live--with-observers (function)
+  "Observe real decisions while intercepting recovery at its entry only."
+  (let ((soft     (symbol-function 'agent-should-compact-p))
+        (estimate (symbol-function 'provider-input-measurement--estimate)))
+    (test-call-with-function-replacements
+     (list
+      (list 'agent-should-compact-p
+            (lambda (agent)
+              (let* ((known
+                      (context-estimate-known-tokens (agent-configuration agent)
+                                                     (agent-conversation agent) :tool-registry
+                                                     (agent-tool-registry agent) :hurry-up-p
+                                                     (agent-hurry-up-p agent) :family
+                                                     (provider-family (agent-provider agent))))
+                     (result (funcall soft agent)))
+                (when *context-live--observe*
+                  (let ((row
+                         (list :event :soft :known known :threshold
+                               (configuration-compaction-token-limit (agent-configuration agent))
+                               :entered result :owner
+                               (not (null *provider-input-measurement-context*)))))
+                    (push row *context-live--log*)
+                    (format t "~&C82 ~S~%" row)))
+                result)))
+      (list 'provider-input-measurement--estimate
+            (lambda (provider request) (context-live--note-estimate estimate provider request)))
+      (list 'agent-compact-conversation
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (push (list :event :recovery-entered) *context-live--log*)
+              (format t "~&C82 recovery-entered; downstream deliberately not executed~%")
+              (throw 'context-live--stop :recovery))))
+     function)))
+
+(-> context-live--loop (t t) t)
+(defun context-live--loop (agent observer)
+  "Run the actual ordinary agent loop under inert transport and refusal capture."
+  (let ((*context-measured-test-refusal-function*
+         (lambda (condition)
+           (let ((row
+                  (list :event :typed-refusal :input
+                        (provider-context-budget-error-estimated-input-tokens condition) :reserve
+                        (provider-context-budget-error-output-reserve condition) :window
+                        (provider-context-budget-error-context-window condition))))
+             (push row *context-live--log*)
+             (format t "~&C82 ~S~%" row)))))
+    (catch 'context-live--stop
+      (agent--run-provider-loop agent observer :tools-p nil :goal-context "Owned fixture goal."))))
+
+(-> context-live--fixture (t t) t)
+(defun context-live--fixture (kind continuation)
+  "Earn ordinary receipts under a real mission, using only inert fixture state."
+  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "700000")
+                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
+    (with-test-configuration (configuration)
+      (let* ((configuration
+              (configuration-copy configuration :model "gpt-6.1-sol" :provider-validation-p nil))
+             (*context-resolver*            (cl-llm-provider-api:make-context-resolver))
+             (*context-last-deliveries*     (make-hash-table :test #'equal))
+             (*context-last-delivery-order* nil)
+             (*context-live--state*         "alpha")
+             (*context-live--account*       "c82-inert-account")
+             (*context-live--bearer*        "c82-inert-bearer-one")
+             (*context-live--log*           nil)
+             (*context-live--observe*       nil)
+             (*context-live--last-request*  nil)
+             (path
+              (let ((path (merge-pathnames "inert.png" (test-configuration-root configuration))))
+                (if (eq kind :soft-tiny)
+                    (progn (test-conversation--write-tiny-png path) path)
+                    (context-live--png path
+                     (if (eq kind :soft)
+                         28000
+                         0)))))
+             (provider
+              (make-instance 'context-live--provider :configuration configuration
+                             :credential-manager                    (credential-manager-create configuration)))
+             (application                   (mission-inference-test--application configuration provider))
+             (conversation                  (application-conversation application))
+             (agent
+              (agent-create :configuration configuration :conversation conversation :provider
+                            provider :tool-registry (make-instance 'tool-registry)))
+             (observer
+              (make-instance 'callback-agent-observer :status-callback
+                             (lambda (&rest args) (declare (ignore args)) nil)))
+             (saved                         (context--registration-snapshot "c82-contributor")))
+        (multiple-value-bind (format width height)
+            (image-input--inspect path)
+          (with-open-file (stream path :element-type '(unsigned-byte 8))
+            (format t "~&C82 PNG format=~S width=~D height=~D bytes=~D~%" format width height
+                    (file-length stream))))
+        (setf (application-agent application) agent)
+        (register-context-contributor "c82-contributor" 'context-live--contributor)
+        (application-mission-start application
+                                   (mission-test--specification :turns 20 :tokens 10000000))
+        (mission-context-bind (mission-context-find conversation) agent)
+        (unwind-protect
+            (test-call-with-function-replacements
+             (list
+              (list 'credential-manager-credentials
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (context-route-tests--credentials configuration *context-live--account*
+                                                        *context-live--bearer*))))
+             (lambda ()
+               (context-live--with-observers
+                (lambda ()
+                  (conversation-append-user-message conversation
+                                                    (make-string
+                                                     (if (member kind
+                                                                 '(:soft :soft-tiny :soft-small))
+                                                         32000
+                                                         800000)
+                                                     :initial-element #\u))
+                  (dotimes
+                      (group
+                       (if (member kind '(:soft :soft-tiny :soft-small))
+                           3
+                           4))
+                    (context-live--images conversation path (* group 8))
+                    (let ((result (context-live--loop agent observer)))
+                      (assert (typep result 'provider-result)))
+                    (let ((receipt (conversation-input-measurement conversation)))
+                      (assert (conversation-input-measurement-valid-p receipt))
+                      (assert (= 200346 (getf receipt :input)))
+                      (format t
+                              "~&C82 EARN group=~D images=~D issued=~D count=~D input=~D cached=199552 fresh=794 fixture-usage=T~%"
+                              group (* 8 (1+ group)) (getf receipt :issued) (getf receipt :count)
+                              (getf receipt :input))))
+                  (setf *context-live--last-request*
+                          (first (context-measured-test-requests provider)))
+                  (funcall continuation
+                           (list :configuration configuration :provider provider :application
+                                 application :conversation conversation :agent agent :observer
+                                 observer :path path))))))
+          (mission-detach application)
+          (context--registration-restore "c82-contributor" saved)))))
+  nil)
+
+(-> context-live--target (t t &key (:change t) (:reopen t) (:append-images t)) t)
+(defun context-live--target (fixture label &key (change nil) reopen append-images)
+  "Execute one candidate continuation, optionally after reopen or contribution mutation."
+  (let* ((application  (getf fixture :application))
+         (provider     (getf fixture :provider))
+         (conversation (getf fixture :conversation))
+         (agent        (getf fixture :agent))
+         (observer     (getf fixture :observer)))
+    (when reopen
+      (let ((receipt (copy-tree (conversation-input-measurement conversation))))
+        (mission-detach application)
+        (context-forget-conversation (conversation-identifier conversation))
+        (setf conversation
+                (conversation-load-by-id (getf fixture :configuration)
+                                         (conversation-identifier conversation))
+              (application-conversation application) conversation
+              agent
+                (agent-create :configuration (getf fixture :configuration) :conversation
+                              conversation :provider provider :tool-registry
+                              (make-instance 'tool-registry))
+              (application-agent application) agent)
+        (assert (equal receipt (conversation-input-measurement conversation)))
+        (application-mission-start application
+                                   (mission-test--specification :turns 20 :tokens 10000000))
+        (mission-context-bind (mission-context-find conversation) agent)
+        (format t "~&C82 durable-reopen receipt-equal=T valid=~S~%"
+                (conversation-input-measurement-valid-p
+                 (conversation-input-measurement conversation)))))
+    (when append-images (context-live--images conversation (getf fixture :path) 24))
+    (context-live--small-result conversation "c82-read" "resource.read")
+    (context-live--small-result conversation "c82-edit" "resource.edit")
+    (when change
+      (setf *context-live--state*
+              (if (eq change :deactivate)
+                  nil
+                  "bravo")))
+    (let* ((*context-live--observe* t)
+           (before                  (context-admission-test-provider-network-calls provider))
+           (result                  (context-live--loop agent observer))
+           (goal                    (mission-context-goal (mission-context-find conversation)))
+           (calls                   (- (context-admission-test-provider-network-calls provider) before)))
+      (format t
+              "~&C82 TARGET label=~S result=~S calls=~D event-count=~D known=~D unknown=~D reserved=~D outstanding=~D~%"
+              label
+              (if (typep result 'provider-result)
+                  :ordinary
+                  result)
+              calls (length *context-live--log*) (getf goal :tokens-used 0)
+              (getf goal :unknown-usage 0) (getf goal :tokens-reserved 0)
+              (getf goal :requests-outstanding 0))
+      (let ((target-events (reverse *context-live--log*)) (direct nil))
+        (when (and append-images (eq result :recovery))
+          (multiple-value-bind (answer ticket)
+              (provider-call-with-input-measurement conversation
+                                                    (lambda ()
+                                                      (provider-stream-turn provider conversation
+                                                                            :tool-namespaces #()
+                                                                            :goal-context
+                                                                            "Owned fixture goal."
+                                                                            :event-callback
+                                                                            #'identity)))
+            (assert ticket)
+            (agent--persist-provider-result agent answer :request-number 5 :input-measurement
+                                            ticket)
+            (setf direct
+                    (list :ticket t :transport
+                          (- (context-admission-test-provider-network-calls provider) before)
+                          :issued (getf (conversation-input-measurement conversation) :issued)))
+            (format t "~&C82 DIRECT-ORDINARY ~S~%" direct)))
+        (list :result result :calls calls :events target-events :goal goal :direct direct)))))
+
+(-> context-live--probe (t &key (:change t) (:reopen t)) t)
+(defun context-live--probe (kind &key change reopen)
+  "Earn ordinary receipts and execute one controlled continuation."
+  (context-live--fixture kind
+   (lambda (fixture)
+     (context-live--target fixture (list kind change reopen) :change change :reopen reopen
+      :append-images (not (null (member kind '(:soft :soft-tiny))))))))
+
+(-> context-live--guard-probe (t) t)
+(defun context-live--guard-probe (mode)
+  "Exercise account refresh and detached compaction through real mission scopes."
+  (context-live--fixture :prefix
+   (lambda (fixture)
+     (ecase mode
+       (:refresh
+        (setf *context-live--bearer* "c82-inert-bearer-two"))
+       (:account
+        (setf *context-live--account* "c82-other-inert-account"))
+       (:detached
+        nil))
+     (if (eq mode :detached)
+         (let* ((owner                   (getf fixture :conversation))
+                (provider                (getf fixture :provider))
+                (capture                 (conversation-compaction-capture owner))
+                (view                    (conversation-compaction-view capture))
+                (*context-live--observe* t)
+                (before                  (context-admission-test-provider-network-calls provider))
+                (refusal
+                 (handler-case
+                  (mission-call-with-request-view (mission-request-view-context owner) view
+                                                  (lambda ()
+                                                    (provider-stream-turn provider view
+                                                                          :tool-namespaces #()
+                                                                          :compaction-p    t
+                                                                          :event-callback
+                                                                          #'identity)))
+                  (provider-context-budget-error nil t)))
+                (goal                    (mission-context-goal (mission-context-find owner))))
+           (test-assert (eq refusal t)
+                        "Detached compaction is not authorized by the ordinary receipt.")
+           (test-assert (= before (context-admission-test-provider-network-calls provider))
+                        "Detached refusal stops before transport.")
+           (test-assert
+            (and (zerop (getf goal :tokens-reserved)) (zerop (getf goal :requests-outstanding))
+                 (zerop (getf goal :unknown-usage 0)))
+            "Detached local refusal releases accounting without UNKNOWN.")
+           (format t "~&C82 DETACHED refusal=~S transport-delta=~D~%" refusal
+                   (- (context-admission-test-provider-network-calls provider) before)))
+         (let ((result (context-live--target fixture mode)))
+           (test-assert
+            (= (getf result :calls)
+               (if (eq mode :refresh)
+                   1
+                   0))
+            "Only equivalent account routing reuses the proof.")
+           (when (eq mode :account)
+             (test-assert
+              (some (lambda (row) (eq (getf row :reason) :identity-changed)) (getf result :events))
+              "Changed account fails at identity before transport.")))))))
+
+(-> context-live--fit-event-p (t) t)
+(defun context-live--fit-event-p (events)
+  "Return whether a real measured estimate fits with its output reserve."
+  (some
+   (lambda (row)
+     (and (eq (getf row :reason) :measured-history) (getf row :owner) (getf row :adapter)
+          (getf row :identity-equal) (= (getf row :images) 32)
+          (< (+ (getf row :estimate) (getf row :reserve)) (getf row :window))))
+   events))
+
+(-> test-context-live-soft-anchor nil t)
+(defun test-context-live-soft-anchor ()
+  "Continue an ordinary turn when its earned final-wire estimate fits despite large encoded images."
+  (context-live--fixture :soft
+   (lambda (fixture)
+     (let* ((result (context-live--target fixture :soft :append-images t))
+            (goal   (getf result :goal)))
+       (test-assert (= (getf result :calls) 1)
+                    "A fitting measured request reaches ordinary transport instead of proactive compaction.")
+       (test-assert (typep (getf result :result) 'provider-result) "The ordinary turn completes.")
+       (test-assert
+        (and (= 4 (getf (conversation-input-measurement (getf fixture :conversation)) :issued))
+             (= 4 (context-admission-test-provider-network-calls (getf fixture :provider))))
+        "Four actual returned ordinary responses earn four receipts.")
+       (test-assert (context-live--fit-event-p *context-live--log*)
+                    "The real final projection fits with all current overhead and positive reserve.")
+       (test-assert
+        (and (= (getf goal :tokens-used) 4052) (zerop (getf goal :unknown-usage 0))
+             (zerop (getf goal :tokens-reserved)) (zerop (getf goal :requests-outstanding)))
+        "Only the four returned fixture responses settle known billable usage."))))
+  nil)
+
+(-> test-context-live-changing-injected-anchor nil t)
+(defun test-context-live-changing-injected-anchor ()
+  "Retain safe ordinary continuation across a changed injected block and unchanged image history."
+  (dolist (reopen '(nil t))
+    (context-live--fixture :prefix
+     (lambda (fixture)
+       (let* ((result
+               (context-live--target fixture (list :changed reopen) :change :change :reopen
+                reopen))
+              (goal (getf result :goal)))
+         (test-assert (= (getf result :calls) 1)
+                      "Changing only injected context does not force refusal of an otherwise fitting measured history.")
+         (test-assert (typep (getf result :result) 'provider-result)
+                      "The next ordinary turn completes after the changed contribution.")
+         (test-assert (context-live--fit-event-p (getf result :events))
+                      "The actual provenance-aware final request, not fixture role filtering, fits.")
+         (test-assert
+          (some
+           (lambda (row)
+             (and (getf row :fixture-history-prefix-equal)
+                  (< (+ (getf row :fixture-provenance-estimate) (getf row :reserve))
+                     (getf row :window))))
+           (getf result :events))
+          "The unchanged fixture history fits when the whole measured input and all current injected context are charged.")
+         (test-assert
+          (and (zerop (getf goal :unknown-usage 0)) (zerop (getf goal :tokens-reserved))
+               (zerop (getf goal :requests-outstanding)))
+          "The local boundary never leaks mission reservations or UNKNOWN.")))))
+  nil)
+
+(-> test-context-live-owning-controls nil t)
+(defun test-context-live-owning-controls ()
+  "Discriminate encoded lengths, active injected context, durable reopen and route ownership."
+  (dolist (kind '(:soft-small :soft-tiny))
+    (context-live--fixture kind
+     (lambda (fixture)
+       (let ((result (context-live--target fixture kind :append-images t)))
+         (test-assert (= 1 (getf result :calls))
+                      "The smaller encoded image control completes an ordinary turn.")
+         (test-assert (context-live--fit-event-p (getf result :events))
+                      "The control consumes the genuinely earned measured prefix.")))))
+  (dolist (reopen '(nil t))
+    (context-live--fixture :prefix
+     (lambda (fixture)
+       (let ((result (context-live--target fixture (list :unchanged reopen) :reopen reopen)))
+         (test-assert (= 1 (getf result :calls))
+                      "Unchanged injected context admits before and after reopening.")
+         (test-assert (context-live--fit-event-p (getf result :events))
+                      "Replay retains eligible measured input, not a raw/UI discount.")))))
+  (dolist (mode '(:refresh :account :detached)) (context-live--guard-probe mode))
+  nil)
+
+(-> context-live--provenance-metadata (t t &key (:prior t) (:request t)) t)
+(defun context-live--provenance-metadata (owner receipt &key prior request)
+  "Compute a fixture-only arithmetic witness, never an admission permit.
+
+Only this controlled fixture has no durable developer messages. Production
+must carry actual projection provenance rather than infer it from a role."
+  (when (and owner receipt (vectorp prior))
+    (assert
+     (notany (lambda (item) (json-string= (json-get item "role") "developer"))
+             (conversation-input-items owner)))
+    (let* ((injected-p  (lambda (item) (json-string= (json-get item "role") "developer")))
+           (old-history (remove-if injected-p prior))
+           (current     (json-get request "input"))
+           (new-history (remove-if injected-p current))
+           (injected    (remove-if-not injected-p current))
+           (equal-prefix
+            (and (>= (length new-history) (length old-history))
+                 (every (lambda (a b) (equal (json-encode a) (json-encode b))) old-history
+                        (subseq new-history 0 (length old-history)))))
+           (unaccounted (json-object-copy request)))
+      (when equal-prefix
+        (setf (gethash "input" unaccounted)
+              (concatenate 'vector injected (subseq new-history (length old-history))))
+        (list :fixture-history-prefix-equal t :fixture-old-history-items (length old-history)
+              :fixture-current-injected-items (length injected) :fixture-new-history-items
+              (- (length new-history) (length old-history)) :fixture-provenance-estimate
+              (+ (getf receipt :input)
+                 (ceiling (provider-context--request-characters unaccounted) 4)))))))
+
+
+;;;; -- Provenance Admission Guards --
+
+(defparameter *context-provenance-test-transform* nil
+  "A private fixture callback at real final request preparation, or NIL.")
+
+(defmethod provider-prepare-stream-request :around
+    ((provider context-measured-test-provider) (request hash-table) credentials)
+  "Exercise provenance against actual prepared requests without changing product authority."
+  (declare (ignore credentials))
+  (let ((prepared (call-next-method)))
+    (if *context-provenance-test-transform*
+        (funcall *context-provenance-test-transform* provider prepared)
+        prepared)))
+
+(-> context-provenance-tests--probe (list function) null)
+(defun context-provenance-tests--probe (fixture function)
+  "Run FUNCTION inside one real ordinary candidate's final preparation and owner."
+  (let ((*context-provenance-test-transform* function))
+    (context-measured-tests--attempt fixture))
+  nil)
+
+(-> test-context-provenance-complete-history () null)
+(defun test-context-provenance-complete-history ()
+  "Require all old durable source and encoded semantics, including developer history."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner    (getf fixture :conversation))
+            (original (copy-list (conversation-input-items owner)))
+            (receipt  (copy-tree (conversation-input-measurement owner))))
+       (test-assert (= 3 (getf receipt :version)) "A genuine ordinary success earns v3 provenance.")
+       (dolist (mode '(:edit :delete :reorder))
+         (let ((items (copy-list original)))
+           (ecase mode
+             (:edit
+              (setf (gethash "role" (first items)) "developer"))
+             (:delete
+              (setf items (rest items)))
+             (:reorder
+              (rotatef (first items) (second items))))
+           (setf (conversation-input-items owner) items
+                 (conversation-input-measurement owner) (copy-tree receipt))
+           (context-provenance-tests--probe
+            fixture
+            (lambda (provider request)
+              (test-assert (null (provider-input-measurement--estimate provider request))
+                           "No old durable edit, deletion or reorder earns a partial-history discount.")
+              request))
+           (setf (gethash "role" (first original)) "user"
+                 (conversation-input-items owner) original
+                 (conversation-input-measurement owner) (copy-tree receipt))))
+       ;; Persist a real developer history item, earn authority, then reopen it.
+       (conversation-append-provider-item owner (responses-developer-message "Durable developer guard"))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket))
+       (let* ((loaded    (conversation-load (conversation-pathname owner)))
+              (developer (find-if (lambda (item) (json-string= (json-get item "role") "developer"))
+                                  (conversation-input-items loaded))))
+         (test-assert developer "The developer item survives durable replay.")
+         (setf (getf fixture :conversation) loaded
+               (getf fixture :agent)
+               (agent-create :configuration (getf fixture :configuration)
+                             :conversation loaded :provider (getf fixture :provider)
+                             :tool-registry (make-instance 'tool-registry)))
+         (context-provenance-tests--probe
+          fixture
+          (lambda (provider request)
+            (multiple-value-bind (estimate reason) (provider-input-measurement--estimate provider request)
+              (test-assert (and estimate (eq reason :measured-history))
+                           "Replayed developer history is committed as durable, not classified by role."))
+            (setf (gethash "role" developer) "user")
+            (test-assert (null (provider-input-measurement--estimate provider request))
+                         "Editing a committed durable developer item invalidates the complete commitment.")
+            request))))))
+  nil)
+
+(-> test-context-provenance-final-mapping () null)
+(defun test-context-provenance-final-mapping ()
+  "Reject incomplete or stale encoder/final mappings and charge all final-added overhead."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (context-provenance-tests--probe
+      fixture
+      (lambda (provider request)
+        (let* ((context  *provider-input-measurement-context*)
+               (plan     (getf context :provenance))
+               (owner    (getf fixture :conversation))
+               (estimate (provider-input-measurement--estimate provider request))
+               (added    (json-object-copy request)))
+          (test-assert estimate "The real encoded candidate carries a complete mapping.")
+          (setf (gethash "new_final_routing_field" added) (make-string 40000 :initial-element #\r))
+          (test-assert (> (provider-input-measurement--estimate provider added) (+ estimate 9999))
+                       "Full current fields added at final preparation are charged beside whole measured input.")
+          (dolist (mode '(:copy :append :delete :reorder))
+            (let* ((candidate (json-object-copy request))
+                   (wire      (copy-seq (json-get request "input"))))
+              (ecase mode
+                (:copy
+                 (setf wire (json-decode (json-encode wire))))
+                (:append
+                 (setf wire (concatenate 'vector wire (vector (responses-developer-message "unattested")))))
+                (:delete
+                 (setf wire (subseq wire 1)))
+                (:reorder
+                 (rotatef (aref wire 0) (aref wire 1))))
+              (setf (gethash "input" candidate) wire)
+              (test-assert (null (provider-input-measurement--estimate provider candidate))
+                           "Unknown final sequence transformations have no provenance authority.")))
+          (dolist (key '(:provenance :generation :log-generation :issued))
+            (let ((saved (if (eq key :provenance) plan
+                            (if (eq key :issued) (getf context key) (getf plan key)))))
+              (unwind-protect
+                   (progn
+                     (case key
+                       (:provenance
+                        (setf (getf context key) nil))
+                       (:issued
+                        (incf (getf context key)))
+                       (t
+                        (incf (getf plan key))))
+                     (test-assert (null (provider-input-measurement--estimate provider request))
+                                  "Absent mapping and stale issuance or generation fail closed."))
+                (case key
+                  (:provenance
+                   (setf (getf context key) saved))
+                  (:issued
+                   (setf (getf context key) saved))
+                  (t
+                   (setf (getf plan key) saved))))))
+          (let ((saved (conversation-input-measurement-issuance owner)))
+            (unwind-protect
+                 (progn
+                   (incf (conversation-input-measurement-issuance owner))
+                   (test-assert (null (provider-input-measurement--estimate provider request))
+                                "A concurrently superseded ordinary attempt loses mapping authority."))
+              (setf (conversation-input-measurement-issuance owner) saved)))
+          request)))))
+  nil)
+
+(-> test-context-provenance-receipt-versions () null)
+(defun test-context-provenance-receipt-versions ()
+  "Keep legacy strict authority separate from unknown, malformed and absent provenance."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner   (getf fixture :conversation))
+            (receipt (copy-tree (conversation-input-measurement owner))))
+       (dolist (mode '(:unknown :missing :schema :digest :duplicate))
+         (let ((candidate (copy-tree receipt)))
+           (ecase mode
+             (:unknown
+              (setf (getf candidate :version) 99))
+             (:missing
+              (remf candidate :attestation))
+             (:schema
+              (setf (getf candidate :provenance) :unknown))
+             (:digest
+              (setf (getf candidate :history-root) "not-a-digest"))
+             (:duplicate
+              (setf candidate (append candidate (list :input 1)))))
+           (test-assert (not (conversation-input-measurement-valid-p candidate))
+                        "Unsupported or malformed provenance receipts are never accepted.")))
+       (let ((legacy (subseq receipt 0 14)))
+         (setf (getf legacy :version) 1)
+         (test-assert (conversation-input-measurement-valid-p legacy) "The earned strict wire-prefix proof has a valid legacy representation.")
+         (context-provenance-tests--probe
+          fixture
+          (lambda (provider request)
+            (setf (conversation-input-measurement owner) legacy)
+            (let ((candidate (json-object-copy request)))
+              (setf (gethash "input" candidate)
+                    (concatenate 'vector (vector (responses-developer-message "new injected span"))
+                                 (json-get request "input")))
+              (multiple-value-bind (estimate reason) (provider-input-measurement--estimate provider candidate)
+                (test-assert (and (null estimate) (eq reason :prefix-changed))
+                             "Legacy receipts cannot gain provenance authority from current history.")))
+            (setf (conversation-input-measurement owner) receipt)
+            request))))))
+  nil)
+
+(-> test-context-prepared-candidate-once () null)
+(defun test-context-prepared-candidate-once ()
+  "Assemble selection, contributions and anchors once, then decide on the sent candidate."
+  (context-live--fixture :soft
+   (lambda (fixture)
+     (let ((counts (make-hash-table)) (decided nil))
+       (test-call-with-function-replacements
+        (append
+         (loop for name in '(provider-request-tool-namespaces context-resolve-request
+                             context-delivery-project-items context-anchors-update)
+               for original = (symbol-function name)
+               collect (let ((name name) (original original))
+                         (list name (lambda (&rest arguments)
+                                      (incf (gethash name counts 0))
+                                      (apply original arguments)))))
+         (let ((original (symbol-function 'provider-call-prepared-request-decision)))
+           (list (list 'provider-call-prepared-request-decision
+                       (lambda (provider request)
+                         (push request decided)
+                         (funcall original provider request))))))
+        (lambda ()
+          (let ((result (context-live--target fixture :once :append-images t)))
+            (test-assert (= 1 (getf result :calls)) "The measured candidate completes exactly one ordinary transport.")
+            (test-assert (= 1 (length decided)) "One input-only proactive decision precedes ordinary transport.")
+            (test-assert (eq (first decided)
+                             (first (context-measured-test-requests (getf fixture :provider))))
+                         "The final candidate inspected for proactive recovery is exactly the request sent.")
+            (dolist (name '(provider-request-tool-namespaces context-resolve-request
+                            context-delivery-project-items context-anchors-update))
+              (test-assert (= 1 (gethash name counts 0))
+                           "Selection, contributors, delivery and anchors are assembled once per candidate."))))))))
+  (let ((*agent-prepared-input-estimate* most-positive-fixnum))
+    (test-assert (null (agent-should-compact-p (allocate-instance (find-class 'rlm-frame-agent))))
+                 "RLM frames keep their specialized no-proactive-compaction policy."))
+  nil)
+
+(defparameter *context-provenance-test-encoder* nil
+  "A scoped inert primary-encoder transform, observed by production provenance.")
+
+(defmethod provider-wire-input-item ((provider context-measured-test-provider) item)
+  "Let adversarial fixtures vary actual encoding without bypassing production observation."
+  (let ((encoded (call-next-method)))
+    (if *context-provenance-test-encoder*
+        (funcall *context-provenance-test-encoder* item encoded)
+        encoded)))
+
+(-> test-context-provenance-encoder-semantics () null)
+(defun test-context-provenance-encoder-semantics ()
+  "Commit actual encoded interpretation and reject duplicate raw source identities."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner    (getf fixture :conversation))
+            (original (conversation-input-items owner))
+            (source   (first original))
+            (raw      (json-encode source))
+            (*context-provenance-test-encoder*
+              (lambda (item encoded)
+                (if (eq item source)
+                    (let ((changed (json-object-copy encoded)))
+                      (setf (gethash "encoding_semantics" changed) "changed")
+                      changed)
+                    encoded))))
+       (context-provenance-tests--probe
+        fixture
+        (lambda (provider request)
+          (test-assert (provider-input-measurement--final-provenance request)
+                       "The changed real encoder output has a complete supported final mapping.")
+          (test-assert (equal raw (json-encode source))
+                       "The durable source is unchanged while its actual encoding differs.")
+          (multiple-value-bind (estimate reason) (provider-input-measurement--estimate provider request)
+            (test-assert (and (null estimate) (eq reason :history-changed))
+                         "An old complete receipt cannot authorize changed actual encoded semantics."))
+          request))
+       (let ((*context-provenance-test-encoder* nil))
+         (unwind-protect
+              (progn
+                (setf (conversation-input-items owner) (append original (list source)))
+                (context-provenance-tests--probe
+                 fixture
+                 (lambda (provider request)
+                   (test-assert (null (provider-input-measurement--final-provenance request))
+                                "Duplicate raw identities cannot acquire an ambiguous origin mapping.")
+                   (test-assert (null (provider-input-measurement--estimate provider request))
+                                "A complete old receipt cannot discount ambiguous duplicated history.")
+                   request)))
+           (setf (conversation-input-items owner) original))))))
+  nil)
+
+
+;;;; -- Pre-Encoder Projection Identity --
+
+(-> context-provenance-tests--projection-mutation (keyword) null)
+(defun context-provenance-tests--projection-mutation (mode)
+  "Reject in-place projection mutations without confusing them with durable history edits."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner                  (getf fixture :conversation))
+            (provider               (getf fixture :provider))
+            (durable                (coerce (conversation-input-items owner) 'vector))
+            (semantics              (map 'list #'json-encode durable))
+            (prior                  (conversation-input-measurement owner))
+            (original               (symbol-function 'provider-input-measurement--encode))
+            (calls                  (context-admission-test-provider-network-calls provider))
+            (*context-contributors* (copy-list *context-contributors*))
+            (*context-live--state*  "Projection identity anchor.")
+            (captured               nil)
+            (final-seen             nil)
+            (final-plan             nil))
+       (test-assert (eql 3 (getf prior :version)) "The prior v3 authority was genuinely earned.")
+       (register-context-contributor "projection-identity" 'context-live--contributor)
+        ;; Establish the real stable anchor, then extend durable history beyond it.
+       (context-measured-tests--attempt fixture)
+       (conversation-append-provider-item owner (responses-developer-message "Projection durable suffix."))
+       (setf durable (coerce (conversation-input-items owner) 'vector)
+             semantics (map 'list #'json-encode durable)
+             calls (context-admission-test-provider-network-calls provider))
+       (let ((*context-provenance-test-transform*
+               (lambda (adapter request)
+                 (test-assert (and (eq adapter provider)
+                                   (eq owner (getf *provider-input-measurement-context* :owner))
+                                   (provider-input-measurement--identity adapter request))
+                              "Final preparation uses the real ordinary owner and credential route.")
+                 (setf final-seen t
+                       final-plan (provider-input-measurement--final-provenance request))
+                 request)))
+         (test-call-with-function-replacements
+          (list
+           (list 'provider-input-measurement--encode
+                 (lambda (adapter projection continuation)
+                   (let* ((items    (cl-llm-provider-api:wire-request-items projection))
+                          ;; Capture identities independently before touching any cons cell.
+                          (before   (coerce items 'vector))
+                          (injected (position-if (lambda (item) (not (find item durable :test #'eq))) before)))
+                     (setf captured t)
+                     (test-assert (getf *provider-input-measurement-context* :provenance)
+                                  "Trusted project-history ran before the adversarial transformation.")
+                     (test-assert (not (eq items (conversation-input-items owner)))
+                                  "Anchored assembly has a separate projection spine.")
+                     (test-assert (and injected (plusp injected) (< injected (1- (length before)))
+                                       (find (aref before 0) durable :test #'eq)
+                                       (some (lambda (item) (find item durable :test #'eq))
+                                             (subseq before (1+ injected))))
+                                  "Injected context is interleaved between durable history items.")
+                     (ecase mode
+                       (:unchanged
+                        nil)
+                       (:reorder
+                        (rotatef (first items) (second items)))
+                       (:substitute
+                        (setf (first items) (responses-developer-message "Unattested replacement.")))
+                       (:duplicate
+                        (setf (second items) (first items))))
+                     (test-assert (eql (eq mode :unchanged) (every #'eq before items))
+                                  "The independent identity snapshot detects each in-place mutation.")
+                     (funcall original adapter projection continuation)))))
+          (lambda ()
+            (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+              (test-assert (typep result 'provider-result)
+                           "Raw or independently strict admission may still complete the ordinary request.")
+              (test-assert (and captured final-seen) "Both actual encoding and final preparation were observed.")
+              (test-assert (= (1+ calls) (context-admission-test-provider-network-calls provider))
+                           "The fitting ordinary request reaches inert transport once.")
+              (test-assert (and (= (length durable) (length (conversation-input-items owner)))
+                                (every #'eq durable (conversation-input-items owner))
+                                (equal semantics (mapcar #'json-encode (conversation-input-items owner))))
+                           "The owner's complete durable identity sequence and content were not mutated.")
+              (if (eq mode :unchanged)
+                  (progn
+                    (test-assert final-plan "The unchanged interleaved projection retains complete provenance.")
+                    (test-assert (eql 3 (getf (getf ticket :receipt) :version))
+                                 "A qualifying unchanged ordinary success earns new v3 authority."))
+                  (progn
+                    (test-assert (null final-plan) "Unsupported in-place source transformations have no final provenance.")
+                    (test-assert (not (eql 3 (getf (getf ticket :receipt) :version)))
+                                 "Unsupported in-place source transformations cannot earn new v3 authority."))))))))))
+  nil)
+
+(-> test-context-provenance-projection-control () null)
+(defun test-context-provenance-projection-control ()
+  "Earn v3 authority from an unchanged real anchored projection."
+  (context-provenance-tests--projection-mutation :unchanged))
+
+(-> test-context-provenance-projection-reorder () null)
+(defun test-context-provenance-projection-reorder ()
+  "Withhold provenance after in-place projection cons-cell reordering."
+  (context-provenance-tests--projection-mutation :reorder))
+
+(-> test-context-provenance-projection-substitute () null)
+(defun test-context-provenance-projection-substitute ()
+  "Withhold provenance after inserting a new source object through an existing cons cell."
+  (context-provenance-tests--projection-mutation :substitute))
+
+(-> test-context-provenance-projection-duplicate () null)
+(defun test-context-provenance-projection-duplicate ()
+  "Withhold provenance after duplicating a source object through an existing cons cell."
+  (context-provenance-tests--projection-mutation :duplicate))
+
+
+;;;; -- Snapshot Window and Complete Origins --
+
+(-> test-context-provenance-snapshot-window () null)
+(defun test-context-provenance-snapshot-window ()
+  "Append between real source snapshots and require conservative ordinary transport."
+  (dolist (prior-p '(t nil))
+    (context-measured-tests--earned
+     (lambda (fixture)
+       (let* ((owner          (getf fixture :conversation))
+              (provider       (getf fixture :provider))
+              (marker         "snapshot-window-unique-durable-X")
+              (extra          (responses-developer-message marker))
+              (project        (symbol-function 'provider-input-measurement--project-history))
+              (raw-reader     (symbol-function 'conversation-input-items))
+              (durable-reader (symbol-function 'conversation-input-items-for-request))
+              (decision       (symbol-function 'provider-call-prepared-request-decision))
+              (attest         (symbol-function 'provider-input-measurement--attest))
+              (armed nil) (inside nil) (fired 0) raw durable history
+              candidate decision-request origins provenance estimate reason failure result ticket proof-version fallback-p)
+         (unless prior-p (setf (conversation-input-measurement owner) nil))
+         (setf (context-measured-test-requests provider) nil)
+         (test-call-with-function-replacements
+          (list
+           (list 'provider-input-measurement--project-history
+                 (lambda (adapter conversation &rest arguments)
+                   (let ((target (and (eq adapter provider) (eq conversation owner))))
+                     (when target (setf armed t inside t history (getf arguments :history)))
+                     (unwind-protect (apply project adapter conversation arguments)
+                       (when target (setf armed nil inside nil))))))
+           (list 'conversation-input-items
+                 (lambda (conversation)
+                   (let ((snapshot (funcall raw-reader conversation)))
+                     (when (and armed (eq conversation owner) (zerop fired))
+                       (setf armed nil raw snapshot)
+                       (incf fired)
+                       (conversation-append-provider-item owner extra))
+                     snapshot)))
+           (list 'conversation-input-items-for-request
+                 (lambda (conversation &rest arguments)
+                   (let ((snapshot (apply durable-reader conversation arguments)))
+                     (when (and inside (eq conversation owner)
+                                (not (getf arguments :include-ephemeral-p)))
+                       (setf durable snapshot))
+                     snapshot)))
+           (list 'provider-call-prepared-request-decision
+                 (lambda (adapter request)
+                   (when (eq adapter provider)
+                     (setf decision-request request))
+                   (funcall decision adapter request)))
+           (list 'provider-input-measurement--attest
+                 (lambda (adapter request conversation)
+                   (prog1 (funcall attest adapter request conversation)
+                     (when (and (eq adapter provider) (eq conversation owner))
+                       (setf proof-version (getf (getf *provider-input-measurement-context* :proof) :version)))))))
+          (lambda ()
+            (let ((*context-provenance-test-transform*
+                    (lambda (adapter request)
+                      (setf candidate request
+                            origins (copy-list (getf (getf *provider-input-measurement-context* :provenance) :wire-origins))
+                            provenance (not (null (provider-input-measurement--final-provenance request))))
+                      (multiple-value-setq (estimate reason)
+                        (provider-input-measurement--estimate adapter request))
+                      (setf fallback-p
+                            (= (provider-request-input-token-estimate adapter request)
+                               (let ((*provider-input-measurement-context* nil))
+                                 (provider-request-input-token-estimate adapter request))))
+                      request)))
+              (handler-case
+                  (handler-bind ((type-error (lambda (condition)
+                                              (declare (ignore condition))
+                                              (sb-debug:print-backtrace :count 25 :stream *standard-output*))))
+                    (multiple-value-setq (result ticket) (context-measured-tests--attempt fixture)))
+                (error (condition)
+                  (setf failure condition)
+                  (format t "~&SNAPSHOT-WINDOW prior=~S error=~A~%" prior-p condition)
+                  (when (typep condition 'type-error)
+                    (format t "TYPE-ERROR datum=~S expected=~S~%"
+                            (type-error-datum condition) (type-error-expected-type condition))))))))
+         (format t "~&SNAPSHOT-WINDOW prior=~S fired=~D raw=~D durable=~D history=~D origins=~S provenance=~S estimate=~S reason=~S transported=~D~%"
+                 prior-p fired (length raw) (length durable) (length history) origins provenance estimate reason
+                 (length (context-measured-test-requests provider)))
+         (test-assert (= 1 fired) "The real raw accessor injects exactly one durable append.")
+         (test-assert (and raw (= (length raw) (length history)) (every #'eq raw history))
+                      "Actual raw H equals the assembly history by identity.")
+         (test-assert (and (= (length durable) (1+ (length raw))) (eq extra (first (last durable)))
+                          (every #'eq raw (butlast durable))) "The next actual durable snapshot is H+X.")
+         (test-assert (and (not (member extra raw :test #'eq)) (not (member extra history :test #'eq)))
+                      "The real append did not mutate the earlier snapshot or history.")
+         (test-assert (and candidate (not (search marker (json-encode candidate))))
+                      "The encoded actual candidate excludes unsent X.")
+         (test-assert (not (member (1- (length durable)) origins)) "Origins omit the newly appended durable index.")
+         (test-assert (null provenance) "A mixed source plan has no final v3 authority.")
+         (test-assert fallback-p "Public estimation uses its ordinary conservative fallback.")
+         (test-assert (equal (remove nil origins) (loop for index below (length raw) collect index))
+                      "The actual encoded wire maps precisely H, not H+X.")
+         (test-assert (and (null estimate) (eq reason (if prior-p :unattested-provenance :no-anchor)))
+                      "A mixed plan receives no measured-history discount.")
+         (test-assert (null failure) "Ordinary pretransport attestation must not signal a type error.")
+         (test-assert (= 1 (length (context-measured-test-requests provider))) "Exactly one conservative candidate reaches inert transport.")
+         (when result
+           (test-assert (not (eql 3 proof-version)) "The actual pretransport proof has no unsent-X v3 authority.")
+           (test-assert (eq decision-request (first (context-measured-test-requests provider)))
+                        "Admission observes the exact transported request.")
+           (test-assert (and (eq candidate decision-request) (not (eql 3 (getf (getf ticket :receipt) :version))))
+                        "The mixed candidate earns no v3 ticket over unsent X.")
+           (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket)
+           (test-assert (not (eql 3 (getf (conversation-input-measurement owner) :version)))
+                        "Normal persistence cannot replace the receipt with unsent-X v3 authority."))
+         ;; Restored accessors must allow a real candidate containing X to earn v3.
+         (multiple-value-bind (fresh fresh-ticket) (context-measured-tests--attempt fixture)
+           (let ((sent (first (context-measured-test-requests provider))))
+             (test-assert (search marker (json-encode sent)) "The fresh actual candidate includes X.")
+             (test-assert (and (= 3 (getf (getf fresh-ticket :receipt) :version))
+                               (>= (getf (getf fresh-ticket :receipt) :history-count) (1+ (length raw))))
+                          "Complete fresh origins earn v3 covering the appended X.")
+             (agent--persist-provider-result (getf fixture :agent) fresh :request-number 3 :input-measurement fresh-ticket)))
+         (context-provenance-tests--probe
+          fixture (lambda (adapter request)
+                    (multiple-value-bind (value why) (provider-input-measurement--estimate adapter request)
+                      (test-assert (and value (eq why :measured-history)) "The fresh persisted full commitment grants measured credit."))
+                    request))))))
+  nil)
+
+(-> test-context-provenance-origin-completeness () null)
+(defun test-context-provenance-origin-completeness ()
+  "Validate real ordered origins, injected spans and malformed-map fallback tickets."
+  (context-measured-tests--earned
+   (lambda (fixture)
+     (let* ((owner                  (getf fixture :conversation))
+            (provider               (getf fixture :provider))
+            (encode                 (symbol-function 'provider-input-measurement--encode))
+            (placement              (symbol-function 'cl-llm-provider-api:provider-responses-instructions-placement))
+            (*context-contributors* (copy-list *context-contributors*))
+            (*context-live--state*  "Origin completeness injected context."))
+       (register-context-contributor "origin-completeness" 'context-live--contributor)
+       (conversation-append-provider-item owner (responses-developer-message "Origin completeness durable developer."))
+       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+         (agent--persist-provider-result (getf fixture :agent) result :request-number 2 :input-measurement ticket))
+       (let ((receipt (copy-tree (conversation-input-measurement owner))))
+         (test-call-with-function-replacements
+          (list
+           (list 'cl-llm-provider-api:provider-responses-instructions-placement
+                 (lambda (adapter) (if (eq adapter provider) :input (funcall placement adapter))))
+           (list 'provider-input-measurement--encode
+                 (lambda (adapter projection continuation)
+                   (if (eq adapter provider)
+                       (let ((prefix (slot-value projection 'cl-llm-provider-api::prefix))
+                             (suffix (slot-value projection 'cl-llm-provider-api::suffix)))
+                         (unwind-protect
+                              (progn
+                                (setf (slot-value projection 'cl-llm-provider-api::prefix)
+                                      (append prefix (list "Origin completeness prefix."))
+                                      (slot-value projection 'cl-llm-provider-api::suffix)
+                                      (append suffix (list "Origin completeness suffix.")))
+                                (funcall encode adapter projection continuation))
+                           (setf (slot-value projection 'cl-llm-provider-api::prefix) prefix
+                                 (slot-value projection 'cl-llm-provider-api::suffix) suffix)))
+                       (funcall encode adapter projection continuation)))))
+          (lambda ()
+            (dolist (mode '(:complete :missing :duplicate :reordered :negative :outside :noninteger :length :entries-length))
+              (setf (conversation-input-measurement owner) (copy-tree receipt))
+              (let (mutated-plan saved-origins saved-entries)
+                (unwind-protect
+                     (let ((*context-provenance-test-transform*
+                             (lambda (adapter request)
+                               (let* ((plan    (getf *provider-input-measurement-context* :provenance))
+                                      (origins (copy-list (getf plan :wire-origins)))
+                                      (indices (loop for origin in origins for i from 0 when origin collect i))
+                                      (a (first indices)) (b (second indices)))
+                                 (setf mutated-plan plan saved-origins (getf plan :wire-origins)
+                                       saved-entries (getf plan :wire-entries))
+                                 (ecase mode
+                                   (:complete
+                                    nil)
+                                   (:missing
+                                    (setf (nth a origins) nil))
+                                   (:duplicate
+                                    (setf (nth b origins) (nth a origins)))
+                                   (:reordered
+                                    (rotatef (nth a origins) (nth b origins)))
+                                   (:negative
+                                    (setf (nth a origins) -1))
+                                   (:outside
+                                    (setf (nth a origins) (length (getf plan :durable))))
+                                   (:noninteger
+                                    (setf (nth a origins) :invalid))
+                                   (:length
+                                    (setf origins (rest origins)))
+                                   (:entries-length
+                                    (setf (getf plan :wire-entries) (rest saved-entries))))
+                                 (setf (getf plan :wire-origins) origins)
+                                 (if (eq mode :complete)
+                                     (progn
+                                       (test-assert (and (null (first origins)) (null (first (last origins)))
+                                                         (member nil (subseq origins a (1+ (first (last indices))))))
+                                                    "Real prefix, suffix and interleaved injected context have NIL origins.")
+                                       (test-assert (and (provider-input-measurement--final-provenance request)
+                                                         (provider-input-measurement--estimate adapter request))
+                                                    "Complete durable origins including developer history retain measured credit."))
+                                     (progn
+                                       (test-assert (null (provider-input-measurement--final-provenance request))
+                                                    "Malformed origins reject final authority.")
+                                       (test-assert (null (provider-input-measurement--estimate adapter request))
+                                                    "Malformed origins grant no measured credit.")))
+                                 request))))
+                       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+                         (declare (ignore result))
+                         (test-assert (if (eq mode :complete)
+                                          (eql 3 (getf (getf ticket :receipt) :version))
+                                          (not (eql 3 (getf (getf ticket :receipt) :version))))
+                                      "Ordinary attestation earns v3 only for the complete mapping.")))
+                  (when mutated-plan
+                    (setf (getf mutated-plan :wire-origins) saved-origins
+                          (getf mutated-plan :wire-entries) saved-entries)))))))))))
+  nil)

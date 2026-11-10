@@ -2494,7 +2494,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                                            "text" "Done."))))
                 (provider
                   (make-instance
-                   'scripted-provider
+                    'prepared-scripted-provider
                    :configuration configuration
                    :results       (list (agent-test-result "compact-1"
                                                            (list summary-item)
@@ -2583,7 +2583,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                                            "text" "Done."))))
                 (provider
                   (make-instance
-                   'native-scripted-provider
+                    'prepared-native-scripted-provider
                    :configuration configuration
                    :native-items
                    (list (json-object "type" "compaction"
@@ -2611,7 +2611,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
               (list (list 'agent-should-compact-p
                           (lambda (agent) (declare (ignore agent))
                             (prog1 pending (setf pending nil)))))
-              (lambda () (agent-run-user-turn agent "hello"))))
+              (lambda () (prepared-scripted--run-observed agent "hello"))))
            (test-assert
             (= (length
                 (first
