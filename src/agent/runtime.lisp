@@ -704,11 +704,11 @@ retries stay auditable next to the request they belong to."
      &key (:request-number integer)
           (:call-plans list)
           (:input-measurement list))
-    null)
+    (values null list))
 (defun agent--persist-provider-result
     (agent result &key request-number call-plans input-measurement)
-  "Append RESULT items in wire order under their per-tool persistence policies."
-  (let ((conversation (agent-conversation agent)))
+  "Append RESULT items in wire order; return NIL and the durable metadata record."
+  (let ((conversation (agent-conversation agent)) (record nil))
     (with-recursive-lock-held ((conversation-append-lock conversation))
      (dolist (item (provider-result-output-items result))
        (unless (json-object-p item)
@@ -735,21 +735,21 @@ retries stay auditable next to the request they belong to."
           (if plan
               (getf plan :persistence)
               ':durable))))
-     (conversation-append-provider-metadata
-      conversation
-      (append (list :request-number   request-number
-                    :response-id      (provider-result-response-id result)
-                    :usage            (agent--portable-value
-                                       (provider-usage-normalize
-                                        (provider-result-usage result)))
-                    :request-identity (conversation-request-identity conversation))
-              (let ((receipt (provider-input-measurement-ticket-receipt
-                              conversation input-measurement)))
-                (and receipt (list :input-measurement receipt)))
-              ;; The service's effective retention mode, when it reports one.
-              (let ((context (agent--result-reasoning-context result)))
-                 (and context (list :reasoning-context context)))))))
-  nil)
+     (setf record (conversation-append-provider-metadata
+                   conversation
+                   (append (list :request-number   request-number
+                                 :response-id      (provider-result-response-id result)
+                                 :usage            (agent--portable-value
+                                                    (provider-usage-normalize
+                                                     (provider-result-usage result)))
+                                 :request-identity (conversation-request-identity conversation))
+                           (let ((receipt (provider-input-measurement-ticket-receipt
+                                           conversation input-measurement)))
+                             (and receipt (list :input-measurement receipt)))
+                           ;; The service's effective retention mode, when it reports one.
+                           (let ((context (agent--result-reasoning-context result)))
+                              (and context (list :reasoning-context context)))))))
+    (values nil record)))
 
 (-> agent--answer-tool-searches
     (agent provider-result vector &key (:request-number integer))
@@ -1483,7 +1483,14 @@ tool registry reaches the very next provider request."
       (agent-observer-status
        observer
        :steering-applied
-       (list :message-count (length messages)))))
+       (list :message-count (length messages)
+            :nonblank-prose-p
+            (some (lambda (entry)
+                    (let* ((message (if (typep entry 'agent-steering-input)
+                                        (agent-steering-input-content entry) entry))
+                           (text    (user-message-input-text message)))
+                      (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) text)))))
+                  messages)))))
   nil)
 
 (defparameter *agent-prepared-input-estimate* nil
@@ -2197,12 +2204,11 @@ loop, so compaction ahead of the user message shares the turn's budget."
              (error condition)))
          (let ((call-plans
                  (agent--tool-call-plans agent calls :storm-state storm-state)))
-           (agent--persist-provider-result
-            agent
-            result
-            :request-number    request-number
-            :call-plans        call-plans
-            :input-measurement input-measurement)
+              (setf (getf completion-details :provider-record-sequence)
+               (getf (rest (nth-value 1
+                            (agent--persist-provider-result
+                             agent result :request-number request-number
+                             :call-plans call-plans :input-measurement input-measurement))) :seq))
            (provider-context-note-response context-request result)
            (agent--answer-tool-searches
             agent result tool-namespaces :request-number request-number)
@@ -2219,10 +2225,11 @@ loop, so compaction ahead of the user message shares the turn's budget."
               observer
               :turn-completed
               (append
-               (list :provider-requests request-number
-                     :tool-rounds       tool-rounds
-                     :tool-calls        tool-calls
-                     :response-id       (provider-result-response-id result))
+               (list :provider-requests        request-number
+                     :tool-rounds              tool-rounds
+                     :tool-calls               tool-calls
+                     :response-id              (provider-result-response-id result)
+                     :provider-record-sequence (getf completion-details :provider-record-sequence))
                (agent-turn-completion-details agent)))
              (agent-learn-procedures agent observer tool-calls)
              (return result))

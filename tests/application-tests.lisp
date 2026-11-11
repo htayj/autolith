@@ -10439,7 +10439,7 @@
 
 (-> test-goal-disposition-failures () null)
 (defun test-goal-disposition-failures ()
-  "Conservatively pause invalid results and reject stale owners without retry loops."
+  "Continue on unavailable assessment and reject stale owners without retry loops."
   (dolist (mode '(:malformed :indeterminate :bad-evidence :error :deadline :expiry :overcap :cancel :replace))
     (test-call-with-decision-application
      (lambda (application provider terminal)
@@ -10480,11 +10480,9 @@
                                                   (make-string 33000 :initial-element #\x)
                                                   "Choose the behavior before I proceed.")))))
          (test-assert (= calls (if (eq mode ':overcap) 0 1)) "no corrective auxiliary loop")
-         (test-assert (if (member mode '(:cancel :replace))
-                          (eq (getf (application-goal application) :status) ':active)
-                          (and (eq (getf (application-goal application) :status) ':paused)
-                               (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)))
-                      "unavailable is honest and stale results cannot pause a new owner")
+         (test-assert (and (eq (getf (application-goal application) :status) ':active)
+                           (not (getf (application-goal application) :pause-reason)))
+                      "unavailable continues and stale results cannot pause a new owner")
          (when operation
            (test-assert (eq (provider-operation-state operation) ':disposed) "failure disposes request identity"))))))
   nil)
@@ -10625,8 +10623,8 @@
                                                 (make-string 17000 :initial-element #\GREEK_SMALL_LETTER_LAMDA)
                                                 "Choose the behavior before I proceed.")))
          (test-assert (and (zerop calls)
-                           (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
-                      "complete fields are refused rather than truncated and missing providers pause honestly")))))
+                           (eq (getf (application-goal application) :status) ':active))
+                      "whole fields are refused without interrupting ordinary continuation")))))
   nil)
 
 (-> test-goal-disposition-wire-isolation () null)
@@ -10756,8 +10754,9 @@
            (lambda () (application--note-goal-turn application (decision-test-result "Ordinary progress."))))))
        (test-assert (and (zerop calls) (zerop creations) (zerop operations))
                     "no auxiliary stream, conversation or operation")
-       (test-assert (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)
-                    "honest durable unavailable pause")
+       (test-assert (and (eq (getf (application-goal application) :status) ':active)
+                         (not (getf (application-goal application) :pause-reason)))
+                    "unsupported assessment permits ordinary continuation")
        (test-assert (zerop (getf (application-goal application) :continuations)) "no continuation consumed"))))
   nil)
 
@@ -10963,7 +10962,7 @@
                       application
                       (lambda () (application--note-goal-turn application (decision-test-result reply))))))
          (test-assert (and (zerop calls) (zerop creations)
-                           (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
+                           (eq (getf (application-goal application) :status) ':active))
                       "prompt overhead, JSON escaping, and UTF-8 bytes each stop whole-field overflow before state creation")
          (test-assert (not (provider-output-ceiling-p (make-instance 'scripted-provider :results nil)))
                       "the ordinary scripted provider does not acquire a production capability")))))
@@ -10971,56 +10970,46 @@
 
 (-> test-goal-disposition-codex-controls () null)
 (defun test-goal-disposition-codex-controls ()
-  "Unsupported Codex pauses durably, with one notice and prose-only reentry."
+  "Read historical unavailable pauses truthfully and resume only through real input."
   (test-call-with-decision-application
    (lambda (application fixture terminal)
      (declare (ignore fixture terminal))
      (let ((provider (make-instance 'codex-subscription-provider
                                     :configuration (application-configuration application)))
-           (calls 0) (notices nil) (entry-status nil))
+           (calls 0) (notices 0))
        (setf (application-provider application) provider
-             (agent-provider (application-agent application)) provider)
+             (agent-provider (application-agent application)) provider
+             (getf (application-goal application) :status) ':paused
+             (getf (application-goal application) :pause-reason) ':disposition-unavailable)
+       (application--record-goal application)
        (test-call-with-function-replacements
         (list (list 'provider-stream-turn
                     (lambda (&rest arguments)
-                      (declare (ignore arguments))
-                      (incf calls)
-                      (push (getf (application-goal application) :status) entry-status)
-                      (decision-test-result "Ordinary progress.")))
+                      (declare (ignore arguments)) (incf calls)
+                      (decision-test-result "[GOAL-COMPLETE]")))
+              (list 'application--maybe-refresh-conversation-title
+                    (lambda (&rest args) (declare (ignore args)) nil))
               (list 'application-present
                     (let ((original (symbol-function 'application-present)))
                       (lambda (app entry &key identifier)
                         (when (and (listp identifier) (eq (first identifier) ':goal-disposition))
-                          (push identifier notices))
+                          (incf notices))
                         (funcall original app entry :identifier identifier)))))
         (lambda ()
-          (application--note-goal-turn application (decision-test-result "Ordinary progress."))
-          (let* ((conversation (application-conversation application))
-                 (sibling      (make-instance 'application :configuration (application-configuration application)
-                                                     :conversation        (conversation-load-by-id
-                                                                           (application-configuration application)
-                                                                           (conversation-identifier conversation))
-                                                     :ui                  (application-ui application))))
-            (application--load-goal sibling)
-            (test-assert (and (eq (getf (application-goal sibling) :status) ':paused)
-                              (eq (getf (application-goal sibling) :pause-reason) ':disposition-unavailable)
-                              (zerop (getf (application-goal sibling) :continuations)))
-                         "reload restores the honest unavailable pause without spending a continuation")
-            (application--run-goal-continuations application)
-            (application--run-goal-continuations sibling)
-            (application-render-records application)
-            (application-goal-request application ':status nil)
-            (test-assert (and (zerop calls) (= (length notices) 1))
-                         "loop entry, reload, rendering, and status neither wake nor renotify"))
+          (application--load-goal application)
+          (test-assert (and (eq (getf (application-goal application) :status) ':paused)
+                            (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
+                       "legacy pause retains its historical reason on reload")
+          (application--run-goal-continuations application)
+          (application-render-records application)
+          (application-goal-request application ':status nil)
           (application-run-message application *application-goal-continuation-prompt*)
-          (test-assert (eq (getf (application-goal application) :status) ':paused)
-                       "synthetic prose never reactivates an unavailable goal")
+          (test-assert (and (= calls 1) (zerop notices) (eq (getf (application-goal application) :status) ':paused) (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
+                       "explicit synthetic submission answers once without reactivating or renotifying")
           (application-run-message application "Continue investigating.")
-          (test-assert (and (member ':active entry-status)
-                            (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)
-                            (zerop (getf (application-goal application) :continuations)))
-                       "real prose allows one normal answer before a new honest unavailable pause")
-          (test-assert (= (length notices) 2) "only a new automatic pause adds a notice"))))))
+          (test-assert (and (= calls 2) (eq (getf (application-goal application) :status) ':complete))
+                       "real prose permits a normal response after a legacy pause")
+          (test-assert (zerop notices) "new unavailability adds no pause notice"))))))
   nil)
 
 (-> test-goal-disposition-independent-context () null)
@@ -11060,4 +11049,284 @@
                                 (search "independent-wire" (json-encode (provider-request-object provider conversation #()))))
                            "the registry and ordinary projection survive exceptional isolation exit"))
          (unregister-context-contributor name)))))
+  nil)
+
+(-> test-goal-question-recognizer () null)
+(defun test-goal-question-recognizer ()
+  "Distinguish final prose questions from representative Markdown data."
+  (dolist (entry (list (cons "Choose A or B?" t)
+                      (cons (format nil "Working.~%~%What should I choose?~%   ~%") t)
+                      (cons "Why repeat? I am implementing now." nil)
+                      (cons "The data contains a question? Continuing." nil)
+                      (cons "Isn't this ready?" t)
+                      (cons "What does `value` mean?" t)
+                      (cons "\"Choose A or B?\"" nil)
+                      (cons "'Choose A or B?'" nil)
+                      (cons "The log says \"Choose A or B?" nil)
+                      (cons "`Choose A or B?`" nil)
+                      (cons "`Choose A or B?" nil)
+                      (cons "> Choose A or B?" nil)
+                      (cons "    Choose A or B?" nil)
+                      (cons (format nil "~CChoose A or B?" #\Tab) nil)
+                      (cons (format nil "```text~%Choose A or B?~%```") nil)
+                      (cons (format nil "~~~~~~text~%Choose A or B?") nil)
+                      (cons (format nil "```text~%Choose A or B?") nil)
+                      (cons (format nil "```text~%data~%```~%Choose A or B?") t)
+                      (cons "Choose A or B" nil)))
+    (test-assert (eql (application--goal-question-ending-p (first entry)) (rest entry))
+                 (format nil "terminal prose boundary ~S" entry)))
+  nil)
+
+(-> test-note-recorded-goal-reply (application string) (integer 0))
+(defun test-note-recorded-goal-reply (application text)
+  "Supply the sequence of an actual durable provider record to a direct fixture."
+  (let* ((record   (conversation-append-provider-metadata
+                    (application-conversation application) '(:response-id "repeated-id")))
+         (sequence (getf (rest record) :seq)))
+    (application--note-goal-turn application (decision-test-result text) :sequence sequence)
+    sequence))
+
+(-> test-goal-question-state () null)
+(defun test-goal-question-state ()
+  "Restore ask1, reject durable replays, and persist exactly one ask2 pause."
+  (test-call-with-decision-application
+   (lambda (application provider terminal)
+     (declare (ignore provider terminal))
+     (setf (application-provider application)
+           (make-instance 'codex-subscription-provider :configuration (application-configuration application)))
+     (let ((sequence (test-note-recorded-goal-reply application "Which option?")) (notices 0))
+       (test-assert (and (eq (getf (application-goal application) :status) ':active)
+                         (getf (application-goal application) :previous-question-p))
+                    "unsupported ask1 persists active streak")
+       (application--load-goal application)
+       (test-assert (eql sequence (getf (application-goal application) :last-response-sequence))
+                    "reload retains durable replay identity")
+       (let ((before (length (conversation-records-newest (application-conversation application) 100))))
+         (application--note-goal-turn application (decision-test-result "Which option?") :sequence sequence)
+         (test-assert (= before (length (conversation-records-newest (application-conversation application) 100)))
+                      "replayed ask1 cannot become ask2"))
+       (test-call-with-function-replacements
+        (list (list 'application-present
+                    (lambda (app entry &key identifier)
+                      (declare (ignore app entry))
+                      (when (and (listp identifier) (eq (first identifier) ':goal-disposition))
+                        (incf notices)) nil)))
+        (lambda ()
+          (test-note-recorded-goal-reply application "A different option?")
+          (test-assert (and (= notices 1)
+                            (eq (getf (application-goal application) :pause-reason) ':awaiting-user))
+                       "different consecutive terminal questions pause once")
+          (application--load-goal application)
+          (application--run-goal-continuations application)
+          (application-render-records application)
+          (application-goal-request application ':status nil)
+          (application--note-goal-turn application (decision-test-result "A different option?")
+                                       :sequence (getf (application-goal application) :last-response-sequence))
+          (test-assert (= notices 1) "paused reload and replay neither wake nor renotify")))
+       (let ((watermark (getf (application-goal application) :last-response-sequence)))
+         (test-call-with-function-replacements
+          (list (list 'application--start-goal-work (lambda (app) (declare (ignore app)) nil)))
+          (lambda () (application-goal-request application ':resume nil)))
+         (test-assert (and (not (getf (application-goal application) :previous-question-p))
+                           (eql watermark (getf (application-goal application) :last-response-sequence)))
+                      "explicit resume resets streak but preserves replay watermark")
+         (application--note-goal-turn application (decision-test-result "A different option?") :sequence watermark)
+         (test-assert (not (getf (application-goal application) :previous-question-p))
+                      "old final cannot recount after resume")
+         (test-note-recorded-goal-reply application "Which option now?")
+         (test-note-recorded-goal-reply application "Implementing now.")
+         (test-note-recorded-goal-reply application "Which option next?")
+         (test-assert (eq (getf (application-goal application) :status) ':active)
+                      "intervening progress resets consecutive questions")
+         (application--goal-update application "Updated objective" :literal-p t)
+         (test-assert (and (not (getf (application-goal application) :previous-question-p))
+                           (getf (application-goal application) :last-response-sequence))
+                      "goal update resets only streak")))))
+  nil)
+
+(-> test-goal-question-input-resets () null)
+(defun test-goal-question-input-resets ()
+  "Reset through persisted real input and real steering, not status or synthetic input."
+  (test-call-with-decision-application
+   (lambda (application provider terminal)
+     (declare (ignore terminal))
+     (setf (application-provider application)
+           (make-instance 'codex-subscription-provider :configuration (application-configuration application)))
+     (test-note-recorded-goal-reply application "Which option?")
+     (let ((observer (application-agent-observer application)))
+       (agent-observer-status observer ':steering-applied '(:message-count 1))
+       (application-goal-request application ':status nil)
+       (test-assert (getf (application-goal application) :previous-question-p)
+                    "status and unqualified synthetic events do not reset")
+       (agent--persist-steering-input (application-agent application) observer
+                                     :messages '("Use the documented behavior.") :request-number 1)
+       (test-assert (not (getf (application-goal application) :previous-question-p))
+                    "persisted genuine steering resets streak"))
+     (test-note-recorded-goal-reply application "Which next option?")
+     (test-assert (eq (getf (application-goal application) :status) ':active)
+                  "first question after real steering continues")
+     (setf (scripted-provider-results provider) (list (decision-test-result "A new chain question?")))
+     (test-call-with-function-replacements
+      (list (list 'application-job-completions-awaited-p (lambda (app) (declare (ignore app)) t))
+            (list 'application--maybe-refresh-conversation-title (lambda (app) (declare (ignore app)) nil)))
+      (lambda () (application-run-message application "Use option A.")))
+     (test-assert (and (eq (getf (application-goal application) :status) ':active)
+                       (getf (application-goal application) :previous-question-p))
+                  "real initial input starts a fresh ask1 chain")))
+  nil)
+
+(-> test-goal-question-unavailable-controls () null)
+(defun test-goal-question-unavailable-controls ()
+  "Unavailable supported assessments continue ask1; deterministic ask2 makes no model call."
+  (dolist (mode '(:malformed :indeterminate :bad-evidence :error :deadline :overcap))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let* ((calls 0)
+              (*test-goal-disposition-handler*
+                (lambda (p c namespaces)
+                  (declare (ignore p c namespaces)) (incf calls)
+                  (case mode
+                    (:error
+                     (error 'provider-error :message "Offline unavailable"))
+                    (:deadline
+                     (error 'sb-sys:deadline-timeout :seconds 0)))
+                  (decision-test-result
+                   (case mode
+                     (:malformed
+                      "not JSON")
+                     (:bad-evidence
+                      "{\"outcome\":\"await-user\",\"evidence\":\"absent\"}")
+                     (otherwise
+                      "{\"outcome\":\"indeterminate\"}"))))))
+         (test-note-recorded-goal-reply application
+                                       (if (eq mode ':overcap)
+                                           (concatenate 'string (make-string 33000 :initial-element #\x) "?")
+                                           "Which behavior?"))
+         (test-assert (eq (getf (application-goal application) :status) ':active)
+                      "unavailable ask1 continues")
+         (test-note-recorded-goal-reply application "Which behavior?")
+         (test-assert (and (eq (getf (application-goal application) :status) ':paused)
+                           (= calls (if (eq mode ':overcap) 0 1)))
+                      "ask2 pauses without auxiliary assessment")))))
+  nil)
+
+(-> test-goal-question-owner-races () null)
+(defun test-goal-question-owner-races ()
+  "Do not commit assessment or streak after a reset, cancellation, or replacement."
+  (dolist (mode '(:steering :update :pause-resume :cancel :replace))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let* ((goal (application-goal application))
+              (*test-goal-disposition-handler*
+                (lambda (p c namespaces)
+                  (declare (ignore p c namespaces))
+                  (case mode
+                    (:steering
+                     (agent--persist-steering-input
+                      (application-agent application) (application-agent-observer application)
+                      :messages '("Choose option A.") :request-number 1))
+                    (:update
+                     (application--goal-update application "New objective" :literal-p t))
+                    (:pause-resume
+                     (application-goal-request application ':pause nil)
+                     (test-call-with-function-replacements
+                      (list (list 'application--start-goal-work (lambda (app) (declare (ignore app)) nil)))
+                      (lambda () (application-goal-request application ':resume nil))))
+                    (:cancel
+                     (provider-cancel-connection-owner goal))
+                    (:replace
+                     (application--replace-lightweight-goal
+                      application (list :objective "Replacement" :status ':active :continuations 0))))
+                  (decision-test-result "{\"outcome\":\"await-user\",\"evidence\":\"Which behavior\"}"))))
+         (application--call-with-goal-connection-owner
+          application (lambda () (test-note-recorded-goal-reply application "Which behavior?")))
+         (test-assert (and (eq (getf (application-goal application) :status) ':active)
+                           (not (getf (application-goal application) :previous-question-p))
+                           (not (getf (application-goal application) :last-response-sequence)))
+                      "stale assessment cannot commit a pause or any streak state")))))
+  nil)
+
+(-> test-call-with-codex-goal-chain (list function) null)
+(defun test-call-with-codex-goal-chain (replies function)
+  "Run the real continuation loop using unsupported Codex and inert ordinary replies."
+  (test-call-with-decision-application
+   (lambda (application scripted terminal)
+     (declare (ignore scripted))
+     (let* ((provider  (make-instance 'codex-subscription-provider
+                                      :configuration (application-configuration application)))
+            (calls 0) (auxiliary 0) (creations 0) (operations 0)
+            (remaining (copy-list replies)))
+       (setf (application-provider application) provider
+             (application-agent application)
+             (agent-create :configuration (application-configuration application)
+                           :provider provider :conversation (application-conversation application)
+                           :tool-registry (application-tool-registry application) :worker nil))
+       (test-assert (not (provider-output-ceiling-p provider)) "actual Codex has no assessment ceiling")
+       (test-call-with-function-replacements
+        (list
+         (list 'application--maybe-refresh-conversation-title (lambda (&rest args) (declare (ignore args)) nil))
+         (list 'conversation-create
+               (let ((original (symbol-function 'conversation-create)))
+                 (lambda (&rest args) (incf creations) (apply original args))))
+         (list 'make-provider-operation
+               (let ((original (symbol-function 'make-provider-operation)))
+                 (lambda (&rest args)
+                   (when (eq *telemetry-request-role* ':goal-disposition) (incf operations))
+                   (apply original args))))
+         (list 'provider-stream-turn
+               (lambda (p c &rest keys)
+                 (declare (ignore p c keys))
+                 (when (eq *telemetry-request-role* ':goal-disposition)
+                   (incf auxiliary) (error "Unexpected auxiliary request"))
+                 (incf calls)
+                 (unless remaining (error "Unexpected third response"))
+                 (decision-test-result (pop remaining)))))
+        (lambda ()
+          (application-run-message application "Investigate and implement.")
+          (funcall function application calls terminal)
+          (test-assert (and (zerop auxiliary) (zerop creations) (zerop operations))
+                       "unsupported assessment performs zero auxiliary work"))))))
+  nil)
+
+(-> test-goal-unavailable-progress-loop () null)
+(defun test-goal-unavailable-progress-loop ()
+  "Unavailable assessment must not interrupt ordinary automatic progress."
+  (test-call-with-codex-goal-chain
+   '("Reading the source." "Implementing the correction." "Checking the patch." "[GOAL-COMPLETE]")
+   (lambda (application calls terminal)
+     (declare (ignore terminal))
+     (test-assert (= calls 4) "all progress replies automatically run through completion")
+     (test-assert (= (getf (application-goal application) :continuations) 3)
+                  "only three ordinary continuations charged")
+     (test-assert (eq (getf (application-goal application) :status) ':complete)
+                  "ordinary Codex progress completes without unavailable pause")
+     (test-assert (not (getf (application-goal application) :pause-reason))
+                  "no unavailable pause reason")))
+  nil)
+
+(-> test-goal-second-question-loop () null)
+(defun test-goal-second-question-loop ()
+  "Two question-ending replies pause without a third response or assessment."
+  (test-call-with-codex-goal-chain
+   '("Which behavior should I implement?" "Which behavior should I implement?" "THIRD SENTINEL")
+   (lambda (application calls terminal)
+     (declare (ignore terminal))
+     (test-assert (= calls 2) "exactly two asks, no third request")
+     (test-assert (= (getf (application-goal application) :continuations) 1)
+                  "only the ask1 continuation is charged")
+     (test-assert (eq (getf (application-goal application) :status) ':paused)
+                  "second question pauses durably")
+     (test-assert (eq (getf (application-goal application) :pause-reason) ':awaiting-user)
+                  "deterministic question pause has honest awaiting-user reason")
+     (let* ((records      (conversation-records-newest (application-conversation application) 100))
+            (dispositions (remove-if-not (lambda (r) (eq (first r) ':goal-disposition)) records)))
+       (test-assert (= 1 (count ':consecutive-questions dispositions
+                                :key (lambda (r) (getf (rest r) :source))))
+                    "one deterministic disposition record"))
+     (let ((before (length (conversation-records-newest (application-conversation application) 100))))
+       (application--run-goal-continuations application)
+       (test-assert (= before (length (conversation-records-newest (application-conversation application) 100)))
+                    "paused reentry does not repeat notice or transition"))))
   nil)

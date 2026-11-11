@@ -1678,6 +1678,13 @@
   test-effort-switch
   test-public-goal-actions
   test-session-goal
+  test-goal-question-recognizer
+  test-goal-question-state
+  test-goal-question-input-resets
+  test-goal-question-unavailable-controls
+  test-goal-question-owner-races
+  test-goal-unavailable-progress-loop
+  test-goal-second-question-loop
   test-session-goal-user-decision
   test-goal-disposition-contract
   test-goal-disposition-failures

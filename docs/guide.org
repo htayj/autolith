@@ -121,30 +121,33 @@ or =(goal :clear)=. Edit it in place with =(goal :update "NEW-OBJECTIVE")=.
 String arguments are literal objectives, including ="pause"=. Unknown keyword
 actions signal =application-goal-error= without changing the goal.
 
-Lightweight goals pause when a final reply needs an unresolved product, scope,
-or authority decision. Reply with the decision to resume. A bare =continue=
-permits another response; it does not authorize an unanswered choice. Explicit
-=(goal :pause)= requires =(goal :resume)= rather than ordinary prose.
+Lightweight goals pause after two consecutive final replies ending in ordinary
+prose questions in the same real-user and automatic-continuation chain. The first
+question may continue; the second pauses before another automatic turn, without
+a model assessment. An intervening progress reply, real nonblank input or steering,
+explicit resume, or objective update resets the streak. Reload preserves it and
+replayed responses do not count twice. Quoted and Markdown code data are excluded.
+Questions without terminal punctuation can be missed; two different optional
+questions can also cause a pause.
 
-For unmarked, noncomplete replies on a supported route, Autolith makes one
-isolated, tool-free model request using only the objective, latest real-user
-request, and complete final reply. Request-local contributors and relax-mode
-instructions are excluded. Routing, model, and cache metadata are transport
-policy, not classification evidence. This adds latency and metered usage; semantic
-classification can be wrong. The request is bounded to 30 seconds, 32 KiB for
-the escaped fields plus fixed instructions, an 8192-token estimate of the final
-encoded input, and an enforceable 512-output-token remote ceiling. Every actual
-route, including fallback and retry, must support that ceiling. An unavailable
-or uncertain result pauses with a distinct notice. It cannot declare completion
-or verify a mission.
+Reply with real prose to resume an automatic pause. A bare =continue= permits
+another response; it does not authorize an unanswered choice. Explicit
+=(goal :pause)= requires =(goal :resume)= rather than ordinary prose. Status,
+rendering, reload, jobs, and synthetic continuations do not reactivate a pause.
 
-*Codex tradeoff:* the pinned Codex subscription API cannot enforce the required
-512-output-token limit. Every unmarked, noncomplete plain-goal reply on Codex,
-including ordinary progress, therefore pauses as assessment unavailable without
-an auxiliary request. Autolith does not switch providers or relax the budget.
-Completion and explicit waiting markers retain their separate authority. Reply
-with real prose to permit another normal answer; status, rendering, reload, and
-synthetic continuations do not reactivate the paused goal.
+On supported routes, an optional isolated, tool-free assessment can pause the first
+reply for an unresolved product, scope, or authority decision. Its only evidence
+is the objective, latest real-user request, and complete final reply. Request-local
+contributors and relax instructions are excluded. This adds latency and metered
+usage; semantic classification can be wrong. Limits are 30 seconds, 32 KiB for the
+escaped fields plus fixed instructions, an 8192-token final-input estimate, and an
+enforceable 512-output-token remote ceiling on every actual retry or fallback route.
+Unavailable or uncertain assessment permits ordinary continuation, without an
+unavailable notice. The pinned Codex API cannot enforce this ceiling, so it makes
+no auxiliary request and uses the deterministic guard. No provider switch or
+budget increase is involved. Completion, explicit waiting, and missions have their
+separate authority. Historical assessment-unavailable pauses retain their reason
+and permit real-prose or explicit-resume reentry.
 
 Lightweight goals also pause after eight automatic continuation turns between user
 messages by default. Set =(settings :goal-continuation-limit 16)= to change the
