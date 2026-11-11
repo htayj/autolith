@@ -1286,8 +1286,8 @@
 
 (-> test-expanded-native-unavailable-negative-controls () null)
 (defun test-expanded-native-unavailable-negative-controls ()
-  "Keep authentication, transient HTTP, and uncertain transport failures outside fallback."
-  (dolist (status '(401 429 500 503 0))
+  "Keep terminal HTTP and raw EOF failures outside native capability fallback."
+  (dolist (status '(401 403 400 0))
     (dolist (owned-p '(nil t))
       (expanded-native-test--fixture
        (lambda (application provider)
@@ -1307,6 +1307,18 @@
                    (error (condition) (setf failure condition)))))))
            (format t "~&NATIVE-NEGATIVE status=~D owned=~S failure=~S~%" status owned-p (type-of failure))
            (test-assert failure "An unrelated native failure must propagate to its existing owner.")
+           (let ((cause (if (typep failure 'mission-error) (mission-error-cause failure) failure)))
+             (if (zerop status)
+                 (test-assert (typep cause 'end-of-file) "Raw native EOF retains its terminal cause.")
+                 (progn
+                   (format t "~&NATIVE-TERMINAL-CAUSE status=~D owned=~S type=~S~%" status owned-p (type-of cause))
+                   (test-assert (typep cause (if (= status 401)
+                                                '(or provider-unauthorized provider--authentication-failure)
+                                                'provider-error))
+                                "The normalized terminal condition is preserved.")
+                   (test-assert (= status (provider-error-status cause)) "The normalized HTTP status is preserved.")
+                   (test-assert (not (typep cause 'provider-retryable-error))
+                                "Plain semantic HTTP rejection is not persistent instability."))))
            (test-assert (not (typep failure 'provider-context-budget-error))
                         "An unrelated native failure is not a local context refusal.")
            (test-assert (null (expanded-native-input-snapshots provider))
@@ -2633,4 +2645,593 @@
           (test-assert (zerop (getf snapshot :executing)) "Scheduler execution reservations are released.")
           (test-assert (every #'zerop (mapcar (lambda (key) (getf snapshot key)) '(:outstanding :reserved :unknown)))
                        "No usage remains outstanding, reserved, or unknown.")))))
+  nil)
+
+(-> test-expanded-native-terminal-recovery-controls () null)
+(defun test-expanded-native-terminal-recovery-controls ()
+  "End genuine opening recovery at semantic rejection or explicit native unavailability."
+  (let ((cases (append (loop for status in '(400 401 403 404 405 501)
+                            collect (list :status status))
+                       (loop for status in '(400 403 501)
+                             collect (list :status status :retry-after-p t))
+                       (loop for type in '("usage_limit_reached" "usage_not_included" "insufficient_quota")
+                             collect (list :status 429 :type type))
+                       (loop for code in '("insufficient_quota" "credit_balance_exhausted"
+                                           "organization_spend_limit_exceeded" "project_spend_limit_exceeded"
+                                           "organization_usage_limit_exceeded")
+                             collect (list :status 429 :code code)))))
+    (dolist (transient '(429 500 503))
+      (dolist (signaled-p '(nil t))
+        (dolist (entry cases)
+          (expanded-native-test--fixture
+           (lambda (application provider)
+             (let* ((configuration                        (application-configuration application))
+                    (status                               (getf entry :status))
+                    (unavailable-p                        (member status '(404 405 501)))
+                    (body                                 (if (= status 429)
+                                                           (json-encode (json-object "error" (json-object "type" (getf entry :type)
+                                                                                                        "code" (getf entry :code))))
+                                                           "Native semantic rejection."))
+                    (headers                              (when (getf entry :retry-after-p)
+                                                           (let ((table (make-hash-table :test #'equal)))
+                                                             (setf (gethash "retry-after" table) "0") table)))
+                    (*provider-maximum-transient-retries* 0)
+                    (posts 0) (waits 0) (failure nil) (normalized nil) (results nil))
+               (let ((*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+                 (test-call-with-function-replacements
+                  (list (list 'credential-manager-credentials
+                              (lambda (&rest arguments)
+                                (declare (ignore arguments))
+                                (provider-tests--credentials configuration)))
+                        (list 'credential-manager-refreshable-p
+                              (lambda (manager) (declare (ignore manager)) nil))
+                        (list 'dexador:post
+                              (lambda (endpoint &rest arguments)
+                                (declare (ignore arguments))
+                                (incf posts)
+                                (test-assert (<= posts 2) "The finite script has no third native response.")
+                                (when (> posts 2) (error "Native script exhausted."))
+                                (let ((reply-status  (if (= posts 1) transient status))
+                                      (reply-body    (if (= posts 1) "Transient pressure." body))
+                                      (reply-headers (unless (= posts 1) headers)))
+                                  (if signaled-p
+                                      (error 'http-request-failed :status reply-status :body reply-body
+                                                                 :headers reply-headers :uri endpoint :method ':post)
+                                      (values reply-body reply-status reply-headers))))))
+                  (lambda ()
+                    (handler-case
+                        (handler-bind ((serious-condition
+                                         (lambda (condition)
+                                           (setf normalized condition))))
+                          (setf results (multiple-value-list
+                                         (provider-native-compact-conversation
+                                          provider (application-conversation application)
+                                          :tool-namespaces #() :event-callback #'identity))))
+                      (error (condition) (setf failure condition))))))
+               (format t "~&NATIVE-TERMINAL transient=~D signaled=~S input=~S POST=~D wait=~D type=~S status=~S code=~S~%"
+                       transient signaled-p entry posts waits (type-of normalized)
+                       (and normalized (provider-error-status normalized))
+                       (and normalized (provider-error-code normalized)))
+               (test-assert (= posts 2) "One transient and one terminal reply reach the native wire boundary.")
+               (test-assert (= waits 1) "Only the genuine transient reply enters persistent recovery.")
+               (if unavailable-p
+                   (progn
+                     (test-assert (null failure) "Explicit native unavailability returns normally.")
+                     (test-assert (null (first results)) "Unavailable native compaction publishes no window."))
+                   (progn
+                     (test-assert (typep failure (if (= status 401) 'provider--authentication-failure 'provider-error))
+                                  "Semantic failure propagates without fallback.")
+                     (test-assert (= status (provider-error-status failure)) "Final normalized status is preserved.")
+                     (when (= status 429)
+                       (test-assert (not (typep failure 'provider-retryable-error))
+                                    "Every allowance type and code is terminal despite status429."))))
+               (test-assert (null *provider-connection-episodes*) "Every terminal path unregisters its episode.")
+               (test-assert (null (expanded-native-input-snapshots provider))
+                            "No portable summary or ordinary request follows a native semantic failure.")))
+           :owned-p nil :large-p nil)))))
+  nil)
+
+(-> test-expanded-native-persistent-owner-lifetime () null)
+(defun test-expanded-native-persistent-owner-lifetime ()
+  "Keep transient native recovery persistent until its explicit caller expires or cancels."
+  (dolist (mode '(:expiry :cancel))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (let* ((configuration (application-configuration application))
+              (conversation  (application-conversation application))
+              (owner         (list :fixture mode))
+              (ready         (sb-thread:make-semaphore :count 0))
+              (original      (symbol-function 'provider--wait-on-connection-condition))
+              (expires       (+ (/ (get-internal-real-time) internal-time-units-per-second) 1/2))
+              (posts 0) (waits 0) (episode nil) (failure nil) (worker nil))
+         (test-call-with-function-replacements
+          (list (list 'credential-manager-credentials
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (provider-tests--credentials configuration)))
+                (list 'provider--connection-retry-delay
+                      (lambda (index &optional random-state)
+                        (declare (ignore index random-state)) 1))
+                (list 'provider--wait-on-connection-condition
+                      (lambda (state seconds)
+                        (setf episode state)
+                        (incf waits)
+                        (when (= posts 3) (sb-thread:signal-semaphore ready))
+                        (funcall original state seconds)))
+                (list 'dexador:post
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf posts)
+                        (values "Transient pressure." (nth (mod (1- posts) 3) '(429 500 503)) nil))))
+          (lambda ()
+            (unwind-protect
+                 (progn
+                   (setf worker
+                         (sb-thread:make-thread
+                          (lambda ()
+                            (let ((*provider-connection-owner*          owner)
+                                  (*provider-connection-owner-check*
+                                    (when (eq mode :expiry)
+                                      (lambda () (- expires (/ (get-internal-real-time) internal-time-units-per-second)))))
+                                  (*provider-maximum-transient-retries* 0)
+                                  (*bounded-retry-sleep-function*       #'sleep))
+                              (handler-case
+                                  (provider-native-compact-conversation provider conversation
+                                   :tool-namespaces #() :event-callback #'identity)
+                                (serious-condition (condition) (setf failure condition)))))
+                          :name "native explicit caller lifetime"))
+                   (when (eq mode :cancel)
+                     (test-assert (sb-thread:wait-on-semaphore ready :timeout 5)
+                                  "Three transient replies outlive the bounded retry maximum.")
+                     (provider-cancel-connection-owner owner))
+                   (sb-thread:join-thread worker :timeout 3 :default ':timeout)
+                   (test-assert (not (sb-thread:thread-alive-p worker)) "The real native wait ends within its caller lifetime.")
+                   (test-assert (typep failure 'provider-owner-ended) "Only the explicit owner ends persistent recovery.")
+                   (test-assert (= posts (if (eq mode :cancel) 3 1)) "No native POST follows expiry or cancellation.")
+                   (test-assert (>= waits posts) "Every transient reply reaches a real condition wait.")
+                   (test-assert (and episode (eq owner (provider-connection-recovery-owner episode)))
+                                "Recovery captures the exact supplied caller.")
+                   (test-assert (and episode (provider-connection-recovery-ended-p episode)) "The exact episode ends.")
+                   (test-assert (null *provider-connection-episodes*) "Terminal cleanup removes the owned episode.")
+                   (test-assert (null (expanded-native-input-snapshots provider)) "Owner termination does not trigger portable fallback.")
+                   (format t "~&NATIVE-LIFETIME mode=~S POST=~D real-waits=~D type=~S joined=~S~%"
+                           mode posts waits (type-of failure) (not (sb-thread:thread-alive-p worker))))
+              (when (and worker (sb-thread:thread-alive-p worker))
+                (provider-cancel-connection-owner owner)
+                (when episode (provider--end-connection-episode episode))
+                (sb-thread:join-thread worker :timeout 2 :default ':timeout))
+              (test-assert (not (sb-thread:thread-alive-p worker)) "Fixture cleanup joins its only worker."))))))
+     :owned-p nil :large-p nil))
+  nil)
+
+
+;;;; -- Terminal Matrix Integration --
+
+(-> compaction-terminal-test--sse (string boolean) stream)
+(defun compaction-terminal-test--sse (code output-p)
+  "Return a real response parser input with an optional generated prefix."
+  (make-instance
+   'test-character-input-stream
+   :source (concatenate 'string
+                        (test-sse-event-string
+                         (json-object "type" "response.created" "response" (json-object "id" "terminal-matrix")))
+                        (if output-p
+                            (test-sse-event-string (json-object "type" "response.output_text.delta" "delta" "partial"))
+                            "")
+                        (test-sse-event-string
+                         (json-object "type" "response.failed"
+                                      "response" (json-object "error" (json-object "code" code "message" "Rejected.")))))))
+
+(-> compaction-terminal-test--restored-call (model-provider conversation configuration &key (:event-callback function)) *)
+(defun compaction-terminal-test--restored-call (provider conversation configuration &key event-callback)
+  "Claim retired numeric history through actual streaming dispatch and terminal ownership."
+  (let* ((goal                             (list :restored-parser))
+         (operation                        (make-provider-operation :conversation conversation :goal goal :epoch 0))
+         (owner                            (make-provider-operation-owner :operation operation))
+         (state                            (make-provider-connection-recovery))
+         (deadline                         (+ 60 (/ (get-internal-real-time) internal-time-units-per-second)))
+         (*provider-suspended-connections* (make-hash-table :test 'eq))
+         (first-p                          t))
+    (setf (provider-operation-owner-scope operation) owner
+          (provider-connection-recovery-owner state) goal
+          (provider-connection-recovery-owner-generation state) 0
+          (provider-connection-recovery-attempt state) 3
+          (provider-connection-recovery-deadline state) deadline)
+    (let ((*provider-connection-operation* operation))
+      (provider--remember-suspension conversation state configuration))
+    (unwind-protect
+         (provider-call-with-operation-owner
+          owner (lambda ()
+                  (let ((*provider-connection-operation* operation)
+                        (*provider-connection-owner*     goal))
+                    (provider-stream-turn
+                     provider conversation :tool-namespaces #()
+                     :event-callback
+                     (lambda (event)
+                       (when (and first-p (typep event 'provider-connection-event))
+                         (setf first-p nil)
+                         (test-assert (= 4 (getf (provider-connection-event-details event) :attempt))
+                                      "Restored dispatch increments the existing attempt instead of resetting it.")
+                         (let ((current (find goal *provider-connection-episodes* :key #'provider-connection-recovery-owner)))
+                           (test-assert current "The restored episode has its exact operation owner.")
+                           (when current
+                             (test-assert (= deadline (provider-connection-recovery-deadline current))
+                                          "The earlier caller deadline is preserved, not renewed."))))
+                       (funcall event-callback event))))))
+      (test-assert (eq :disposed (provider-operation-state operation)) "Terminal parser unwind disposes its exact operation.")
+      (test-assert (zerop (hash-table-count *provider-suspended-connections*)) "Terminal parser unwind retains no suspended history."))))
+
+(-> test-compaction-terminal-sse-aliases () null)
+(defun test-compaction-terminal-sse-aliases ()
+  "Normalize real SSE aliases after opening recovery, with and without partial output."
+  (let ((persistent '("service_unavailable_error" "overloaded_error" "rate_limit_error"))
+        (bounded    '("server_error" "internal_server_error" "server_is_overloaded" "slow_down"
+                      "rate_limit_exceeded" "DEADLINE_EXCEEDED" "INTERNAL" "RESOURCE_EXHAUSTED" "UNAVAILABLE"
+                      "SERVICE_UNAVAILABLE_ERROR" "OVERLOADED_ERROR" "RATE_LIMIT_ERROR"))
+        (terminal   '("authentication_error" "permission_denied" "invalid_argument" "not_found"
+                      "unsupported_model" "context_length_exceeded" "invalid_prompt")))
+    (dolist (code (append persistent bounded terminal))
+      (dolist (output-p '(nil t))
+        (with-test-configuration (configuration)
+          (let* ((conversation                         (conversation-create configuration))
+                 (provider                             (provider-tests--transport-provider
+                                                        configuration
+                                                        (list :syscall (compaction-terminal-test--sse code output-p)
+                                                              (list "Final bad request." 400 nil))))
+                 (*provider-maximum-transient-retries* 0)
+                 (waits 0) (failure nil) (events nil)
+                 (*bounded-retry-sleep-function*       (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+            (credential-source-save (credential-manager-primary-source (provider-credential-manager provider))
+                                    (provider-tests--credentials configuration))
+            (handler-case
+                (compaction-terminal-test--restored-call provider conversation configuration
+                                                         :event-callback (lambda (event) (push event events)))
+              (error (condition) (setf failure condition)))
+            (let* ((persistent-p (and (not output-p) (member code persistent :test #'string=)))
+                   (failures     (remove-if-not (lambda (event) (typep event 'provider-attempt-failed-event)) events))
+                   (normalized   (find code (mapcar #'provider-attempt-failed-event-condition failures)
+                                       :test #'equal :key #'provider-error-code)))
+              (format t "~&TERMINAL-SSE code=~S output=~S attempts=~D waits=~D failure=~S normalized=~S~%"
+                      code output-p (test-transport-provider-attempt-count provider) waits
+                      (type-of failure) (and normalized (provider-error-code normalized)))
+              (test-assert (= (test-transport-provider-attempt-count provider) (if persistent-p 3 2))
+                           "Only the three exact pre-generation aliases can persist beyond the bounded ladder.")
+              (test-assert (= waits (if persistent-p 2 1)) "Semantic terminal and generated failures add no persistent wait.")
+              (test-assert normalized "The real parser publishes its normalized failure.")
+              (when normalized
+                (test-assert (equal code (provider-error-code normalized)) "The exact SSE alias is preserved."))
+              (test-assert (typep failure 'provider-error) "The actual failure propagates out of the real provider entry.")
+              (when (member code terminal :test #'string=)
+                (test-assert (not (typep failure 'provider-retryable-error)) "Semantic SSE rejection is terminal.")
+                (test-assert (equal code (provider-error-code failure)) "Terminal propagation retains the semantic code."))
+              (when persistent-p
+                (test-assert (= 400 (provider-error-status failure)) "The finite next semantic response terminates persistent recovery."))
+              (test-assert (null *provider-connection-episodes*) "Every parser failure ends and removes its episode.")))))))
+  nil)
+
+(-> test-compaction-restored-terminal-disposal () null)
+(defun test-compaction-restored-terminal-disposal ()
+  "Retain restored route and counters until exact semantic failure disposes its operation."
+  (dolist (status '(400 401 403 404 405 429 501))
+    (route-tests--call-with-runtime
+     (lambda (provider conversation configuration)
+       (let* ((goal                             (list :restored-terminal status))
+              (operation                        (make-provider-operation :conversation conversation :goal goal :epoch 0))
+              (owner                            (make-provider-operation-owner :operation operation))
+              (*provider-suspended-connections* (make-hash-table :test 'eq))
+              (state                            (make-provider-connection-recovery))
+              (expected                         (make-condition 'provider-error :status status :code "terminal-restored" :message "Rejected."))
+              (deadline                         (+ 60 (/ (get-internal-real-time) internal-time-units-per-second)))
+              (routes nil) (events nil) (failure nil))
+         (setf (provider-operation-owner-scope operation) owner
+               (provider-connection-recovery-owner state) goal
+               (provider-connection-recovery-owner-generation state) 0
+               (provider-connection-recovery-attempt state) 3
+               (provider-connection-recovery-route-index state) 1
+               (provider-connection-recovery-deadline state) deadline)
+         (let ((*provider-connection-operation* operation))
+           (provider--remember-suspension conversation state configuration))
+         (test-call-with-function-replacements
+          (list (list 'cl-llm-provider-api::provider-execute-request
+                      (lambda (adapter request &rest arguments)
+                        (declare (ignore request arguments))
+                        (push (provider-account-label adapter) routes)
+                        (error expected))))
+          (lambda ()
+            (handler-case
+                (provider-call-with-operation-owner
+                 owner (lambda ()
+                         (let ((*provider-connection-operation* operation)
+                               (*provider-connection-owner*     goal))
+                           (provider-stream-turn provider conversation :tool-namespaces #()
+                                                                      :event-callback   (lambda (event) (push event events))))))
+              (error (condition) (setf failure condition)))))
+         (test-assert (eq expected failure) "The restored invocation propagates the identical terminal condition.")
+         (test-assert (equal routes '("runtime-b")) "Only the explicitly restored fallback route dispatches once.")
+         (test-assert (equal (provider-tests--connection-phases events) '(:attempting :terminated))
+                      "No wait or extra route rotation follows terminal rejection.")
+         (test-assert (eq :disposed (provider-operation-state operation)) "The exact terminal owner disposes its operation.")
+         (test-assert (zerop (hash-table-count *provider-suspended-connections*)) "The restored history is consumed and removed.")
+         (test-assert (null *provider-connection-episodes*) "The restored episode is removed.")))))
+  nil)
+
+(-> test-compaction-staged-terminal-native () null)
+(defun test-compaction-staged-terminal-native ()
+  "Abort real native compaction after a successful encrypted-history admission stage."
+  (dolist (status '(400 401 403 429 200))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "5000") ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "256"))
+        (let* ((configuration (application-configuration application))
+               (conversation  (application-conversation application))
+               (state         (make-compaction-recovery))
+               (posts 0) (dispatches 0) (failure nil) (refusals nil)
+               (body          (if (= status 429)
+                                  (json-encode (json-object "error" (json-object "type" "usage_limit_reached")))
+                                  (if (= status 400)
+                                      (json-encode (json-object "error" (json-object "code" "context_length_exceeded")))
+                                      "{}"))))
+          (conversation-append-provider-item
+           conversation (json-object "type" "reasoning" "id" "stage-old" "encrypted_content"
+                                     (make-string 60000 :initial-element #\e)))
+          (conversation-append-user-message conversation "latest request")
+          (compaction-recovery-test-small-context
+           (lambda ()
+             (test-call-with-function-replacements
+              (list (list 'credential-manager-credentials
+                          (lambda (&rest arguments) (declare (ignore arguments))
+                            (provider-tests--credentials configuration)))
+                    (list 'credential-manager-refreshable-p (lambda (manager) (declare (ignore manager)) nil))
+                    (list 'provider-compaction-recovery-window (lambda (adapter) (declare (ignore adapter)) nil))
+                    (list 'dexador:post
+                          (lambda (endpoint &rest arguments)
+                            (declare (ignore endpoint arguments))
+                            (incf posts)
+                            (values body status nil))))
+              (lambda ()
+                (handler-case
+                    (handler-bind ((provider-context-budget-error (lambda (condition) (push condition refusals))))
+                      (compaction-recovery-call
+                       state provider conversation :native-p t
+                       :preflight                            (lambda (view)
+                                                               (provider-check-request-context
+                                                                provider (provider-native-compaction-request-object provider view #())))
+                       :dispatch                             (lambda (view)
+                                                               (incf dispatches)
+                                                               (handler-bind ((provider-context-budget-error (lambda (condition) (push condition refusals))))
+                                                                 (provider-native-compact-conversation provider view :tool-namespaces #()
+                                                                                                                    :event-callback   #'identity)))))
+                  (error (condition) (setf failure condition)))))))
+          (format t "~&STAGED-TERMINAL status=~D posts=~D dispatches=~D refusals=~D tier=~D type=~S~%"
+                  status posts dispatches (length refusals) (compaction-recovery-tier state) (type-of failure))
+          (test-assert (plusp (length refusals)) "The original native request really refuses before dispatch.")
+          (test-assert (= 1 posts) "Exactly one admitted native POST follows the successful staged preflight.")
+          (test-assert (= 2 dispatches) "The refused original and admitted reduced request are the only dispatch entries.")
+          (test-assert (= 1 (compaction-recovery-tier state)) "Semantic terminal failure does not authorize another recovery tier.")
+          (test-assert (typep failure (if (= status 401) 'provider--authentication-failure 'provider-error))
+                       "The actual native semantic or invalid-response condition escapes staged recovery.")
+          (unless (= status 200)
+            (test-assert (= status (provider-error-status failure)) "The normalized terminal HTTP status survives staging."))
+          (test-assert (null (expanded-native-input-snapshots provider)) "No portable summary follows terminal native failure.")
+          (test-assert (test-object-contains-string-p (conversation-input-items conversation) "stage-old")
+                       "Failed detached staging does not publish its reduced projection.")
+          (test-assert (null *provider-connection-episodes*) "Terminal staged failure removes its episode."))))
+     :owned-p nil :large-p nil))
+  nil)
+
+(-> test-expanded-native-auth-exhaustion-after-recovery () null)
+(defun test-expanded-native-auth-exhaustion-after-recovery ()
+  "Bound real native authentication refresh after genuine opening recovery."
+  (dolist (signaled-p '(nil t))
+    (dolist (body '("" "Denied."))
+      (expanded-native-test--fixture
+       (lambda (application provider)
+         (let* ((configuration                        (application-configuration application))
+                (*provider-maximum-transient-retries* 0)
+                (posts 0) (waits 0) (refreshes nil) (failure nil)
+                (*bounded-retry-sleep-function*       (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+           (test-call-with-function-replacements
+            (list (list 'credential-manager-credentials
+                        (lambda (manager &key force-refresh)
+                          (declare (ignore manager))
+                          (push force-refresh refreshes)
+                          (provider-tests--credentials configuration)))
+                  (list 'credential-manager-refreshable-p (lambda (manager) (declare (ignore manager)) t))
+                  (list 'dexador:post
+                        (lambda (endpoint &rest arguments)
+                          (declare (ignore arguments))
+                          (incf posts)
+                          (test-assert (<= posts 3) "Authentication exhaustion cannot dispatch a fourth response.")
+                          (when (> posts 3) (error "Authentication script exhausted."))
+                          (let ((status (if (= posts 1) 503 401)))
+                            (if signaled-p
+                                (error 'http-request-failed :status status :body body :headers nil :uri endpoint)
+                                (values body status nil))))))
+            (lambda ()
+              (handler-case
+                  (provider-native-compact-conversation provider (application-conversation application)
+                                                       :tool-namespaces #() :event-callback #'identity)
+                (error (condition) (setf failure condition)))))
+           (format t "~&AUTH-RECOVERY signaled=~S body=~S posts=~D waits=~D refresh=~S type=~S~%"
+                   signaled-p body posts waits (reverse refreshes) (type-of failure))
+           (test-assert (= 3 posts) "One transient and exactly two unauthorized responses are dispatched.")
+           (test-assert (= 1 waits) "Only the opening transient waits; authentication exhaustion never persists.")
+           (test-assert (equal (reverse refreshes) '(nil nil t)) "Exactly the final rejection uses forced refresh.")
+           (test-assert (typep failure 'provider--authentication-failure) "The exact final authentication class escapes.")
+           (test-assert (= 401 (provider-error-status failure)) "Authentication status survives the normalized final condition.")
+           (test-assert (null *provider-connection-episodes*) "Exhaustion ends its exact recovery episode.")
+           (test-assert (null (expanded-native-input-snapshots provider)) "Authentication rejection cannot trigger portable fallback.")))
+       :owned-p nil :large-p nil)))
+  nil)
+
+(-> test-compaction-terminal-protocol-after-recovery () null)
+(defun test-compaction-terminal-protocol-after-recovery ()
+  "End recovered requests on real incomplete protocol and permanent opening failures."
+  (dolist (entry '(("content_filter" provider-incomplete-response "response_incomplete")
+                   ("max_output_tokens" cl-llm-provider-api::provider-truncated-response "response_incomplete")
+                   ("length" provider-protocol-error "invalid_finish_reason")
+                   ("max_tokens" provider-protocol-error "invalid_finish_reason")
+                   (:missing provider-protocol-error "invalid_terminal_response")
+                   (:dns provider-opening-rejected nil)
+                   (:tls provider-error nil)))
+    (dolist (output-p '(nil t))
+      (with-test-configuration (configuration)
+        (let* ((conversation (conversation-create configuration))
+               (kind         (first entry))
+               (outcome      (case kind
+                               (:dns
+                                (make-condition 'sb-bsd-sockets:name-service-error
+                                                :errno sb-bsd-sockets-internal::eai-noname :syscall "getaddrinfo"))
+                               (:tls
+                                :tls)
+                               (otherwise
+                                (make-instance
+                                 'test-character-input-stream
+                                 :source (concatenate
+                                          'string
+                                          (if output-p
+                                              (test-sse-event-string (json-object "type" "response.output_text.delta" "delta" "partial"))
+                                              "")
+                                          (test-sse-event-string
+                                           (if (eq kind :missing)
+                                               (json-object "type" "response.incomplete")
+                                               (json-object "type" "response.incomplete"
+                                                            "response" (json-object "id" "incomplete-matrix"
+                                                                                    "incomplete_details" (json-object "reason" kind))))))))))
+               (provider     (provider-tests--transport-provider configuration (list :syscall outcome)))
+               (waits 0) (events nil) (failure nil))
+          (credential-source-save (credential-manager-primary-source (provider-credential-manager provider))
+                                  (provider-tests--credentials configuration))
+          (let ((*provider-maximum-transient-retries* 0)
+                (*bounded-retry-sleep-function*       (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+            (handler-case
+                (provider-stream-turn provider conversation :tool-namespaces #()
+                                                           :event-callback   (lambda (event) (push event events)))
+              (error (condition) (setf failure condition))))
+          (format t "~&TERMINAL-PROTOCOL kind=~S output=~S attempts=~D waits=~D type=~S code=~S~%"
+                  kind output-p (test-transport-provider-attempt-count provider) waits (type-of failure)
+                  (and (typep failure 'provider-error) (provider-error-code failure)))
+          (test-assert (= 2 (test-transport-provider-attempt-count provider)) "A terminal parser or permanent opening failure never redispatches.")
+          (test-assert (= 1 waits) "Only the genuine opening instability enters recovery wait.")
+          (test-assert (typep failure (second entry)) "The normalized terminal class propagates unchanged.")
+          (when (third entry)
+            (test-assert (equal (third entry) (provider-error-code failure)) "The exact normalized protocol code survives."))
+          (when (equal kind "max_output_tokens")
+            (test-assert (cl-llm-provider-api::provider-retryable-error-generation-started-p failure)
+                         "Token exhaustion marks generation even without visible output."))
+          (test-assert (null *provider-connection-episodes*) "Protocol and permanent opening failures remove their episodes.")))))
+  nil)
+
+(-> test-compaction-terminal-observer-unwind () null)
+(defun test-compaction-terminal-observer-unwind ()
+  "Preserve arbitrary observer errors at waiting and terminated publication boundaries."
+  (dolist (phase '(:waiting :terminated))
+    (with-test-configuration (configuration)
+      (let* ((conversation (conversation-create configuration))
+             (provider     (provider-tests--transport-provider
+                            configuration (if (eq phase :waiting) (list :syscall) (list (list "Rejected." 400 nil)))))
+             (expected     (make-condition 'simple-error :format-control "Observer failed." :format-arguments nil))
+             (failure      nil))
+        (credential-source-save (credential-manager-primary-source (provider-credential-manager provider))
+                                (provider-tests--credentials configuration))
+        (handler-case
+            (provider-stream-turn
+             provider conversation :tool-namespaces #()
+             :event-callback                        (lambda (event)
+                                                      (when (and (typep event 'provider-connection-event)
+                                                                 (eq phase (getf (provider-connection-event-details event) :phase)))
+                                                        (error expected))))
+          (error (condition) (setf failure condition)))
+        (test-assert (eq expected failure) "The original observer failure, not a provider wrapper, reaches the caller.")
+        (test-assert (= 1 (test-transport-provider-attempt-count provider)) "Observer failure cannot trigger another transport dispatch.")
+        (test-assert (null *provider-connection-episodes*) "Observer failure still ends and removes the episode."))))
+  nil)
+
+(-> test-compaction-restored-terminal-http () null)
+(defun test-compaction-restored-terminal-http ()
+  "Classify restored semantic HTTP statuses and Codex transport-failure allowance aliases."
+  (dolist (entry '((400 nil nil) (403 nil nil) (404 nil nil) (401 nil nil)
+                   (429 "type" "usage_limit_reached") (429 "type" "usage_not_included")
+                   (429 "type" "insufficient_quota") (429 "code" "insufficient_quota")
+                   (429 "code" "credit_balance_exhausted") (429 "code" "organization_spend_limit_exceeded")
+                   (429 "code" "project_spend_limit_exceeded") (429 "code" "organization_usage_limit_exceeded")))
+    ;; Codex allowance normalization is at the signaled transport-failure boundary.
+    ;; Returned statuses from this generic test opener bypass that host hook.
+    (dolist (signaled-p (if (= 429 (first entry)) '(t) '(nil t)))
+      (with-test-configuration (configuration)
+        (let* ((conversation                         (conversation-create configuration))
+               (status                               (first entry))
+               (body                                 (if (second entry)
+                                                         (format nil "{\"error\":{~S:~S}}" (second entry) (third entry))
+                                                         "Rejected."))
+               (terminal                             (if signaled-p
+                                                         (make-condition 'http-request-failed :status status :body body :headers nil :uri "https://fixture.invalid/")
+                                                         (list body status nil)))
+               (provider                             (provider-tests--transport-provider configuration (list :syscall terminal)))
+               (failure nil) (waits 0)
+               (*provider-maximum-transient-retries* 0)
+               (*bounded-retry-sleep-function*       (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+          (credential-source-save (credential-manager-primary-source (provider-credential-manager provider))
+                                  (provider-tests--credentials configuration))
+          (test-call-with-function-replacements
+           (list (list 'credential-manager-refreshable-p (lambda (manager) (declare (ignore manager)) nil)))
+           (lambda ()
+             (handler-case
+                (compaction-terminal-test--restored-call provider conversation configuration :event-callback #'identity)
+               (error (condition) (setf failure condition)))))
+          (format t "~&RESTORED-HTTP status=~D field=~S alias=~S signaled=~S attempts=~D waits=~D type=~S~%"
+                  status (second entry) (third entry) signaled-p
+                  (test-transport-provider-attempt-count provider) waits (type-of failure))
+          (test-assert (= 2 (test-transport-provider-attempt-count provider)) "Recovered restored HTTP rejection stops exactly the next dispatch.")
+          (test-assert (= 1 waits) "Only the genuine opening failure waits.")
+          (test-assert (typep failure (if (= status 401) 'provider--authentication-failure 'provider-error))
+                       "The exact authentication or semantic terminal root reaches the caller.")
+          (test-assert (not (typep failure 'provider-retryable-error)) "Terminal quota and semantic rejection never enter persistent recovery.")
+          (when (or (typep failure 'provider-error) (typep failure 'provider--authentication-failure))
+            (test-assert (= status (provider-error-status failure)) "The terminal status is preserved."))
+          (when (= status 401)
+            (test-assert (typep failure 'provider--authentication-failure) "HTTP authentication retains the final auth class."))
+          (test-assert (null *provider-connection-episodes*) "Terminal HTTP rejection removes the restored episode.")))))
+  nil)
+
+(-> test-compaction-restored-returned-codex-quota () null)
+(defun test-compaction-restored-returned-codex-quota ()
+  "Classify returned allowance bodies through the real Codex HTTP opener after restored recovery."
+  (dolist (entry '(("type" "usage_limit_reached") ("type" "usage_not_included")
+                   ("type" "insufficient_quota") ("code" "insufficient_quota")
+                   ("code" "credit_balance_exhausted") ("code" "organization_spend_limit_exceeded")
+                   ("code" "project_spend_limit_exceeded") ("code" "organization_usage_limit_exceeded")))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (let* ((configuration                        (application-configuration application))
+              (provider                             (make-instance 'codex-subscription-provider :configuration configuration
+                                                                                           :credential-manager (provider-credential-manager provider)))
+              (conversation                         (application-conversation application))
+              (posts 0) (waits 0) (failure nil)
+              (*provider-maximum-transient-retries* 0)
+              (*bounded-retry-sleep-function*       (lambda (seconds) (declare (ignore seconds)) (incf waits))))
+         (test-call-with-function-replacements
+          (list (list 'credential-manager-credentials
+                      (lambda (&rest arguments) (declare (ignore arguments)) (provider-tests--credentials configuration)))
+                (list 'credential-manager-refreshable-p (lambda (manager) (declare (ignore manager)) nil))
+                (list 'dexador:post
+                      (lambda (endpoint &rest arguments)
+                        (declare (ignore endpoint arguments))
+                        (incf posts)
+                        (when (> posts 2) (error "Returned quota script exhausted."))
+                        (if (= posts 1)
+                            (values "Transient pressure." 503 nil)
+                            (values (format nil "{\"error\":{~S:~S}}" (first entry) (second entry)) 429 nil)))))
+          (lambda ()
+            (handler-case
+                (compaction-terminal-test--restored-call provider conversation configuration :event-callback #'identity)
+              (error (condition) (setf failure condition)))))
+         (format t "~&RETURNED-QUOTA alias=~S posts=~D waits=~D failure=~S~%" entry posts waits failure)
+         (test-assert (= posts 2) "The restored call stops at the returned quota body without fallback.")
+         (test-assert (= waits 1) "Only the genuine opening failure waits.")
+         (test-assert (typep failure 'provider-error) "The host normalizes the returned allowance body.")
+         (test-assert (not (typep failure 'provider-retryable-error)) "Allowance exhaustion is terminal.")
+         (when (typep failure 'provider-error)
+           (test-assert (eql 429 (provider-error-status failure)) "Allowance status is preserved."))
+         (test-assert (null *provider-connection-episodes*) "The exact restored episode is removed.")))))
   nil)

@@ -1582,6 +1582,8 @@ work must steer the running turn, not queue as follow-up work."
   "Cancel the mission and install GOAL after the mission's final notices."
   (let ((previous (and (mission-goal-p (application-goal application))
                        (mission-context-find (application-conversation application)))))
+    (when (application-goal application)
+      (provider-cancel-connection-owner (application-goal application)))
     (mission-detach application)
     (flet ((install ()
              (setf (application-goal application) goal)
@@ -1627,6 +1629,7 @@ NIL and :STATUS show the goal. :UPDATE takes one string objective; :PAUSE,
            (progn
              (setf (getf (application-goal application) :status) ':paused)
              (application--record-goal application)
+             (provider-cancel-connection-owner goal)
              (application-present application "The session goal is paused."))
            (application-present application "No active goal to pause.")))
       ((eq request ':resume)

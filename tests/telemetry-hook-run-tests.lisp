@@ -414,7 +414,9 @@
                     `(let* ((*model-catalog-fetch-function* (lambda (run) (declare (ignore run)) nil))
                             (configuration
                               (make-configuration
-                               ,@(loop for key in '(:source-root :working-directory :config-root :data-root :state-root :cache-root)
+                               ;; Keep this run's matching core for the nested ordinary worker.
+                               ,@(loop for key in '(:source-root :working-directory :config-root :data-root
+                                                    :state-root :cache-root :active-image-core)
                                        append (list key (config key configuration))))))
                        (telemetry-shutdown)
                        (unless (and (null (uiop:getenv "AUTOLITH_TRACEPARENT"))
@@ -462,7 +464,8 @@
              (unwind-protect
                   (let* ((*package* (find-package '#:cl-user))
                          (response  (lisp-worker-request worker ':eval (list :forms (list (write-to-string form :readably t))))))
-                    (test-assert (eq (getf (rest response) :status) ':ok) "A fresh worker exports its process root.")
+                    (test-assert (eq (getf (rest response) :status) ':ok)
+                                 (format nil "A fresh worker exports its process root: ~S" response))
                     (push (first (test-telemetry-hooks--kind (uiop:read-file-string output) "run")) roots))
                (lisp-worker-stop worker)))
            (when (zerop index)

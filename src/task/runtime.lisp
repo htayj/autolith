@@ -503,6 +503,12 @@ under the progress lock before releasing it to other threads."
         (now      (get-internal-real-time)))
     (with-lock-held ((task-progress-lock progress))
       (case status
+        (:provider-connection
+         (setf (task-progress-provider-connections progress)
+               (remove (getf details :episode) (task-progress-provider-connections progress)
+                       :test #'equal :key (lambda (entry) (getf entry :episode))))
+         (unless (member (getf details :phase) '(:completed :cancelled :terminated :suspended))
+           (push (copy-list details) (task-progress-provider-connections progress))))
         (:provider-request-started
          (setf (task-progress-request-count progress)
                (or (getf details :request-number)
@@ -534,6 +540,8 @@ under the progress lock before releasing it to other threads."
                    :success-p       (and (getf details :success-p) t)
                    :current-tool    (task-progress-current-tool progress)
                    :request-count   (task-progress-request-count progress))
+             (when (eq status :provider-connection)
+               (list :provider-connection (copy-list details)))
              (when (eq status :provider-request-completed)
                (task-progress--event-usage (getf details :usage))))))
     (when (member status '(:provider-request-started :provider-request-completed
@@ -756,10 +764,11 @@ handed rather than storing a second copy."
     (let ((progress (task-job-progress job)))
       (with-lock-held ((task-progress-lock progress))
         (let ((now (or ended-at (get-internal-real-time))))
-          (list :id            (job-identifier job)
-                :agent         agent-name
-                :status        (task-progress-status progress)
-                :current-tool  (task-progress-current-tool progress)
+          (list :id                   (job-identifier job)
+                :agent                agent-name
+                :status               (task-progress-status progress)
+                :provider-connections (copy-tree (task-progress-provider-connections progress))
+                :current-tool         (task-progress-current-tool progress)
                 :current-tool-duration-ms
                 (and (task-progress-current-tool-started-at progress)
                      (task--milliseconds-between
@@ -767,9 +776,9 @@ handed rather than storing a second copy."
                       now))
                 :recent-tools
                 (coerce (deque->vector (task-progress-recent-tools progress)) 'list)
-                :recent-output (copy-seq (task-progress-output-tail progress))
-                :request-count (task-progress-request-count progress)
-                :usage         (task-progress--usage-summary (task-progress-usage progress))
+                :recent-output        (copy-seq (task-progress-output-tail progress))
+                :request-count        (task-progress-request-count progress)
+                :usage                (task-progress--usage-summary (task-progress-usage progress))
                 :duration-ms
                 (and (task-progress-started-at progress)
                      (task--milliseconds-between
@@ -891,14 +900,15 @@ values from either side of a terminal transition."
       (let ((progress (task-job-progress job)))
         (with-lock-held ((task-progress-lock progress))
           (let ((now (get-internal-real-time)))
-            (list :id            (session-job-identifier job)
-                  :type          ':task
-                  :index         (session-job-order job)
-                  :agent         (task-job-agent-name job)
-                  :state         state
+            (list :id                   (session-job-identifier job)
+                  :type                 ':task
+                  :index                (session-job-order job)
+                  :agent                (task-job-agent-name job)
+                  :state                state
                   :pending-prompt-count
                   (task-job-steering-pending-count job)
-                  :current-tool  (task-progress-current-tool progress)
+                  :provider-connections (copy-tree (task-progress-provider-connections progress))
+                  :current-tool         (task-progress-current-tool progress)
                   :current-tool-duration-ms
                   (and (task-progress-current-tool-started-at progress)
                        (task--milliseconds-between
@@ -906,7 +916,7 @@ values from either side of a terminal transition."
                         now))
                   :recent-tools
                   (coerce (deque->vector (task-progress-recent-tools progress)) 'list)
-                  :request-count (task-progress-request-count progress)
+                  :request-count        (task-progress-request-count progress)
                   :duration-ms
                   (and (task-progress-started-at progress)
                        (task--milliseconds-between
@@ -916,7 +926,7 @@ values from either side of a terminal transition."
                   (bounded-string
                    (getf (task-job-item job) :task)
                    :limit *task-retained-assignment-limit*)
-                  :detached      (task-job-detached-p job))))))))
+                  :detached             (task-job-detached-p job))))))))
 
 (defmethod tool-execution-activity-callback ((runtime task-orchestrator))
   "Capture the executing job so nested workers report to the same owner."

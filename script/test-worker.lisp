@@ -64,6 +64,26 @@
       (format *error-output* "~&Live threads after cases: ~{~A~^, ~}~%"
               (mapcar #'sb-thread:thread-name others)))))
 
+(defun test-worker--capture-stack (seconds record completed)
+  "Capture one diagnostic without unwinding the interrupted test."
+  ;; Keep nested interrupts pending only inside this diagnostic callback. Otherwise
+  ;; a cancellation delivered while printing could be mistaken for a dump error.
+  ;; No test body or output-stream write runs inside this region.
+  (sb-sys:without-interrupts
+    (handler-case
+        (setf (aref record 2)
+              (with-output-to-string (stream)
+                (setf (aref record 0) :heading)
+                (format stream "~&Worker thread ~S after ~D seconds:~%"
+                        (sb-thread:thread-name sb-thread:*current-thread*) seconds)
+                (setf (aref record 0) :backtrace)
+                (sb-debug:print-backtrace :count 60 :stream stream)))
+      (error (condition)
+        ;; Do not print this condition or attempt a recursive backtrace here.
+        (setf (aref record 1) (type-of condition))))
+    (setf (aref record 3) t)
+    (sb-thread:signal-semaphore completed)))
+
 (defun test-worker--start-stack-watchdog ()
   "Print live Lisp thread stacks after AUTOLITH_TEST_STACK_AFTER seconds."
   (let ((value (uiop:getenv "AUTOLITH_TEST_STACK_AFTER")))
@@ -77,20 +97,34 @@
         (sb-thread:make-thread
          (lambda ()
            (sleep seconds)
-           (dolist (thread (sb-thread:list-all-threads))
-             (unless (eq thread sb-thread:*current-thread*)
-               (handler-case
-                   (sb-thread:interrupt-thread
-                    thread
-                    (lambda ()
-                      (let ((dump
-                              (with-output-to-string (stream)
-                                (format stream "~&Worker thread ~S after ~D seconds:~%"
-                                        (sb-thread:thread-name sb-thread:*current-thread*) seconds)
-                                (sb-debug:print-backtrace :count 60 :stream stream))))
-                        (write-string dump output)
-                        (finish-output output))))
-                 (error () nil)))))
+           (let ((completed (sb-thread:make-semaphore))
+                 (records   nil))
+             (dolist (thread (sb-thread:list-all-threads))
+               (unless (eq thread sb-thread:*current-thread*)
+                 (let ((record (vector :scheduled nil nil nil)))
+                   (push (cons thread record) records)
+                   (handler-case
+                       (sb-thread:interrupt-thread
+                        thread (lambda ()
+                                 (test-worker--capture-stack seconds record completed)))
+                     (error (condition)
+                       (setf (aref record 0) :scheduling
+                             (aref record 1) (type-of condition)
+                             (aref record 3) t)
+                       (sb-thread:signal-semaphore completed))))))
+             (dotimes (index (length records))
+               (declare (ignore index))
+               (sb-thread:wait-on-semaphore completed)
+               (dolist (entry records)
+                 (let ((record (rest entry)))
+                   (when (aref record 3)
+                     (setf (aref record 3) nil)
+                     (if (aref record 1)
+                         (format output "~&Stack diagnostic failed for ~S during ~S: ~S~%"
+                                 (sb-thread:thread-name (first entry))
+                                 (aref record 0) (aref record 1))
+                         (write-string (aref record 2) output))
+                     (finish-output output)))))))
          :name "test worker stack watchdog")))))
 
 (defun test-worker-main (arguments source-root &key preloaded-p)

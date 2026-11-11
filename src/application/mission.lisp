@@ -327,17 +327,135 @@ preserving the calling thread's provider bindings and authorization callbacks."
         (or (mission-context-find agent) context)
         context)))
 
+(-> mission-call-with-provider-operation
+    (conversation function &key (:owner (option provider-operation-owner)) (:operation (option provider-operation)) (:configuration (option configuration))) *)
+(defun mission-call-with-provider-operation (conversation function &key owner operation configuration)
+  "Own one ordinary request with exact identity, cancellation and caller lifetime."
+  (let* ((context                         (let ((candidate (mission--conversation-context conversation)))
+                                            (when (and candidate (mission--request-owned-p candidate conversation))
+                                              candidate)))
+         (goal                            (if (and context (mission--request-owned-p context conversation))
+                                              (mission-context-goal context)
+                                              (or *provider-connection-owner* conversation)))
+         (identity                        (or operation (make-provider-operation)))
+         (epoch                           (provider--connection-owner-generation goal))
+         (caller-check                    *provider-connection-owner-check*)
+         (*provider-connection-owner*     goal)
+         (*provider-connection-operation* identity)
+         (*provider-connection-owner-check*
+           (lambda ()
+             (multiple-value-prog1
+                 (when caller-check (funcall caller-check))
+               (unless (and (= epoch (provider--connection-owner-generation goal))
+                            (or (null context)
+                                (and (eq goal (application-goal (mission-context-application context)))
+                                     (or (eq (getf goal :status) ':active)
+                                         (mission--operation-draining-p context *mission-admitted-operation*)))))
+                 (error 'provider-owner-ended :message "The ordinary operation no longer owns this request.")))))
+         (transferred-p                   nil))
+    (when owner
+      (with-lock-held (*provider-connection-episodes-lock*)
+        (unless (provider-operation-owner-active-p owner)
+          (error 'provider-operation-refused :message "The outer provider work scope is not established."))
+        (unless (or (eq owner (provider-operation-owner-scope identity))
+                    (and (null (provider-operation-owner-scope identity))
+                         (eq (provider-operation-state identity) ':new)))
+          (error 'provider-operation-refused :message "Another work scope owns this provider operation."))
+        (let ((previous (provider-operation-owner-operation owner)))
+          (unless (or (null previous) (eq previous identity)
+                      (eq (provider-operation-state previous) ':disposed))
+            (error 'provider-operation-refused :message "This work already owns another provider operation."))
+          (setf (provider-operation-owner-operation owner) identity
+                (provider-operation-owner-scope identity) owner))))
+    (funcall *provider-connection-owner-check*)
+    (if (eq (provider-operation-state identity) ':new)
+        (setf (provider-operation-conversation identity) conversation
+              (provider-operation-goal identity) goal
+              (provider-operation-epoch identity) epoch
+              (provider-operation-deadline identity) (provider--caller-deadline))
+        (unless (and owner
+                     (eq conversation (provider-operation-conversation identity))
+                     (eq goal (provider-operation-goal identity))
+                     (= epoch (provider-operation-epoch identity))
+                     (provider-operation-resumable-p identity conversation
+                                                     (if context
+                                                         (application-configuration (mission-context-application context))
+                                                         configuration)))
+          (error 'provider-operation-refused :message "The explicit provider resume is not eligible.")))
+    (with-lock-held (*provider-connection-episodes-lock*)
+      (when (or (provider-operation-busy-p identity)
+                (eq (provider-operation-state identity) ':disposed))
+        (error 'provider-operation-refused :message "Another consumer already claimed this operation."))
+      (setf (provider-operation-busy-p identity) t))
+    (unwind-protect
+         (handler-case (funcall function)
+           (mission-error (condition)
+             ;; Accounting has unwound. Only an explicit outer owner may retain
+             ;; numeric retry history; no evaluator or automatic grant is invoked.
+             (unless (and owner context (eq (mission-error-reason condition) ':operation-timeout)
+                          (provider-operation-resumable-p identity conversation
+                                                          (application-configuration (mission-context-application context))))
+               (error condition))
+             (with-lock-held (*provider-connection-episodes-lock*)
+               (setf (provider-operation-state identity) :transferred
+                     (provider-operation-busy-p identity) nil
+                     transferred-p t))
+             (error 'provider-operation-transfer :owner owner :operation identity
+                    :message "The owning work must explicitly resume the interrupted request.")))
+      (unless transferred-p (provider-operation-dispose identity)))))
+
 (defmethod provider-stream-turn :around
     ((provider model-provider) (conversation conversation)
      &key tool-namespaces event-callback goal-context compaction-p)
   "Charge primary, delegated and recursive streaming inference to its mission."
   (declare (ignore tool-namespaces event-callback goal-context compaction-p))
-  (let ((context (mission--conversation-context conversation)))
+  (let ((context      (mission--conversation-context conversation))
+        (caller-check *provider-connection-owner-check*))
     (if (and context (mission--request-owned-p context conversation))
-        (mission-review--account context conversation
-                                 :function       #'call-next-method
-                                 :usage-function (lambda (results) (provider-result-usage (first results))))
+        (let ((*provider-connection-owner* (mission-context-goal context))
+              (*provider-connection-owner-check*
+                (lambda ()
+                  (let ((caller-remaining (when caller-check (funcall caller-check)))
+                        (goal             (mission-context-goal context)))
+                    (unless (and (eq goal (application-goal (mission-context-application context)))
+                                 (or (eq (getf goal :status) ':active)
+                                     (mission--operation-draining-p context *mission-admitted-operation*)))
+                      (error 'provider-owner-ended :message "The mission no longer owns this request."))
+                    (when *mission-admitted-operation*
+                      (job-check-cancellation *mission-admitted-operation*))
+                    (let ((mission-remaining (/ (mission--remaining-milliseconds context) 1000)))
+                      (if (numberp caller-remaining)
+                          (min caller-remaining mission-remaining)
+                          mission-remaining))))))
+          (provider-call-with-suspension
+           conversation
+           (lambda ()
+             (mission-review--account
+              context conversation :function #'call-next-method
+              :usage-function                (lambda (results) (provider-result-usage (first results)))))
+           :suspended-p (lambda (condition)
+                          (and (typep condition 'mission-error)
+                               (eq (mission-error-reason condition) :operation-timeout)))))
         (call-next-method))))
+
+(-> mission--call-with-native-connection-owner (mission-context function) *)
+(defun mission--call-with-native-connection-owner (context function)
+  "Retain exact mission lifetime across native attempts and their recovery waits."
+  (let ((caller-check *provider-connection-owner-check*))
+    (let ((*provider-connection-owner* (mission-context-goal context))
+          (*provider-connection-owner-check*
+            (lambda ()
+              (let ((caller-remaining (when caller-check (funcall caller-check)))
+                    (goal             (mission-context-goal context)))
+                (unless (and (eq goal (application-goal (mission-context-application context)))
+                             (or (eq (getf goal :status) ':active)
+                                 (mission--operation-draining-p context *mission-admitted-operation*)))
+                  (error 'provider-owner-ended :message "The mission no longer owns this native request."))
+                (when *mission-admitted-operation*
+                  (job-check-cancellation *mission-admitted-operation*))
+                (let ((remaining (/ (mission--remaining-milliseconds context) 1000)))
+                  (if (numberp caller-remaining) (min remaining caller-remaining) remaining))))))
+      (funcall function))))
 
 (defmethod provider-native-compact-conversation :around
     ((provider model-provider) (conversation conversation)
@@ -346,8 +464,9 @@ preserving the calling thread's provider bindings and authorization callbacks."
   (declare (ignore tool-namespaces event-callback))
   (let ((context (mission--conversation-context conversation)))
     (if (and context (mission--request-owned-p context conversation))
-        (mission-review--account context conversation
-                                 :function #'call-next-method :usage-function #'second)
+        (mission--call-with-native-connection-owner
+         context (lambda () (mission-review--account context conversation
+                                                    :function #'call-next-method :usage-function #'second)))
         (call-next-method))))
 
 (-> mission--unknown-usage-blocks-p (list) boolean)
@@ -665,15 +784,17 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
 
 (-> mission-call-with-native-compaction-view ((option mission-context) conversation function) t)
 (defun mission-call-with-native-compaction-view (context view function)
-  "Capture VIEW's owner for actual native attempts, leaving unsupported probes unowned."
+  "Capture VIEW's lifetime without charging unsupported native capability probes."
   (let ((*mission-native-compaction-view* (cons view context)))
-    (funcall function)))
+    (if context
+        (mission--call-with-native-connection-owner context function)
+        (funcall function))))
 
 ;; Specialize the native backend so the telemetry MODEL-PROVIDER wrapper composes.
 (defmethod provider-attempt-native-compaction :around
     ((provider codex-subscription-provider) (conversation conversation)
      &key tool-namespaces force-refresh event-callback)
-  "Account for detached native views when native compaction is attempted, not during unsupported capability probes."
+  "Account detached native attempts and preserve ordinary admission authority."
   (declare (ignore tool-namespaces force-refresh event-callback))
   (let ((context (and (eq conversation (first *mission-native-compaction-view*))
                       (rest *mission-native-compaction-view*))))
@@ -682,8 +803,21 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
         (mission-call-with-request-view
          context conversation
          (lambda ()
-           (mission-review--account context conversation
-                                    :function #'call-next-method :usage-function #'second)))
+           (handler-case
+               (mission-review--account context conversation
+                                        :function #'call-next-method :usage-function #'second)
+             (mission-error (condition)
+               (let ((cause (mission-error-cause condition)))
+                 ;; Settlement retains uncertainty before ordinary policy decides
+                 ;; whether another attempt is permitted.
+                 (unless (and (eq (mission-error-reason condition) ':failed)
+                              (typep cause 'provider-retryable-error)
+                              (or (eq (getf (mission-context-goal context) :status) ':active)
+                                  (mission--operation-draining-p context *mission-admitted-operation*)))
+                   (error condition))
+                 (with-recursive-lock-held ((mission-context-lock context))
+                   (mission--admit context))
+                 (error cause))))))
         (call-next-method))))
 
 (-> mission--agent-context (agent) (option mission-context))

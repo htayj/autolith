@@ -728,3 +728,65 @@
                (test-assert (eq original observed)
                             "credential recovery and retry failures propagate unchanged"))))))))
   nil)
+
+(-> copilot-test--with-presentation-probes (function) null)
+(defun copilot-test--with-presentation-probes (function)
+  "Repeat display reads inside real adapter fixtures while forbidding presentation I/O."
+  (let ((display     (symbol-function 'provider--connection-display-endpoint))
+        (read-config (symbol-function 'config))
+        (calls       0))
+    (test-call-with-function-replacements
+     (list
+      (list 'provider--connection-display-endpoint
+            (lambda (provider)
+              (incf calls)
+              (let ((configuration (provider-configuration provider))
+                    (session       (provider-session-id provider))
+                    (protocol      (copilot-provider-protocol provider)))
+                (flet ((unexpected (&rest arguments)
+                         (declare (ignore arguments))
+                         (error "Connection presentation attempted request work.")))
+                  (test-call-with-function-replacements
+                   (cons
+                    ;; Upstream now supplies registry endpoints. Exercise absent optional
+                    ;; presentation data without changing the actual dynamic wire route.
+                    (list 'config
+                          (lambda (key &rest arguments)
+                            (if (eq key :provider-endpoint)
+                                (error 'configuration-error :message "No static presentation endpoint.")
+                                (apply read-config key arguments))))
+                    (mapcar (lambda (name) (list name #'unexpected))
+                            (list 'dexador:get 'provider-post-event-stream
+                                  'credential-manager-load 'credential-manager-refresh
+                                  'provider-call-with-request-adapter
+                                  (copilot-test--http-backend-request))))
+                   (lambda ()
+                     (test-assert
+                      (handler-case (progn (config :provider-endpoint configuration) nil)
+                        (configuration-error () t))
+                      "dynamic providers have no required static endpoint")
+                     (let ((first  (funcall display provider))
+                           (second (funcall display provider)))
+                       (test-assert (and (string= first "endpoint unavailable")
+                                         (string= first second))
+                                    "repeated optional display reads need no dynamic endpoint")
+                       (test-assert
+                        (and (eq configuration (provider-configuration provider))
+                             (eq session (provider-session-id provider))
+                             (eq protocol (copilot-provider-protocol provider))
+                             (not (test-object-contains-string-p first "tid=")))
+                        "display reads neither copy nor mutate the primary wire identity")
+                       first))))))))
+     function)
+    (test-assert (plusp calls) "ordinary requests traverse the presentation boundary"))
+  nil)
+
+(-> copilot-test--connection-display-protocols () null)
+(defun copilot-test--connection-display-protocols ()
+  "Preserve all three actual wire protocols and headers with side-effect-free display reads."
+  (copilot-test--with-presentation-probes #'copilot-test--discovery-and-transport))
+
+(-> copilot-test--connection-display-auto-renewal () null)
+(defun copilot-test--connection-display-auto-renewal ()
+  "Preserve Auto adapter selection, exact request counts, renewed host and invalid-route checks."
+  (copilot-test--with-presentation-probes #'copilot-test--auto-routing))

@@ -1341,10 +1341,8 @@
       ((and (consp outcome) (eq (first outcome) ':tls))
        (error 'test-provider-tls-error :detail (second outcome)))
       ((eq outcome ':name-service)
-       (error 'sb-bsd-sockets:name-service-error
-              :errno   1
-              :symbol  'getaddrinfo
-              :syscall 'getaddrinfo))
+       ;; SBCL's addrinfo temporary failure has this subtype, not generic errno1.
+       (error 'sb-bsd-sockets:try-again-error :syscall "getaddrinfo"))
       ((eq outcome ':simple-error)
        (error "Synthetic provider transport failure."))
       ((consp outcome)
@@ -1364,10 +1362,7 @@
       ((typep outcome 'condition)
        (error outcome))
       ((eq outcome ':name-service)
-       (error 'sb-bsd-sockets:name-service-error
-              :errno   1
-              :symbol  'getaddrinfo
-              :syscall 'getaddrinfo))
+       (error 'sb-bsd-sockets:try-again-error :syscall "getaddrinfo"))
       ((eq outcome ':tls)
        (error 'test-provider-tls-error
               :detail "compaction certificate verification failed"))
@@ -1455,6 +1450,44 @@
                          "only ordinary requests announce their selected memories"))))))
   nil)
 
+(-> provider-tests--connection-phases (list) list)
+(defun provider-tests--connection-phases (events)
+  "Read chronological connection phases without altering other event assertions."
+  (loop for event in (reverse events)
+        when (typep event 'provider-connection-event)
+          collect (getf (provider-connection-event-details event) :phase)))
+
+(-> provider-tests--assert-persistent-reconnect (list) null)
+(defun provider-tests--assert-persistent-reconnect (events)
+  "Require the precise pre-generation lifecycle and one same-route retry."
+  (let* ((connections (reverse (remove-if-not
+                                (lambda (event) (typep event 'provider-connection-event))
+                                events)))
+         (details     (mapcar #'provider-connection-event-details connections)))
+    (test-assert (equal (provider-tests--connection-phases events)
+                        '(:attempting :waiting :attempting :completed))
+                 "opening recovery publishes exactly one wait and the next attempt")
+    (test-assert
+     (and (= (length details) 4)
+          (equal (mapcar (lambda (detail) (getf detail :attempt)) details) '(1 1 2 2))
+          (every (lambda (detail)
+                   (and (equal (getf detail :episode) (getf (first details) :episode))
+                        (eql (getf detail :route-index) (getf (first details) :route-index))))
+                 details)
+          (plusp (getf (second details) :delay)))
+     "the wait belongs to the same episode and route before logical attempt two")
+    (test-assert
+     (equal (loop for event in (reverse events)
+                  when (typep event '(or provider-connection-event provider-attempt-failed-event))
+                    collect (if (typep event 'provider-connection-event)
+                                (getf (provider-connection-event-details event) :phase)
+                                :failure))
+            '(:attempting :failure :waiting :attempting :completed))
+     "the single transport failure precedes its wait and next attempt")
+    (test-assert (notany (lambda (event) (typep event 'provider-retry-event)) events)
+                 "pre-generation recovery never emits bounded retry events"))
+  nil)
+
 (-> test-provider-tls-eof-recovery () null)
 (defun test-provider-tls-eof-recovery ()
   "Reconnect on TLS EOF across authenticated opens, SSE reads, and native compaction."
@@ -1528,9 +1561,23 @@
                          'provider-transport-error)
                   (eq (provider-attempt-failed-event-output-received-p (first failures)) output-p))
              "TLS EOF retains its retryable transport class and observed output state"))
-          (test-assert
-           (= (count-if (lambda (event) (typep event 'provider-retry-event)) events) 2)
-           "each TLS EOF schedules one bounded reconnect")))))
+          (if output-p
+              (let ((retries (reverse (remove-if-not
+                                       (lambda (event) (typep event 'provider-retry-event))
+                                       events))))
+                (test-assert
+                 (and (= (length retries) 2)
+                      (= (provider-retry-event-attempt (first retries)) 1)
+                      (= (provider-retry-event-maximum-attempts (first retries)) 6)
+                      (<= 1 (provider-retry-event-delay (first retries)) 60)
+                      (= (provider-retry-event-attempt (second retries)) 1)
+                      (zerop (provider-retry-event-delay (second retries))))
+                 "post-output TLS EOF schedules exactly one bounded reconnect pair")
+                (test-assert
+                 (equal (provider-tests--connection-phases events)
+                        '(:attempting :attempting :completed))
+                 "post-output recovery never enters persistent waiting"))
+              (provider-tests--assert-persistent-reconnect events))))))
   nil)
 
 (-> test-provider-transport-boundary () null)
@@ -2299,7 +2346,13 @@
               (equal (nreverse (test-codex-provider-refresh-flags provider))
                      '(nil t))
               "the first retry forces credential refresh")
-             (test-assert (null events) "credential refresh adds no provider events"))
+             (test-assert
+              (and (every (lambda (event) (typep event 'provider-connection-event)) events)
+                   (equal (provider-tests--connection-phases events) '(:attempting :completed))
+                   (every (lambda (event)
+                            (= 1 (getf (provider-connection-event-details event) :attempt)))
+                          events))
+              "credential refresh adds only the one logical connection lifecycle"))
            (dolist (case '((nil nil) (t nil) (nil t) (t t)))
              (let* ((refreshable-p (first case))
                     (missing-p     (second case))
@@ -2346,7 +2399,13 @@
                 (equal (nreverse (test-codex-provider-refresh-flags provider))
                        (if refreshable-p '(nil t) '(nil)))
                 "only refreshable credentials receive one forced refresh")
-               (test-assert (null events) "authentication exhaustion adds no provider events")
+               (test-assert
+                (and (every (lambda (event) (typep event 'provider-connection-event)) events)
+                     (equal (provider-tests--connection-phases events) '(:attempting :terminated))
+                     (every (lambda (event)
+                              (= 1 (getf (provider-connection-event-details event) :attempt)))
+                            events))
+                "authentication exhaustion adds no retry, failure or waiting events")
                (let* ((report      (princ-to-string terminal))
                       (preserved-p (if missing-p
                                        (not (search message report))
@@ -2816,29 +2875,80 @@
                      :event-callback  (lambda (event) (push event events)))
                     result)
                 "transient stream and server failures retry the provider turn")
-               (let* ((retry-events
-                        (reverse
-                         (remove-if-not (lambda (event)
-                                          (typep event 'provider-retry-event))
-                                        events)))
-                      (announcement (first retry-events))
-                      (in-flight    (second retry-events)))
-                 (test-assert
-                  (and announcement
-                       (= (provider-retry-event-attempt announcement) 1)
-                       (= (provider-retry-event-maximum-attempts announcement) 6)
-                       (<= 1 (provider-retry-event-delay announcement) 60))
-                  "provider retries expose their attempt and delay to the observer")
-                 (test-assert
-                  (and in-flight
-                       (= (provider-retry-event-attempt in-flight) 1)
-                       (zerop (provider-retry-event-delay in-flight)))
-                  "the reconnect attempt itself reports no remaining countdown"))
+               (if (eq failure :stream-error)
+                   (provider-tests--assert-persistent-reconnect events)
+                   (let* ((retry-events
+                            (reverse
+                             (remove-if-not (lambda (event)
+                                              (typep event 'provider-retry-event))
+                                            events)))
+                          (announcement (first retry-events))
+                          (in-flight    (second retry-events)))
+                     (test-assert (= (length retry-events) 2)
+                                  "semantic failures emit exactly one bounded retry pair")
+                     (test-assert
+                      (and announcement
+                           (= (provider-retry-event-attempt announcement) 1)
+                           (= (provider-retry-event-maximum-attempts announcement) 6)
+                           (<= 1 (provider-retry-event-delay announcement) 60))
+                      "provider retries expose their attempt and delay to the observer")
+                     (test-assert
+                      (and in-flight
+                           (= (provider-retry-event-attempt in-flight) 1)
+                           (= (provider-retry-event-maximum-attempts in-flight) 6)
+                           (zerop (provider-retry-event-delay in-flight)))
+                      "the reconnect attempt itself reports no remaining countdown")
+                     (test-assert
+                      (equal (provider-tests--connection-phases events)
+                             '(:attempting :attempting :completed))
+                      "semantic failures never enter persistent waiting")))
                (test-assert
                 (equal (nreverse
                         (test-codex-provider-refresh-flags provider))
                        '(nil nil))
                 "provider retries do not force an authentication refresh")))
+           ;; A later attempt without output must not erase earlier generation.
+           (let* ((*provider-maximum-transient-retries* 1)
+                  (events                               nil)
+                  (provider
+                    (provider-tests--transport-provider
+                     configuration
+                     (list (make-instance
+                            'test-tls-eof-stream
+                            :source (concatenate
+                                     'string
+                                     (test-sse-event-string
+                                      (json-object "type" "response.created"
+                                                   "response" (json-object "id" "partial")))
+                                     (test-sse-event-string
+                                      (json-object "type" "response.output_text.delta"
+                                                   "delta" "partial"))))
+                           (provider-tests--tls-eof-condition)
+                           (make-instance 'test-character-input-stream
+                                          :source (provider-tests--completed-sse-source "forbidden"))))))
+             (credential-source-save
+              (credential-manager-primary-source (provider-credential-manager provider))
+              (provider-tests--credentials configuration))
+             (test-assert
+              (handler-case
+                  (progn (provider-stream-turn
+                          provider conversation
+                          :tool-namespaces #()
+                          :event-callback  (lambda (event) (push event events)))
+                         nil)
+                (provider-retryable-error () t))
+              "generated transport retries abandon the request at the bounded limit")
+             (test-assert (= 2 (test-transport-provider-attempt-count provider))
+                          "cumulative generation prevents an unbounded third transport")
+             (test-assert
+              (equal (provider-tests--connection-phases events)
+                     '(:attempting :attempting :terminated))
+              "later output-free failure never reenters persistent waiting")
+             (test-assert
+              (and (= 2 (count-if (lambda (event) (typep event 'provider-retry-event)) events))
+                   (= 1 (count-if (lambda (event)
+                                    (typep event 'provider-retries-exhausted-event)) events)))
+              "the bounded announcement, countdown and exhaustion are retained"))
            (let ((delays nil)
                  (provider
                    (test-codex-provider-create
@@ -3651,14 +3761,20 @@ Transport is synthetic; retry delays are suppressed."
                              (incf attempts)
                              (let ((content (body text representation)))
                                (when (streamp content) (push content streams))
-                               (error (failure content))))
+                              (let ((condition (failure content)))
+                                ;; Keep this body/cleanup fixture's generated-output safety bound.
+                                ;; Pre-generation throttling has its own caller-lifetime witness.
+                                (unless quota-p
+                                  (setf (slot-value condition 'cl-llm-provider-api::generation-started-p) t))
+                                (error condition))))
                            (lambda (event) (declare (ignore event))))
                         (provider-error (condition) condition))))
                 (check condition 'provider-error)
                 (test-assert (= (provider-error-status condition) 429) "the status survives the body drain")
-                (test-assert (eq (not (null (typep condition 'provider-retryable-error))) (not quota-p))
-                             "only the recognized allowance is terminal")
-                (test-assert (= attempts (if quota-p 1 7)) "the original bounded retry counts are retained")
+                (test-assert (eq (not (null (typep condition 'provider-stream-abandoned))) (not quota-p))
+                             "only generated throttling reaches the streaming safety limit")
+                (test-assert (= attempts (if quota-p 1 (1+ *provider-maximum-streaming-retries*)))
+                             "quota is terminal and generated throttling has a finite safety bound")
                 (unless quota-p
                   (test-assert (search "synthetic rate detail" (autolith-error-message condition))
                                "fallback retains the normalized body after quota inspection")))
@@ -3759,6 +3875,8 @@ Transport is synthetic; retry delays are suppressed."
                          (lambda (refresh event-callback)
                            (declare (ignore refresh))
                            (incf attempts)
+                           (unless recover-p
+                             (funcall event-callback (make-instance 'assistant-delta-event :text "owned partial")))
                            (if (and recover-p (> attempts 1))
                                :success
                                (provider-consume-stream
@@ -3779,7 +3897,7 @@ Transport is synthetic; retry delays are suppressed."
                    (expected-attempts (if transient-p (if recover-p 2 3) 1))
                    (exhausted         (assoc :provider-retries-exhausted statuses)))
               (test-assert (= attempts expected-attempts)
-                           "only transient SSE errors enter the bounded retry ladder")
+                           "only transient SSE errors retry; generation keeps its finite safety limit")
               (test-assert (and (= (length delays) (1- expected-attempts))
                                 (every (lambda (delay) (<= 1 delay 60)) delays))
                            "each retry sleeps once with bounded backoff")
@@ -3789,11 +3907,10 @@ Transport is synthetic; retry delays are suppressed."
                                     (string= (provider-error-code failure) code)
                                     (search "Temporary provider failure" (princ-to-string failure))))
                            "success ends recovery and terminal failures retain the provider reason")
-              (test-assert (if (and transient-p (not recover-p))
-                               (and exhausted (= (getf (rest exhausted) :attempts) 3)
-                                    (string= (getf (rest exhausted) :code) code))
-                               (null exhausted))
-                           "only true retry exhaustion emits a request-local notice")))))
+              (test-assert (and (null exhausted)
+                                (or recover-p (not transient-p)
+                                    (typep failure 'provider-stream-abandoned)))
+                           "streaming safety stops are distinct from finite pre-generation exhaustion")))))
       (dolist (status '(503 429))
         (test-assert
          (handler-case (provider--signal-http-status-failure provider status)
@@ -3840,8 +3957,8 @@ Transport is synthetic; retry delays are suppressed."
                             (funcall callback (make-instance 'assistant-delta-event :text "partial")))
                           (setf last-condition
                                 (make-condition 'provider-retryable-error
-                                                :message "Service unavailable"
-                                                :code    "service_unavailable_error"))
+                                                :message "Owned finite transient"
+                                                :code    "owned_finite_transient"))
                           (error last-condition)))
                       (agent--provider-event-callback observer))
                    (provider-error (condition) condition))))
@@ -3876,4 +3993,1116 @@ Transport is synthetic; retry delays are suppressed."
              (provider-retryable-error (condition)
                (string= (provider-error-code condition) code)))
            "Anthropic error events use the same exact transient classification")))))
+  nil)
+
+
+;;;; -- Product Connection Recovery --
+
+(-> provider-recovery-tests--call-with-provider (integer function) t)
+(defun provider-recovery-tests--call-with-provider (port function)
+  "Call FUNCTION with a factory-selected local Chat Completions provider."
+  (with-test-configuration (configuration)
+    (let ((name "owned-connection-recovery-fixture"))
+      (unwind-protect
+           (progn
+             (register-provider
+              name :models '("owned-connection-model") :family ':openai
+              :protocol ':chat-completions
+              :endpoint (format nil "http://127.0.0.1:~D/v1/chat/completions" port)
+              :factory  (lambda (configuration &key reasoning-summaries-p)
+                         (declare (ignore reasoning-summaries-p))
+                         (openai-compatible-provider-create
+                          configuration :name name :family ':openai)))
+             (setf (configuration-validation-deferred-p configuration) t
+                   (config :model configuration) "owned-connection-model"
+                   (config :model-provider configuration) name)
+             (let ((provider (provider-create configuration)))
+               (test-assert (typep provider 'openai-compatible-provider)
+                            "the registered factory selects the production HTTP provider")
+               (funcall function provider
+                        (conversation-create configuration :identifier "owned-recovery"))))
+        (unregister-provider name)))))
+
+(-> test-provider-recovery-native-opening () null)
+(defun test-provider-recovery-native-opening ()
+  "Exercise a real healthy HTTP opening and an isolated non-listening refusal."
+  (dolist (healthy-p '(nil t))
+    (let ((socket       (make-instance 'sb-bsd-sockets:inet-socket
+                                       :type ':stream :protocol ':tcp))
+          (server       nil)
+          (accepted     nil)
+          (stream       nil)
+          (headers-read 0))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind socket #(127 0 0 1) 0)
+             (when healthy-p
+               (sb-bsd-sockets:socket-listen socket 1)
+               (setf server
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (setf accepted (sb-bsd-sockets:socket-accept socket)
+                              stream (sb-bsd-sockets:socket-make-stream
+                                      accepted :input t :output t :element-type 'character
+                                      :external-format :utf-8 :buffering ':none))
+                        (let ((body-length 0))
+                          (loop for line = (read-line stream nil nil)
+                                while (and line (plusp (length (string-trim '(#\Return) line))))
+                                do (incf headers-read)
+                                when (search "content-length:" (string-downcase line))
+                                  do (setf body-length (parse-integer line :start 15 :junk-allowed t)))
+                          (loop repeat body-length do (read-char stream)))
+                        (format stream "HTTP/1.1 200 OK~C~CContent-Type: text/event-stream~C~CContent-Length: 0~C~CConnection: close~C~C~C~C"
+                                #\Return #\Newline #\Return #\Newline #\Return #\Newline
+                                #\Return #\Newline #\Return #\Newline)
+                        (finish-output stream)
+                        (close stream))
+                      :name "owned recovery healthy control")))
+             (multiple-value-bind (address port) (sb-bsd-sockets:socket-name socket)
+               (declare (ignore address))
+               (provider-recovery-tests--call-with-provider
+                port
+                (lambda (provider conversation)
+                  (let ((started (get-internal-real-time))
+                        (failure nil)
+                        (status  nil))
+                    (handler-case
+                        (multiple-value-bind (response response-status headers)
+                            (provider-call-with-response-deadline
+                             (if healthy-p 2 0.2)
+                             (lambda ()
+                               (provider--open-response-stream
+                                provider (json-object "model" "owned-connection-model" "messages" #())
+                                :credentials  (make-instance 'oauth-credentials :access-token "inert")
+                                :conversation conversation)))
+                          (declare (ignore headers))
+                          (setf status response-status)
+                          (when (streamp response) (close response)))
+                      (error (condition) (setf failure condition)))
+                    (format t "~&NATIVE healthy=~S start=~D end=~D class=~S status=~S accepted=~S headers=~D~%"
+                            healthy-p started (get-internal-real-time) (type-of failure)
+                            status (not (null accepted)) headers-read)
+                    (test-assert (if healthy-p (and (null failure) (eql status 200)) failure)
+                                 "the selected production route distinguishes healthy and refusing sockets")
+                    (test-assert (< (/ (- (get-internal-real-time) started)
+                                      internal-time-units-per-second) 3)
+                                 "the supported deadline bounds actual opening detection"))))))
+        (when stream (close stream :abort t))
+        (when accepted (sb-bsd-sockets:socket-close accepted))
+        (sb-bsd-sockets:socket-close socket)
+        (when server
+          (sb-thread:join-thread server :timeout 3 :default nil)
+          (when (sb-thread:thread-alive-p server)
+            (sb-thread:terminate-thread server)
+            (sb-thread:join-thread server :default nil))))))
+  nil)
+
+(-> test-provider-recovery-long-ladder () null)
+(defun test-provider-recovery-long-ladder ()
+  "Survive more than six ordinary unstable openings without a total wait ceiling."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (let ((attempts 0)
+           (waits    nil)
+           (failure  nil)
+           (answer   nil))
+       (let ((*bounded-retry-sleep-function* (lambda (seconds) (push seconds waits))))
+         (handler-case
+             (setf answer
+                   (multiple-value-list
+                    (provider--call-with-bounded-retries
+                     provider
+                     (lambda (refresh callback)
+                       (declare (ignore refresh callback))
+                       (incf attempts)
+                       (if (< attempts 10)
+                           (provider--call-with-transport-normalization
+                            (lambda ()
+                              (error 'usocket:connection-refused-error))
+                            :terminal-errors-p t)
+                           (values :healthy :second-value)))
+                     #'identity)))
+           (provider-error (condition) (setf failure condition))))
+       (test-assert (null failure) "eligible instability does not exhaust a finite retry ladder")
+       (test-assert (and (equal answer '(:healthy :second-value)) (= attempts 10))
+                    "the tenth actual attempt preserves all returned values")
+       (test-assert (and (= (length waits) 9) (> (reduce #'+ waits :initial-value 0) 300))
+                    "caller-owned recovery survives more than five minutes of modeled waits")
+       (test-assert (every (lambda (seconds) (<= seconds 300)) waits)
+                    "every jittered wait respects the per-wait cap"))))
+  nil)
+
+(-> test-provider-recovery-native-cancellation () null)
+(defun test-provider-recovery-native-cancellation ()
+  "Interrupt an accepted silent opening through the existing controller owner."
+  (let ((listener  (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type ':stream :protocol ':tcp))
+        (accepted  nil)
+        (peer      nil)
+        (worker    nil)
+        (outcome   nil)
+        (unwound-p nil))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 1)
+           (multiple-value-bind (address port) (sb-bsd-sockets:socket-name listener)
+             (declare (ignore address))
+             (provider-recovery-tests--call-with-provider
+              port
+              (lambda (provider conversation)
+                (setf worker
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (unwind-protect
+                              (handler-case
+                                  (provider-call-with-response-deadline
+                                   5
+                                   (lambda ()
+                                     (provider--open-response-stream
+                                      provider (json-object "model" "owned-connection-model" "messages" #())
+                                      :credentials  (make-instance 'oauth-credentials :access-token "inert")
+                                      :conversation conversation)))
+                                (application-turn-cancelled () (setf outcome :cancelled))
+                                (error (condition) (setf outcome (type-of condition))))
+                           (setf unwound-p t)))
+                       :name "owned cancellable provider opening"))
+                (setf accepted
+                      (provider-call-with-response-deadline
+                       2 (lambda () (sb-bsd-sockets:socket-accept listener)))
+                      peer (sb-bsd-sockets:socket-make-stream
+                            accepted :input t :element-type '(unsigned-byte 8) :buffering ':none))
+                (provider-recovery-tests--read-native-request peer)
+                (let ((controller (make-instance 'application-input-controller :main-thread worker))
+                      (cancel-at  (get-internal-real-time)))
+                  (setf (application-input-controller-turn-cancellation-delivery-pending-p controller) t)
+                  (application-input-controller--interrupt-main-for-turn-cancellation controller)
+                  (sb-thread:join-thread worker :timeout 2 :default :timed-out)
+                  (format t "~&NATIVE cancellation start=~D end=~D outcome=~S unwind=~S~%"
+                          cancel-at (get-internal-real-time) outcome unwound-p)
+                  (test-assert (and (eq outcome :cancelled) unwound-p
+                                    (not (sb-thread:thread-alive-p worker)))
+                               "controller cancellation escapes normalization and finishes the owned opening")
+                  (test-assert (< (/ (- (get-internal-real-time) cancel-at)
+                                    internal-time-units-per-second) 1)
+                               "native cancellation does not wait for the five-second opening timeout")
+                  (let ((closed-p
+                          (handler-case
+                              (provider-call-with-response-deadline
+                               0.5
+                               (lambda ()
+                                 (loop while (read-byte peer nil nil))
+                                 t))
+                            (sb-sys:deadline-timeout () nil))))
+                    (test-assert closed-p "the cancelled native client closes its accepted transport")))))))
+      (when worker
+        (when (sb-thread:thread-alive-p worker)
+          (sb-thread:terminate-thread worker)
+          (sb-thread:join-thread worker :default nil)))
+      (when peer (close peer :abort t))
+      (when accepted (sb-bsd-sockets:socket-close accepted))
+      (sb-bsd-sockets:socket-close listener)))
+  nil)
+
+(-> test-provider-recovery-service-and-semantic-controls () null)
+(defun test-provider-recovery-service-and-semantic-controls ()
+  "Extend only service instability, leaving ordinary semantic rejection bounded."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (dolist (status '(500 502 503 504 400 429))
+       (let ((attempts 0) (failure nil) (result nil))
+         (let ((*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
+           (handler-case
+               (setf result
+                     (provider--call-with-bounded-retries
+                      provider
+                      (lambda (refresh callback)
+                        (declare (ignore refresh callback))
+                        (incf attempts)
+                        (if (< attempts 10)
+                            (error 'provider-retryable-error :message "owned control" :status status)
+                            :healthy))
+                      #'identity))
+             (provider-error (condition) (setf failure condition))))
+         (test-assert (if (or (= status 429) (<= 500 status 599))
+                          (and (null failure) (eq result :healthy) (= attempts 10))
+                          (and failure (= attempts (1+ *provider-maximum-transient-retries*))))
+                      "service and throttling instability receive the caller-owned ladder")))))
+  nil)
+
+(-> test-provider-recovery-cumulative-generation () null)
+(defun test-provider-recovery-cumulative-generation ()
+  "Keep the imported cumulative generated-failure budget across mixed attempts."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (let ((attempts 0) (failure nil))
+       (let ((*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
+         (handler-case
+             (provider--call-with-bounded-retries
+              provider
+              (lambda (refresh callback)
+                (declare (ignore refresh))
+                (incf attempts)
+                (when (oddp attempts)
+                  (funcall callback (make-instance 'assistant-delta-event :text "partial")))
+                (error 'provider-transport-error :message "owned read reset"))
+              #'identity)
+           (provider-error (condition) (setf failure condition))))
+       (test-assert (and (= attempts 5) (typep failure 'provider-stream-abandoned)
+                         (= (provider-stream-abandoned-attempts failure) 3))
+                    "three generated failures stop the same wrapper despite intervening openings"))))
+  nil)
+
+(-> test-provider-recovery-native-refusal-to-healthy () null)
+(defun test-provider-recovery-native-refusal-to-healthy ()
+  "Recover the production factory route after nine actual failed HTTP openings."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket :type ':stream :protocol ':tcp))
+        (server nil) (accepted nil) (stream nil) (attempts 0) (waits nil))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-bind socket #(127 0 0 1) 0)
+           (multiple-value-bind (address port) (sb-bsd-sockets:socket-name socket)
+             (declare (ignore address))
+             (provider-recovery-tests--call-with-provider
+              port
+              (lambda (provider conversation)
+                (let ((*bounded-retry-sleep-function*
+                        (lambda (seconds)
+                          (push seconds waits)
+                          (when (= (length waits) 9)
+                            (sb-bsd-sockets:socket-listen socket 1)
+                            (setf server
+                                  (sb-thread:make-thread
+                                   (lambda ()
+                                     (setf accepted (sb-bsd-sockets:socket-accept socket)
+                                           stream (sb-bsd-sockets:socket-make-stream
+                                                   accepted :input t :output t :element-type 'character
+                                                   :external-format :utf-8 :buffering ':none))
+                                     (let ((body-length 0))
+                                       (loop for line = (read-line stream nil nil)
+                                             while (and line (plusp (length (string-trim '(#\Return) line))))
+                                             when (search "content-length:" (string-downcase line))
+                                               do (setf body-length (parse-integer line :start 15 :junk-allowed t)))
+                                       (loop repeat body-length do (read-char stream)))
+                                     (format stream "HTTP/1.1 200 OK~C~CContent-Type: text/event-stream~C~CContent-Length: 0~C~CConnection: close~C~C~C~C"
+                                             #\Return #\Newline #\Return #\Newline #\Return #\Newline
+                                             #\Return #\Newline #\Return #\Newline)
+                                     (finish-output stream)
+                                     (close stream))
+                                   :name "owned delayed healthy provider")))))
+                      (failure nil) (status nil))
+                  (handler-case
+                      (setf status
+                            (provider--call-with-bounded-retries
+                             provider
+                             (lambda (refresh callback)
+                               (declare (ignore refresh callback))
+                               (incf attempts)
+                               (multiple-value-bind (response status headers)
+                                   (provider-call-with-response-deadline
+                                    (if (< attempts 10) 0.1 2)
+                                    (lambda ()
+                                      (provider--open-response-stream
+                                       provider (json-object "model" "owned-connection-model" "messages" #())
+                                       :credentials  (make-instance 'oauth-credentials :access-token "inert")
+                                       :conversation conversation)))
+                                 (declare (ignore headers))
+                                 (when (streamp response) (close response))
+                                 status))
+                             #'identity))
+                    (provider-error (condition) (setf failure condition)))
+                  (format t "~&NATIVE recovery attempts=~D waits=~D accepted=~S status=~S failure=~S~%"
+                          attempts (length waits) (not (null accepted)) status (type-of failure))
+                  (test-assert (and (null failure) (= attempts 10) (= (length waits) 9)
+                                    accepted (eql status 200))
+                               "the tenth native opening succeeds without restarting the charged invocation"))))))
+      (when stream (close stream :abort t))
+      (when accepted (sb-bsd-sockets:socket-close accepted))
+      (sb-bsd-sockets:socket-close socket)
+      (when server
+        (sb-thread:join-thread server :timeout 3 :default nil)
+        (when (sb-thread:thread-alive-p server)
+          (sb-thread:terminate-thread server)
+          (sb-thread:join-thread server :default nil)))))
+  nil)
+
+(-> test-provider-recovery-owner-deadline () null)
+(defun test-provider-recovery-owner-deadline ()
+  "An earlier enclosing deadline terminates ownership instead of reopening."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (provider-recovery-tests--deadline-quantum-controls)
+     (let ((attempts 0) (expired-p nil)
+           (*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
+       (handler-case
+           (sb-sys:with-deadline (:seconds 0.03)
+             (provider--call-with-bounded-retries
+              provider
+              (lambda (refresh callback)
+                (declare (ignore refresh callback))
+                (incf attempts)
+                (when (> attempts 2)
+                  (error 'provider-error :message "An expired owner dispatched again."))
+                (provider--call-with-transport-normalization
+                 (lambda () (provider--call-opening (lambda () (sleep 0.1))))
+                 :terminal-errors-p t))
+              #'identity))
+         (sb-sys:deadline-timeout () (setf expired-p t))
+         (provider-error () (setf expired-p (= attempts 1))))
+       (test-assert expired-p "owner expiry escapes normalization without instability retry")
+       (test-assert (= attempts 1) "no dispatch follows expiry of the earlier owner"))))
+  (let ((state (make-provider-connection-recovery)))
+    (provider--connection-wait state 0.01)
+    (test-assert (not (provider-connection-recovery-ended-p state))
+                 "natural native wait expiry does not end a live owner"))
+  (let ((expired-p nil) (state nil))
+    (handler-case
+        (sb-sys:with-deadline (:seconds 0.02)
+          (setf state (make-provider-connection-recovery))
+          (provider--call-with-connection-episode
+           state (lambda () (provider--connection-wait state 1))))
+      (sb-sys:deadline-timeout () (setf expired-p t))
+      (provider-owner-ended () (setf expired-p t)))
+    (test-assert expired-p "caller expiry terminates a native wait")
+    (test-assert (provider-connection-recovery-ended-p state)
+                 "deadline unwind removes ownership")
+    (test-assert (not (member state *provider-connection-episodes*))
+                 "deadline unwind unregisters the exact waiter"))
+  nil)
+
+(-> test-provider-recovery-dns-codes () null)
+(defun test-provider-recovery-dns-codes ()
+  "Classify concrete SBCL DNS semantics without printed error matching."
+  (dolist (entry (list (cons sb-bsd-sockets-internal::eai-again t)
+                      (cons sb-bsd-sockets-internal::eai-noname nil)
+                      (cons sb-bsd-sockets-internal::eai-badflags nil)))
+    (let ((retried-p nil))
+      (handler-case
+          (provider--call-opening
+           (lambda ()
+             (error 'sb-bsd-sockets:name-service-error
+                    :errno (first entry) :syscall "getaddrinfo")))
+        (provider-retryable-error () (setf retried-p t))
+        (provider-error () nil))
+      (test-assert (eq retried-p (rest entry)) "only temporary resolver codes enter recovery")))
+  (test-assert
+   (eq :dns-temporary
+       (provider--raw-opening-category (make-condition 'sb-bsd-sockets:try-again-error)))
+   "a typed temporary resolver failure needs no synthetic errno slot")
+  nil)
+
+(-> test-provider-recovery-owned-waiter () null)
+(defun test-provider-recovery-owned-waiter ()
+  "Wake the exact owned waiter through cancellation and actual public goal pause."
+  (provider-recovery-tests--registration-races)
+  (provider-recovery-tests--ordinary-goal-ownership)
+  (provider-recovery-tests--concurrent-waiters)
+  (with-test-configuration (configuration)
+    (let* ((conversation (conversation-create configuration))
+           (application  (make-instance
+                          'application
+                          :configuration configuration
+                          :conversation  conversation
+                          :ui            (terminal-ui-create
+                                          :terminal (make-instance 'recording-terminal :columns 60)))))
+      (dolist (mode '(:before-registration :at-dispatch :wait :controller :pause))
+        (let* ((goal    (list :objective "Owned fixture" :status ':active))
+               (ready   (sb-thread:make-semaphore :count 0))
+               (release (sb-thread:make-semaphore :count 0))
+               (worker nil) (state nil) (attempts 0) (cleanup 0) (outcome nil))
+          (setf (application-goal application) goal)
+          (let ((original-wait (symbol-function 'provider--wait-on-connection-condition)))
+            (test-call-with-function-replacements
+             (list (list 'provider--wait-on-connection-condition
+                         (lambda (episode timeout)
+                           (when (and (eq state episode)
+                                      (member mode '(:wait :controller :pause)))
+                             ;; Cancellation must acquire this mutex after the native
+                             ;; wait atomically registers and releases it.
+                             (sb-thread:signal-semaphore ready))
+                           (funcall original-wait episode timeout))))
+             (lambda ()
+              (unwind-protect
+                   (progn
+                     (setf worker
+                           (sb-thread:make-thread
+                            (lambda ()
+                              (let* ((*provider-connection-owner* goal)
+                                     (*provider-connection-owner-check*
+                                       (lambda ()
+                                         (unless (eq (getf goal :status) ':active)
+                                           (error 'provider-owner-ended :message "Fixture goal stopped."))
+                                         nil))
+                                     (episode                     (make-provider-connection-recovery)))
+                                (setf state episode)
+                                (unwind-protect
+                                     (handler-case
+                                         (progn
+                                           (when (eq mode ':before-registration)
+                                             (sb-thread:signal-semaphore ready)
+                                             (sb-thread:wait-on-semaphore release))
+                                           (provider--call-with-connection-episode
+                                            episode
+                                            (lambda ()
+                                              (provider--call-with-connection-recovery
+                                               episode
+                                               (lambda ()
+                                                 (incf attempts)
+                                                 (when (eq mode ':at-dispatch)
+                                                   (sb-thread:signal-semaphore ready)
+                                                   (sb-thread:wait-on-semaphore release))
+                                                 (provider--call-opening
+                                                  (lambda ()
+                                                    (when (eq mode ':at-dispatch)
+                                                      (error "Dispatch after owner stop."))
+                                                    (error 'usocket:connection-refused-error))))))))
+                                       (provider-owner-ended () (setf outcome ':ended))
+                                       (application-turn-cancelled () (setf outcome ':controller))
+                                       (error (condition) (setf outcome (type-of condition))))
+                                  (incf cleanup))))
+                            :name "owned connection waiter"))
+                     (test-assert (sb-thread:wait-on-semaphore ready :timeout 2)
+                                  "the owned request reaches its synchronized boundary")
+                     (let ((unrelated (make-provider-connection-recovery))
+                           (cancel-at (get-internal-real-time)))
+                       (case mode
+                         ((:before-registration :pause)
+                          (application-goal-request application ':pause nil))
+                         (:at-dispatch
+                          (setf (getf goal :status) ':paused)
+                          (provider-cancel-connection-owner goal))
+                         (:wait
+                          (provider-cancel-connection-owner goal))
+                         (:controller
+                          (let ((controller (make-instance 'application-input-controller :main-thread worker)))
+                            (setf (application-input-controller-turn-cancellation-delivery-pending-p controller) t)
+                            (application-input-controller--interrupt-main-for-turn-cancellation controller))))
+                       (sb-thread:signal-semaphore release)
+                       (sb-thread:join-thread worker :timeout 2 :default ':timeout)
+                       (test-assert (not (sb-thread:thread-alive-p worker))
+                                    "cancellation wakes a long owned wait promptly")
+                       (test-assert (< (/ (- (get-internal-real-time) cancel-at)
+                                         internal-time-units-per-second) 1)
+                                    "no backoff duration delays the owner stop")
+                       (test-assert (and (= cleanup 1)
+                                         (eq outcome (if (eq mode ':controller) ':controller ':ended))
+                                         (= attempts (if (eq mode ':before-registration) 0 1)))
+                                    "one cleanup and no later attempt after stop")
+                       (test-assert (not (provider-connection-recovery-ended-p unrelated))
+                                    "unrelated request ownership is unaffected")
+                       (test-assert (not (member state *provider-connection-episodes*))
+                                    "every terminal path removes its registration")))
+                (when (and worker (sb-thread:thread-alive-p worker))
+                  (sb-thread:terminate-thread worker)
+                  (sb-thread:join-thread worker :default nil))))))))))
+  nil)
+
+(-> test-provider-recovery-repeated-opening-timeout () null)
+(defun test-provider-recovery-repeated-opening-timeout ()
+  "A per-opening timeout can repeat without expiring a live owner."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (let ((attempts                           0)
+           (*provider-opening-timeout-seconds* 0.005)
+           (*bounded-retry-sleep-function*     (lambda (seconds) (declare (ignore seconds)))))
+       (test-assert
+        (equal '(17 23)
+               (multiple-value-list
+                (provider--call-with-bounded-retries
+                 provider
+                 (lambda (refresh callback)
+                   (declare (ignore refresh callback))
+                   (incf attempts)
+                   (provider--call-with-transport-normalization
+                    (lambda ()
+                      (provider--call-opening
+                       (lambda () (if (< attempts 8) (sleep 0.02) (values 17 23)))))
+                    :terminal-errors-p t))
+                 #'identity)))
+        "successful values survive repeated independent opening expiry")
+       (test-assert (= attempts 8) "local timeouts are not a hidden finite ladder"))))
+  nil)
+
+(-> provider-recovery-tests--deadline-quantum-controls () null)
+(defun provider-recovery-tests--deadline-quantum-controls ()
+  "Control ownership rounding only after SBCL actually signals its deadline."
+  (dolist (units '(0 1 2))
+    (let* ((state                         (make-provider-connection-recovery))
+           (observed                      nil)
+           (outcome                       nil)
+           (*provider-connection-episode* state))
+      (setf (provider-connection-recovery-deadline state) nil
+            (provider-connection-recovery-owner-check state)
+            (lambda () (when observed (/ units internal-time-units-per-second))))
+      (handler-case
+          (provider--call-opening
+           (lambda ()
+             (handler-bind ((sb-sys:deadline-timeout
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (setf observed t))))
+               (sb-sys:with-deadline (:seconds 0 :override t)
+                 (sleep 0.001)))))
+        (provider-owner-ended () (setf outcome ':owner))
+        (provider-opening-instability () (setf outcome ':local)))
+      (test-assert observed "the runtime signals an actual deadline at the controlled ownership boundary")
+      (test-assert (eq outcome (if (<= units 1) ':owner ':local))
+                   "zero and one quantum end ownership, outside tolerance remains a local timeout")))
+  (dolist (units '(0 1 2))
+    (let ((state (make-provider-connection-recovery)) (dispatched nil) (ended nil))
+      (setf (provider-connection-recovery-deadline state) nil
+            (provider-connection-recovery-owner-check state)
+            (lambda () (/ units internal-time-units-per-second)))
+      (let ((*provider-connection-episode* state))
+        (handler-case (provider--call-opening (lambda () (setf dispatched t)))
+          (provider-owner-ended () (setf ended t))))
+      (test-assert (and (eq ended (zerop units)) (eq dispatched (plusp units)))
+                   "ordinary dispatch does not borrow the post-condition quantum tolerance")))
+  nil)
+
+(-> provider-recovery-tests--ordinary-goal-ownership () null)
+(defun provider-recovery-tests--ordinary-goal-ownership ()
+  "Exercise ordinary application dispatch without a mission, deadline or opt-in."
+  (dolist (mode '(:before-registration :at-dispatch :wait :resume :clear))
+    (with-test-configuration (configuration)
+      (let* ((application (mission-test--application configuration))
+             (goal        (list :objective "Ordinary fixture" :status ':active))
+             (attempts 0) (ended nil) (captured nil))
+        (setf (application-goal application) goal)
+        (test-call-with-function-replacements
+         (list
+          (list 'agent-run-user-turn
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  (setf captured *provider-connection-owner*)
+                  (when (member mode '(:before-registration :resume))
+                    (application-goal-request application ':pause nil)
+                    (when (eq mode ':resume)
+                      ;; Restore the same goal identity to expose revival of a
+                      ;; cancelled turn, without starting new fixture work.
+                      (setf (getf goal :status) ':active)))
+                  (let ((state (make-provider-connection-recovery)))
+                    (provider--call-with-connection-episode
+                     state
+                     (lambda ()
+                       (when (eq mode ':at-dispatch)
+                         (application-goal-request application ':pause nil))
+                       (provider--call-with-connection-recovery
+                        state
+                        (lambda ()
+                          (incf attempts)
+                          (when (> attempts 2)
+                            (error 'provider-error :message "Fixture observed post-pause replay."))
+                          (if (eq mode ':wait)
+                              (error 'provider-opening-instability :category ':connection
+                                     :message                                "Fixture refusal.")
+                              (progn
+                                (when (eq mode ':clear)
+                                  (application-goal-request application ':clear nil))
+                                (provider--call-opening (lambda () (values 17 23))))))))))))
+          (list 'application-render-records (lambda (&rest arguments) (declare (ignore arguments))))
+          (list 'application--note-goal-turn (lambda (&rest arguments) (declare (ignore arguments))))
+          (list 'application--maybe-refresh-conversation-title
+                (lambda (&rest arguments) (declare (ignore arguments)))))
+         (lambda ()
+           (let ((*bounded-retry-sleep-function*
+                   (lambda (seconds)
+                     (declare (ignore seconds))
+                     (application-goal-request application ':pause nil))))
+             (handler-case (application--run-turn application "Fixture dispatch" :tools-p nil)
+               (provider-owner-ended () (setf ended t))
+               (error () nil)))))
+        (test-assert (eq captured goal) "ordinary application dispatch attaches the exact caller goal")
+        (test-assert ended "pause, clear and pause-resume terminate the existing ordinary turn")
+        (test-assert (= attempts (if (member mode '(:before-registration :at-dispatch :resume)) 0 1))
+                     "a terminal ordinary turn never dispatches another provider attempt")
+        (test-assert (null (mission-context-find (application-conversation application)))
+                     "ordinary goal ownership does not create a mission"))))
+  nil)
+
+(-> provider-recovery-tests--concurrent-waiters () null)
+(defun provider-recovery-tests--concurrent-waiters ()
+  "Pause an ordinary application waiter while an unrelated native waiter stays live."
+  (with-test-configuration (configuration)
+    (let* ((application (mission-test--application configuration))
+           (goal        (list :objective "Native ordinary owner" :status ':active))
+           (owners      (list goal (list :second)))
+           (states      (mapcar (lambda (owner)
+                                  (let ((*provider-connection-owner* owner))
+                                    (make-provider-connection-recovery))) owners))
+           (ready       (sb-thread:make-semaphore :count 0))
+           (threads     nil)
+           (outcomes    (make-array 2 :initial-element nil))
+           (original    (symbol-function 'provider--wait-on-connection-condition)))
+      (setf (application-goal application) goal)
+      (test-call-with-function-replacements
+       (list
+        (list 'provider--wait-on-connection-condition
+              (lambda (state seconds)
+                (sb-thread:signal-semaphore ready)
+                (funcall original state seconds)))
+        (list 'agent-run-user-turn
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                (let ((state (make-provider-connection-recovery)))
+                  (setf (first states) state)
+                  (provider--call-with-connection-episode
+                   state (lambda () (provider--connection-wait state 300)))))))
+       (lambda ()
+         (unwind-protect
+              (progn
+                (loop for state in states for index from 0
+                      do (let ((owned state) (slot index))
+                           (push (sb-thread:make-thread
+                                  (lambda ()
+                                    (handler-case
+                                        (if (zerop slot)
+                                            (application--run-turn application "Native fixture" :tools-p nil)
+                                            (provider--call-with-connection-episode
+                                             owned (lambda () (provider--connection-wait owned 300))))
+                                      (provider-owner-ended () (setf (aref outcomes slot) ':ended))
+                                      (error (condition) (setf (aref outcomes slot) (type-of condition))))))
+                                 threads)))
+                (test-assert (sb-thread:wait-on-semaphore ready :timeout 2) "first simultaneous waiter registers")
+                (test-assert (sb-thread:wait-on-semaphore ready :timeout 2) "second simultaneous waiter registers")
+                (application-goal-request application ':pause nil)
+                (sb-thread:join-thread (second threads) :timeout 2 :default ':timeout)
+                (test-assert (eq (aref outcomes 0) ':ended) "public ordinary goal pause wakes its native waiter")
+                (test-assert (and (sb-thread:thread-alive-p (first threads))
+                                  (null (aref outcomes 1)))
+                             "unrelated concurrent waiter is still alive after peer pause")
+                (provider-cancel-connection-owner (second owners))
+                (sb-thread:join-thread (first threads) :timeout 2 :default ':timeout)
+                (test-assert (eq (aref outcomes 1) ':ended) "unrelated waiter requires its own cancellation")
+                (dolist (state states)
+                  (handler-case
+                      (provider--call-with-connection-episode state (lambda () (error "Revived a terminal episode.")))
+                    (provider-owner-ended () nil))
+                  (test-assert (not (member state *provider-connection-episodes*))
+                               "terminal waiter cannot register or revive")))
+           (dolist (thread threads)
+             (when (sb-thread:thread-alive-p thread)
+               (sb-thread:terminate-thread thread))
+             (sb-thread:join-thread thread :default nil)))))))
+  nil)
+
+(-> provider-recovery-tests--read-native-request (stream) null)
+(defun provider-recovery-tests--read-native-request (peer)
+  "Wait for the native request, not merely TCP accept during client initialization."
+  (provider-call-with-response-deadline
+   2
+   (lambda ()
+     (let* ((headers
+              (with-output-to-string (output)
+                (loop with matched = 0
+                      with delimiter = '(13 10 13 10)
+                      for byte = (read-byte peer)
+                      do (write-char (code-char byte) output)
+                         (setf matched (if (= byte (nth matched delimiter)) (1+ matched) 0))
+                      until (= matched 4))))
+            (marker (search "content-length:" (string-downcase headers))))
+       (unless marker (error "The owned native fixture requires an explicit body length."))
+       (let ((length (parse-integer headers :start (+ marker 15) :junk-allowed t)))
+         (dotimes (index length)
+            (declare (ignorable index))
+           (read-byte peer))))))
+  nil)
+
+(-> provider-recovery-tests--registration-races () null)
+(defun provider-recovery-tests--registration-races ()
+  "Cancel before registration, between checks, and at dispatch without state revival."
+  (dolist (mode '(:before-registration :between-checks :dispatch))
+    (let* ((owner                       (list :race mode))
+           (*provider-connection-owner* owner)
+           (state                       (make-provider-connection-recovery))
+           (original                    (symbol-function 'provider--check-connection-owner))
+           (checks 0) (attempts 0) (ended nil))
+      (when (eq mode ':before-registration) (provider-cancel-connection-owner owner))
+      (test-call-with-function-replacements
+       (list (list 'provider--check-connection-owner
+                   (lambda (episode)
+                     (multiple-value-prog1 (funcall original episode)
+                       (when (and (eq state episode) (= (incf checks) 1) (eq mode ':between-checks))
+                         (provider-cancel-connection-owner owner))))))
+       (lambda ()
+         (handler-case
+             (provider--call-with-connection-episode
+              state
+              (lambda ()
+                (when (eq mode ':dispatch) (provider-cancel-connection-owner owner))
+                (provider--call-with-connection-recovery state (lambda () (incf attempts)))))
+           (provider-owner-ended () (setf ended t)))))
+      (test-assert (and ended (zerop attempts)) "cancellation at each registration boundary prevents dispatch")
+      (test-assert (not (member state *provider-connection-episodes*)) "cancelled registration is removed")))
+  (let* ((state (make-provider-connection-recovery))
+         (lock  (provider-connection-recovery-lock state)))
+    (with-lock-held (lock)
+      (provider--wait-on-connection-condition state 0)
+      (test-assert (eq (sb-thread:mutex-owner lock) sb-thread:*current-thread*)
+                   "native condition timeout returns to the caller with the mutex reacquired")))
+  nil)
+
+
+;;;; -- Detached Native Retry Accounting --
+
+(-> test-provider-native-detached-retry-accounting () null)
+(defun test-provider-native-detached-retry-accounting ()
+  "Retain retry classification only while ordinary mission policy admits further work."
+  (dolist (policy '(:block :record))
+    (dolist (terminal-p '(nil t))
+      (expanded-native-test--fixture
+       (lambda (application provider)
+         (let* ((source  (application-conversation application))
+                (context (mission-request-view-context source))
+                (view    (conversation-compaction-view (conversation-compaction-capture source)))
+                (goal    (application-goal application))
+                (calls   0)
+                (waits   0)
+                (caught  nil)
+                (result  nil))
+           (setf (getf goal :unknown-usage-policy) policy)
+           (test-call-with-function-replacements
+            (list (list 'credential-manager-credentials
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (provider-tests--credentials (application-configuration application))))
+                  (list 'dexador:post
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (incf calls)
+                          (cond
+                            ((= calls 1)
+                             (error 'http-request-failed :status 429 :body "Retry later."
+                                                        :headers nil :uri "fixture" :method ':post))
+                            (terminal-p
+                             (error 'http-request-failed :status 400 :body "Invalid request."
+                                                        :headers nil :uri "fixture" :method ':post))
+                            (t
+                             (values (json-encode
+                                      (json-object "output" (vector (json-object "type" "compaction"
+                                                                                "encrypted_content" "opaque"))
+                                                   "usage" (json-object "input_tokens" 1 "output_tokens" 2)))
+                                     200 nil)))))
+                  (list 'provider--connection-wait
+                        (lambda (state seconds)
+                          (declare (ignore state seconds))
+                          (incf waits))))
+            (lambda ()
+              (handler-case
+                  (setf result
+                        (mission-call-with-native-compaction-view
+                         context view
+                         (lambda () (provider-native-compact-conversation
+                                     provider view :tool-namespaces #() :event-callback #'identity))))
+                (serious-condition (condition) (setf caught condition)))))
+           (test-assert (= calls (if (eq policy ':block) 1 2))
+                        "Only a viable ordinary mission retries the transient native attempt.")
+           (test-assert (= waits (if (eq policy ':block) 0 1))
+                        "Quarantined requests do not enter backoff; record-only uncertainty may recover.")
+           (test-assert (eq (getf goal :status) (if (eq policy ':block) ':blocked ':active))
+                        "The selected unknown-usage policy retains terminal authority.")
+           (test-assert (= (getf goal :turns-used) calls) "Each real native attempt consumes one ordinary turn.")
+           (test-assert (= (getf goal :unknown-usage) (if (and terminal-p (eq policy ':record)) 2 1))
+                        "Failed dispatched attempts retain unknown usage without a fabricated zero.")
+           (test-assert (= (getf goal :tokens-used) (if (and (not terminal-p) (eq policy ':record)) 3 0))
+                        "Only the successful response contributes measured tokens.")
+           (test-assert (and (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved)))
+                        "Every per-attempt reservation settles once.")
+           (if (and (eq policy ':record) (not terminal-p))
+               (test-assert (and result (null caught)) "A viable detached native request recovers to success.")
+               (test-assert (and (typep caught 'mission-error)
+                                 (typep (mission-error-cause caught) 'provider-error)
+                                 (= (provider-error-status (mission-error-cause caught))
+                                    (if (eq policy ':block) 429 400)))
+                            "The exact terminal provider cause remains supervised."))))
+       :owned-p t :large-p nil)))
+  nil)
+
+(-> test-provider-native-detached-mission-lifetime () null)
+(defun test-provider-native-detached-mission-lifetime ()
+  "End real detached backoff through actual mission expiry or exact cancellation."
+  (dolist (mode '(:expiry :caller-expiry :cancel :owner-cancel))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (let* ((source   (application-conversation application))
+              (context  (mission-request-view-context source))
+              (view     (conversation-compaction-view (conversation-compaction-capture source)))
+              (goal     (application-goal application))
+              (ready    (sb-thread:make-semaphore :count 0))
+              (original (symbol-function 'provider--wait-on-connection-condition))
+              (posts 0) (waits 0) (episode nil) (failure nil) (worker nil))
+         (setf (getf goal :unknown-usage-policy) ':record)
+         (when (eq mode ':expiry)
+           (setf (getf goal :deadline) (+ (get-universal-time) 2)))
+         (test-call-with-function-replacements
+          (list (list 'credential-manager-credentials
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (provider-tests--credentials (application-configuration application))))
+                (list 'provider--connection-retry-delay
+                      (lambda (index &optional random-state)
+                        (declare (ignore index random-state)) 1))
+                (list 'provider--wait-on-connection-condition
+                      (lambda (state seconds)
+                        (setf episode state)
+                        (incf waits)
+                        (when (= posts 3) (sb-thread:signal-semaphore ready))
+                        (funcall original state seconds)))
+                (list 'dexador:post
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf posts)
+                        (values "Transient pressure." 429 nil))))
+          (lambda ()
+            (unwind-protect
+                 (progn
+                   (setf worker
+                         (sb-thread:make-thread
+                          (lambda ()
+                            (let* ((expires                              (+ (/ (get-internal-real-time) internal-time-units-per-second) 1/4))
+                                   (*provider-connection-owner-check*
+                                     (when (eq mode ':caller-expiry)
+                                       (lambda () (- expires (/ (get-internal-real-time) internal-time-units-per-second)))))
+                                   (*provider-maximum-transient-retries* 0)
+                                   (*bounded-retry-sleep-function*       #'sleep))
+                              (handler-case
+                                  (mission-call-with-native-compaction-view
+                                   context view
+                                   (lambda () (provider-native-compact-conversation
+                                               provider view :tool-namespaces #() :event-callback #'identity)))
+                                (serious-condition (condition) (setf failure condition)))))
+                          :name "detached native mission lifetime"))
+                   (unless (member mode '(:expiry :caller-expiry))
+                     (test-assert (sb-thread:wait-on-semaphore ready :timeout 5)
+                                  "A viable detached mission outlives the bounded retry maximum.")
+                     (if (eq mode ':cancel)
+                         (application-mission-stop application ':cancelled "Fixture cancellation.")
+                         (provider-cancel-connection-owner goal)))
+                   (sb-thread:join-thread worker :timeout 4 :default ':timeout)
+                   (test-assert (not (sb-thread:thread-alive-p worker)) "Actual mission lifetime promptly ends backoff.")
+                   (test-assert (typep failure 'provider-owner-ended) "Exact caller ownership terminates between attempts.")
+                   (test-assert (and episode (eq goal (provider-connection-recovery-owner episode)))
+                                "The entire detached episode retains its actual mission owner.")
+                   (test-assert (if (member mode '(:expiry :caller-expiry)) (plusp posts) (= posts 3))
+                                "No HTTP request follows the observed caller lifetime end.")
+                   (test-assert (>= waits posts) "Transient attempts reach real condition waits.")
+                   (test-assert (and (zerop (getf goal :requests-outstanding))
+                                     (zerop (getf goal :tokens-reserved))
+                                     (= posts (getf goal :turns-used))
+                                     (= posts (getf goal :unknown-usage)))
+                                "Each dispatched attempt settles its ordinary unknown usage exactly once.")
+                   (test-assert (null *provider-connection-episodes*) "The terminal episode is removed.")
+                   (test-assert (null (expanded-native-input-snapshots provider)) "Cancellation cannot select portable fallback.")
+                   (format t "~&DETACHED-LIFETIME mode=~S posts=~D waits=~D cause=~S joined=~S~%"
+                           mode posts waits (type-of failure) (not (sb-thread:thread-alive-p worker))))
+              (when (and worker (sb-thread:thread-alive-p worker))
+                (application-mission-stop application ':cancelled "Fixture safety cleanup.")
+                (when episode (provider--end-connection-episode episode))
+                (sb-thread:join-thread worker :timeout 3 :default ':timeout))
+              (test-assert (not (sb-thread:thread-alive-p worker)) "The fixture joins its sole worker."))))))
+     :owned-p t :large-p nil))
+  nil)
+
+(-> test-provider-native-detached-budget-and-zero-usage () null)
+(defun test-provider-native-detached-budget-and-zero-usage ()
+  "Preserve ordinary exhausted-turn authority and definitive unavailable zero usage."
+  (dolist (status '(429 404))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (let* ((source  (application-conversation application))
+              (context (mission-request-view-context source))
+              (view    (conversation-compaction-view (conversation-compaction-capture source)))
+              (goal    (application-goal application))
+              (waits   0)
+              (failure nil))
+         (setf (getf goal :unknown-usage-policy) ':record
+               (getf goal :turn-limit) 1)
+         (test-call-with-function-replacements
+          (list (list 'provider--connection-wait
+                      (lambda (state seconds)
+                        (declare (ignore state seconds)) (incf waits))))
+          (lambda ()
+            (expanded-native-test--transport
+             application :status status :signaled-p t :function
+             (lambda ()
+               (handler-case
+                   (mission-call-with-native-compaction-view
+                    context view
+                    (lambda () (provider-native-compact-conversation
+                                provider view :tool-namespaces #() :event-callback #'identity)))
+                 (serious-condition (condition) (setf failure condition)))))))
+         (test-assert (zerop waits) "An exhausted turn budget cannot authorize another recovery wait.")
+         (test-assert (= 1 (getf goal :turns-used)) "The sole real attempt consumes the sole normal turn.")
+         (test-assert (= (getf goal :unknown-usage) (if (= status 429) 1 0))
+                      "Only unavailable native capability has definitive zero usage.")
+         (test-assert (and (zerop (getf goal :tokens-used))
+                           (zerop (getf goal :tokens-reserved))
+                           (zerop (getf goal :requests-outstanding)))
+                      "Ordinary settlement releases all reservations without fabricated measured usage.")
+         (if (= status 429)
+             (test-assert (and (typep failure 'mission-error) (eq (mission-error-reason failure) ':exhausted)
+                               (eq (getf goal :status) ':exhausted))
+                          "Ordinary exhaustion, not the retryable condition, owns the terminal decision.")
+             (test-assert (null failure) "Unavailable capability returns normally with known zero usage."))))
+     :owned-p t :large-p nil))
+  nil)
+
+
+;;;; -- Inherited Caller Lifetime --
+
+(-> provider-tests--caller-entry (keyword application model-provider &key (:function function)) *)
+(defun provider-tests--caller-entry (entry application provider &key function)
+  "Enter the ordinary owning boundaries, including the agent's explicit operation."
+  (let ((conversation (application-conversation application)))
+    (flet ((stream () (provider-stream-turn provider conversation :tool-namespaces #() :event-callback #'identity)))
+      (ecase entry
+        (:goal
+         (application--call-with-goal-connection-owner application #'stream))
+        (:stream
+         (stream))
+        (:legacy
+         (mission-call-with-provider-operation conversation #'stream))
+        (:explicit
+         (let ((owner (make-provider-operation-owner)))
+           (provider-call-with-operation-owner
+            owner (lambda () (mission-call-with-provider-operation
+                              conversation #'stream :owner owner :operation (make-provider-operation))))))
+        (:agent
+         (funcall function))))))
+
+(-> test-provider-ordinary-caller-composition () null)
+(defun test-provider-ordinary-caller-composition ()
+  "Check inherited numeric and signaling authority through actual ordinary requests."
+  (dolist (entry '(:goal :stream :legacy :explicit :agent))
+    (dolist (remaining '(1/100 0 -1 120 nil :signal))
+      (route-tests--call-with-runtime
+       (lambda (provider unused configuration)
+         (declare (ignore unused))
+         (let* ((application (mission-inference-test--application configuration provider))
+                (agent       (application-agent application))
+                (goal nil) (calls 0) (observed nil) (failure nil) (signal-seen nil)
+                (original    (make-condition 'simple-error :format-control "Inherited caller cancellation."))
+                (*provider-connection-owner-check*
+                  (lambda () (if (eq remaining :signal) (error original) remaining))))
+           (unwind-protect
+                (progn
+                  (setf (agent-provider agent) provider
+                        (config :session-title-generation-p configuration) nil
+                        (config :provider-fallback-mappings configuration) "[]")
+                  (if (eq entry :goal)
+                      (setf (application-goal application) (list :status :active))
+                      (application-mission-start application (mission-test--specification :turns 8 :tokens 10000)))
+                  (setf goal (application-goal application))
+                  (test-call-with-function-replacements
+                   (list (list 'redact (lambda (text &key language model-directory runtime-library)
+                                        (declare (ignore language model-directory runtime-library)) (values text :ok)))
+                         (list 'cl-llm-provider-api::provider-execute-request
+                               (lambda (&rest arguments)
+                                 (declare (ignore arguments))
+                                 (incf calls)
+                                 (setf observed (funcall *provider-connection-owner-check*))
+                                 (mission-test--result "Caller-owned result."))))
+                   (lambda ()
+                     (handler-bind ((serious-condition (lambda (condition) (when (eq condition original) (setf signal-seen t)))))
+                       (handler-case
+                           (provider-tests--caller-entry entry application provider
+                                                         :function (lambda () (agent-run-user-turn agent "Caller lifetime." :tools-p nil)))
+                         (serious-condition (condition) (setf failure condition))))))
+                  (setf signal-seen (eq original (if (typep failure 'mission-error) (mission-error-cause failure) failure)))
+                  (cond ((eq remaining :signal)
+                         (test-assert (and signal-seen failure (zerop calls)) "Inherited cancellation identity survives every owning entry."))
+                        ((and (numberp remaining) (<= remaining 0))
+                         (test-assert (and failure (zerop calls)) "Elapsed inherited caller prevents provider dispatch."))
+                        (t
+                         (test-assert (and (null failure) (= calls 1)) "A viable ordinary caller dispatches once.")
+                         (test-assert (if (eq entry :goal)
+                                          (eql observed remaining)
+                                          (and (numberp observed) (plusp observed)
+                                               (or (null remaining) (<= observed remaining))))
+                                      "Owning boundaries preserve the caller minimum, including NIL and longer callers.")))
+                  (unless (eq entry :goal)
+                    (test-assert (and (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved)))
+                                 "Ordinary caller unwind settles reservations."))
+                  (format t "~&CALLER-ENTRY ~S remaining=~S requests=~D observed=~S cause=~S identity=~S~%"
+                          entry remaining calls observed (type-of failure) signal-seen))
+             (unless (eq entry :goal) (mission-detach application))
+             (remhash application *mission-schedule-services*)
+             (terminal-ui-stop (application-ui application))))))))
+  nil)
+
+(-> test-provider-ordinary-caller-real-wait () null)
+(defun test-provider-ordinary-caller-real-wait ()
+  "Expire inherited callers in genuine opening backoff through ordinary entry paths."
+  (dolist (entry '(:goal :stream :legacy :explicit :agent))
+    (dolist (mode '(:expiry :cancel))
+      (route-tests--call-with-runtime
+       (lambda (provider unused configuration)
+         (declare (ignore unused))
+         (let* ((application                          (mission-inference-test--application configuration provider))
+                (agent                                (application-agent application))
+                (original-wait                        (symbol-function 'provider--wait-on-connection-condition))
+                (cancel                               (make-condition 'simple-error :format-control "Caller cancelled in real backoff."))
+                (expires                              (+ (/ (get-internal-real-time) internal-time-units-per-second) 1/4))
+                (posts 0) (waits 0) (failure nil) (signal-seen nil)
+                (*bounded-retry-sleep-function*       #'sleep)
+                (*provider-maximum-transient-retries* 0)
+                (*provider-connection-owner-check*
+                  (lambda ()
+                    (when (and (eq mode :cancel) (plusp waits)) (error cancel))
+                    (- expires (/ (get-internal-real-time) internal-time-units-per-second)))))
+           (unwind-protect
+                (progn
+                  (setf (agent-provider agent) provider
+                        (config :session-title-generation-p configuration) nil
+                        (config :provider-fallback-mappings configuration) "[]")
+                  (if (eq entry :goal)
+                      (setf (application-goal application) (list :status :active))
+                      (progn
+                        (application-mission-start application (mission-test--specification :turns 16 :tokens 10000))
+                        (setf (getf (application-goal application) :unknown-usage-policy) :record)))
+                  (test-call-with-function-replacements
+                   (list (list 'redact (lambda (text &key language model-directory runtime-library)
+                                        (declare (ignore language model-directory runtime-library)) (values text :ok)))
+                         (list 'provider--connection-retry-delay
+                               (lambda (index &optional random-state) (declare (ignore index random-state)) 1))
+                         (list 'provider--wait-on-connection-condition
+                               (lambda (state seconds) (incf waits) (funcall original-wait state seconds)))
+                         (list 'dexador:post
+                               (lambda (&rest arguments)
+                                 (declare (ignore arguments))
+                                 (incf posts)
+                                 (if (> posts 2) (error "Diagnostic safety dispatch limit.")
+                                     (values "Transient pressure." 429 nil)))))
+                   (lambda ()
+                     (handler-bind ((serious-condition (lambda (condition) (when (eq condition cancel) (setf signal-seen t)))))
+                       (handler-case
+                           (provider-tests--caller-entry entry application provider
+                                                         :function (lambda () (agent-run-user-turn agent "Wait for caller." :tools-p nil)))
+                         (serious-condition (condition) (setf failure condition))))))
+                  (test-assert (and (= posts 1) (plusp waits) failure) "The shorter caller ends genuine wait before a second POST.")
+                  (setf signal-seen (eq cancel (if (typep failure 'mission-error) (mission-error-cause failure) failure)))
+                  (test-assert (if (eq mode :cancel) signal-seen
+                                   (typep (if (typep failure 'mission-error) (mission-error-cause failure) failure) 'provider-owner-ended))
+                               "Real backoff retains elapsed caller and exact signaling cancellation authority.")
+                  (test-assert (null *provider-connection-episodes*) "Caller termination removes the exact episode.")
+                  (unless (eq entry :goal)
+                    (let ((goal (application-goal application)))
+                      (test-assert (and (= 1 (getf goal :turns-used)) (= 1 (getf goal :unknown-usage))
+                                        (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved)))
+                                   "Real dispatched failure settles ordinary accounting once.")))
+                  (format t "~&CALLER-WAIT ~S ~S POST=~D waits=~D cause=~S identity=~S~%"
+                          entry mode posts waits (type-of failure) signal-seen))
+             (unless (eq entry :goal) (mission-detach application))
+             (remhash application *mission-schedule-services*)
+             (terminal-ui-stop (application-ui application))))))))
   nil)

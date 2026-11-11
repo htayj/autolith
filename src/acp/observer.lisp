@@ -202,10 +202,23 @@ fragments that providers interleave with empty content deltas."
 (defmethod agent-observer-status ((observer acp-observer) status details)
   "Translate provider and durable tool lifecycle events to ACP updates."
   ;; Completion events must be sent before the cancelled prompt response.
-  (unless (eq status ':tool-call-completed)
+  (unless (or (eq status ':tool-call-completed)
+              (and (eq status :provider-connection)
+                   (member (getf details :phase) '(:completed :cancelled :terminated :suspended))))
     (acp-session-check-cancelled (acp-observer-session observer)))
   (with-lock-held ((acp-observer-lock observer))
     (case status
+      (:provider-connection
+       (acp-extension-notify
+        (acp-observer-session observer) "provider-connection"
+        (agentcomms:json-object
+         "episode" (getf details :episode)
+         "phase" (string-downcase (symbol-name (getf details :phase)))
+         "endpoint" (getf details :endpoint)
+         "attempt" (getf details :attempt)
+         "routeIndex" (getf details :route-index)
+         "delay" (or (getf details :delay) :null)
+         "nextRetryAt" (or (getf details :next-retry-at) :null))))
       (:user-message-persisted
        (setf (acp-observer-turn-sequence observer) (getf details :sequence)))
       (:provider-request-started

@@ -1069,6 +1069,10 @@ its parenthesis open, and are dropped once the name closes it itself."
 (defun terminal-ui--agent-trace-spans-at
     (activity now limit &key (show-omitted-p t))
   "Return a bounded chronological tool trace for ACTIVITY at monotonic NOW."
+  (when (getf activity :provider-connections)
+    (return-from terminal-ui--agent-trace-spans-at
+      (loop for details in (getf activity :provider-connections)
+            append (list (terminal-span ':notice (provider-connection-status-text details))))))
   (multiple-value-bind (tools omitted-count)
       (terminal-ui--agent-trace-tools activity limit)
     (let* ((current-tool (getf activity :current-tool))

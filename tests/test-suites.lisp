@@ -18,6 +18,58 @@
   test-usage-display-styling-gate
   test-usage-display-command)
 
+(define-test-suite provider-suspension
+  test-provider-operation-agent-resume
+  test-provider-operation-single-consumer
+  test-provider-operation-terminal-guards)
+
+(define-test-suite provider-connection-status
+  test-provider-status-lifecycle
+  test-provider-status-headless-and-observer
+  test-provider-status-terminal
+  test-provider-status-consumers
+  test-provider-status-concurrent-owners
+  test-provider-status-telemetry)
+
+(define-test-suite provider-route-accounting
+  test-provider-route-cost-attribution
+  test-provider-route-cross-family-complete-path
+  test-provider-route-context-output-incompatibility
+  test-provider-route-real-preparation-rejection
+  test-provider-route-mission-accounting
+  test-provider-route-terminal-stream-usage)
+
+(define-test-suite provider-runtime-routing
+  test-provider-runtime-routing-cycle
+  test-provider-runtime-routing-terminal-and-generation
+  test-provider-runtime-routing-projection-rejection
+  test-provider-runtime-throttling)
+
+(define-test-suite provider-route-configuration
+  test-provider-route-defaults
+  test-provider-route-settings-validation
+  test-provider-route-explicit-order-and-isolation
+  test-provider-route-terminal-resolution)
+
+(define-test-suite provider-connection-recovery
+  test-provider-ordinary-caller-composition
+  test-provider-ordinary-caller-real-wait
+  test-provider-native-detached-retry-accounting
+  test-provider-native-detached-mission-lifetime
+  test-provider-native-detached-budget-and-zero-usage
+  test-provider-recovery-native-opening
+  test-provider-recovery-native-cancellation
+  test-provider-recovery-long-ladder
+  test-provider-recovery-service-and-semantic-controls
+  test-provider-recovery-cumulative-generation
+  test-provider-recovery-native-refusal-to-healthy)
+
+(define-test-suite provider-recovery-lifetime
+  test-provider-recovery-owner-deadline
+  test-provider-recovery-dns-codes
+  test-provider-recovery-owned-waiter
+  test-provider-recovery-repeated-opening-timeout)
+
 (define-test-suite context-admission
   test-context-boundary-prepare-change
   test-context-boundary-headroom-change
@@ -1048,7 +1100,9 @@
   copilot-test--authentication-repairs-route-cache
   copilot-test--auto-routing
   copilot-test--auto-session-boundary
-  copilot-test--request-failure-context)
+  copilot-test--request-failure-context
+  copilot-test--connection-display-protocols
+  copilot-test--connection-display-auto-renewal)
 
 (define-test-suite fireworks-provider
   fireworks-provider-test--selection
@@ -1933,7 +1987,17 @@
   test-compaction-recovery-mission-accounting
   test-compaction-recovery-selected-route
   test-compaction-recovery-exhaustion
+  test-compaction-restored-terminal-http
+  test-compaction-restored-returned-codex-quota
+  test-compaction-terminal-protocol-after-recovery
+  test-compaction-terminal-observer-unwind
+  test-compaction-staged-terminal-native
+  test-compaction-terminal-sse-aliases
+  test-compaction-restored-terminal-disposal
+  test-expanded-native-auth-exhaustion-after-recovery
   test-expanded-native-unavailable-negative-controls
+  test-expanded-native-terminal-recovery-controls
+  test-expanded-native-persistent-owner-lifetime
   test-expanded-native-unavailable-representations
   test-expanded-native-unavailable-ordinary
   test-expanded-native-unavailable-manual

@@ -156,6 +156,9 @@
    (status :initform ':queued :accessor task-progress-status :type
            keyword :documentation
            "The queued, running, completed, failed, or aborted state.")
+   (provider-connections
+    :initform nil :accessor task-progress-provider-connections :type list
+    :documentation "Active safe recovery statuses, keyed by exact episode within this job.")
    (current-tool
     :initform      nil
     :accessor      task-progress-current-tool

@@ -472,7 +472,7 @@ needs the few most recent calls to recognize an oscillation."
 (defgeneric agent-run-user-turn
     (agent content
      &key observer goal-context tools-p tool-allowlist tool-restriction-p
-          pending-input-identifier automatic-p operation-request)
+           pending-input-identifier automatic-p operation-request provider-operation-owner)
   (:documentation
    "Persist user CONTENT, run model and optional tool rounds, and return the final provider result.
 
@@ -505,7 +505,7 @@ request that carries its expansion."
     ((agent agent) (content string)
      &key (observer (make-instance 'agent-observer)) goal-context (tools-p t)
           tool-allowlist (tool-restriction-p nil) pending-input-identifier
-          automatic-p operation-request)
+           automatic-p operation-request provider-operation-owner)
   "Normalize a textual user turn before running it through AGENT."
   (agent-run-user-turn agent
                        (user-message-input-create :text content)
@@ -516,13 +516,14 @@ request that carries its expansion."
                        :tool-restriction-p       tool-restriction-p
                        :pending-input-identifier pending-input-identifier
                        :automatic-p              automatic-p
-                       :operation-request        operation-request))
+                       :operation-request        operation-request
+                       :provider-operation-owner provider-operation-owner))
 
 (defmethod agent-run-user-turn
     ((agent agent) (content user-message-input)
      &key (observer (make-instance 'agent-observer)) goal-context (tools-p t)
           tool-allowlist (tool-restriction-p nil) pending-input-identifier
-          automatic-p operation-request)
+           automatic-p operation-request provider-operation-owner)
   "Run one serialized user turn through AGENT while presenting events to OBSERVER."
   (unless (or (non-empty-string-p (user-message-input-text content))
               (user-message-input-image-pathnames content))
@@ -570,8 +571,31 @@ request that carries its expansion."
                   :tools-p            tools-p
                   :tool-allowlist     tool-allowlist
                   :tool-restriction-p tool-restriction-p
-                  :request-number     compaction-requests))
+                   :request-number    compaction-requests
+                   :operation-owner   provider-operation-owner))
             (conversation-clear-ephemeral-input-items conversation))))))))
+
+(-> agent-resume-provider-operation
+    (agent provider-operation &key (:owner provider-operation-owner)
+                                  (:observer agent-observer) (:goal-context (option string))) provider-result)
+(defun agent-resume-provider-operation
+    (agent operation &key owner (observer (make-instance 'agent-observer)) goal-context)
+  "Rebuild the interrupted ordinary request from current conversation without appending user input.
+OWNER must already own OPERATION. The outer work scope covers this call and any
+subsequent handoff publication; current preparation and ordinary accounting run anew."
+  (unless (and owner (eq operation (provider-operation-owner-operation owner))
+               (eq owner (provider-operation-owner-scope operation)))
+    (error 'provider-operation-refused :message "The resume does not belong to this work scope."))
+  (with-lock-held ((agent-turn-lock agent))
+    (unwind-protect
+         (agent--run-provider-loop
+          agent observer :goal-context goal-context
+          :tools-p                     (provider-operation-tools-p operation)
+          :tool-allowlist              (copy-list (provider-operation-tool-allowlist operation))
+          :tool-restriction-p          (provider-operation-tool-restriction-p operation)
+          :request-number              (provider-operation-request-number operation)
+          :operation-owner owner :resume-operation operation)
+      (conversation-clear-ephemeral-input-items (agent-conversation agent)))))
 
 
 ;;;; -- Provider and Persistence Flow --
@@ -610,6 +634,9 @@ CONVERSATION is given, persisted as provider metadata under REQUEST-NUMBER so
 retries stay auditable next to the request they belong to."
   (lambda (event)
     (typecase event
+      (provider-connection-event
+       (agent-observer-status observer :provider-connection
+                              (copy-list (provider-connection-event-details event))))
       (memory-context-event
        (agent-observer-status
         observer :related-memories
@@ -1949,22 +1976,24 @@ publication. Return issued request count and optional next-request details."
                           (:tools-p boolean)
                           (:tool-allowlist (option list))
                           (:tool-restriction-p boolean)
-                          (:request-number (integer 0)))
+                          (:request-number (integer 0))
+                          (:operation-owner (option provider-operation-owner))
+                          (:resume-operation (option provider-operation)))
     provider-result)
 (defun agent--run-provider-loop
     (agent observer
      &key goal-context (tools-p t) tool-allowlist (tool-restriction-p nil)
-          (request-number 0))
+           (request-number 0) operation-owner resume-operation)
   "Run provider and optional tool rounds until AGENT's turn completes.
 
 REQUEST-NUMBER counts provider requests the turn already issued before the
 loop, so compaction ahead of the user message shares the turn's budget."
     (let ((*task-unfinished-work-agent*   agent)
-          (*agent-unissued-soft-attempts* 0)
+          (*agent-unissued-soft-attempts* (if resume-operation (provider-operation-soft-attempts resume-operation) 0))
           (seen-call-identifiers          (make-hash-table :test #'equal))
           (storm-state                    (agent-tool-storm-state-create))
-          (tool-rounds                    0)
-          (tool-calls                     0)
+          (tool-rounds                    (if resume-operation (provider-operation-tool-rounds resume-operation) 0))
+          (tool-calls                     (if resume-operation (provider-operation-tool-calls resume-operation) 0))
           (first-request-p                t)
           (maximum-output-tokens          nil)
           (next-request-details           nil))
@@ -2062,17 +2091,41 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                       (mcp-tool-registry-context-contributions
                                        (agent-tool-registry agent)))))
                           (multiple-value-bind (measured-result ticket)
-                              (provider-call-with-input-measurement conversation (lambda ()
-                                                                                  (provider-stream-turn
-                                                                                   (agent-provider agent)
-                                                                                   conversation
-                                                                                   :tool-namespaces tool-namespaces
-                                                                                   :event-callback
-                                                                                   (agent--provider-event-callback
-                                                                                    observer
-                                                                                    :conversation   conversation
-                                                                                    :request-number request-number)
-                                                                                   :goal-context    goal-context)))
+                              (provider-call-with-input-measurement
+                               conversation
+                               (lambda ()
+                                   (let ((initial-p t)
+                                         (operation (or resume-operation (make-provider-operation))))
+                                     (setf resume-operation nil)
+                                    (mission-call-with-provider-operation
+                                     conversation
+                                     (lambda ()
+                                       (unless initial-p
+                                         (agent--check-request-budget agent request-number)
+                                         (agent--prepare-provider-request agent)
+                                         (incf request-number)
+                                         (agent-observer-status
+                                          observer :provider-request-started
+                                          (list :request-number request-number :tool-rounds tool-rounds)))
+                                       (setf initial-p nil)
+                                       (setf (provider-operation-request-number operation) request-number
+                                             (provider-operation-tool-rounds operation) tool-rounds
+                                             (provider-operation-tool-calls operation) tool-calls
+                                             (provider-operation-soft-attempts operation) *agent-unissued-soft-attempts*
+                                             (provider-operation-tools-p operation) tools-p
+                                             (provider-operation-tool-restriction-p operation) tool-restriction-p
+                                             (provider-operation-tool-allowlist operation) (copy-list tool-allowlist))
+                                       (provider-stream-turn
+                                        (agent-provider agent)
+                                        conversation
+                                        :tool-namespaces tool-namespaces
+                                        :event-callback
+                                        (agent--provider-event-callback
+                                         observer
+                                         :conversation   conversation
+                                         :request-number request-number)
+                                        :goal-context    goal-context))
+                                     :owner operation-owner :operation operation :configuration (agent-configuration agent)))))
                             (setf input-measurement ticket)
                             measured-result)))
                     (provider-context-budget-error (condition)
@@ -2097,6 +2150,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
                            :next-request-tool-rounds    tool-rounds)
                         (incf request-number compaction-requests)
                         (setf next-request-details details)))
+                    (provider-operation-transfer (condition)
+                      (error condition))
                     (provider-error (condition)
                       (conversation-append-provider-metadata
                        conversation

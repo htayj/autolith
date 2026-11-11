@@ -1,0 +1,63 @@
+#+title: Explicit provider fallback configuration
+
+Set =:provider-fallback-mappings= to a JSON array of route chains. Each chain
+contains a primary =[provider, model]= pair followed by its ordered fallback
+pairs. Use exact registered model identifiers and explicit provider names.
+
+#+begin_src lisp
+(settings :provider-fallback-mappings
+          "[[[\"chatgpt\",\"gpt-6.1-sol\"],[\"grok\",\"grok-4.5\"]]]")
+(settings :provider-fallback-threshold 3)
+#+end_src
+
+The default mapping is the empty string; ="[]"= also selects no fallbacks.
+The failure threshold defaults to three and accepts positive integers.
+Different-model mappings explicitly authorize disclosure of future request
+content to the configured alternate provider and model. Configure only routes
+you authorize. Duplicate primary chains, repeated routes within a chain and
+self routes are invalid. Model identifiers are case-sensitive; provider names
+are canonicalized through the provider registry.
+
+This configuration interface resolves local route descriptions only. Request
+compatibility and ordinary credentials must be checked before alternate dispatch.
+Resolution performs no login, model discovery, provider construction or health
+request, and does not change the selected primary provider or model.
+
+
+Each ordinary streaming request starts on its primary route. After the
+configured number of eligible failures before generation, try the next route
+in order. After the last route, cycle back to the primary. Backoff continues
+across route changes, with a ceiling of 300 seconds per wait and the existing
+caller lifetime as the retry boundary.
+
+For each attempt, prepare the logical conversation and tools through the
+selected provider's ordinary request path and resolve its ordinary credentials.
+A preparation, authentication or configuration failure is terminal. Once
+generation starts, apply the existing finite streaming safety policy rather
+than changing routes. A successful request ends recovery immediately.
+
+
+* Connection status
+
+During ordinary streaming recovery, inspect the episode identifier, sanitized
+endpoint host and optional port, attempt, phase, delay and next retry time in
+terminal notices or child activity. ACP clients receive the same fields in
+=_autolith/event= notifications with kind =provider-connection=. Headless
+callers can observe =:provider-connection= through the ordinary agent observer.
+Terminal phases remove only their matching child episode. Cancellation and
+caller expiry terminate the episode through the ordinary ownership path.
+
+Endpoint notices omit user information, paths, queries and fragments. Invalid
+endpoint identities appear as =endpoint unavailable=. Existing model-attempt
+telemetry records ordinary attempt outcomes; endpoint notices and raw provider
+conditions are not exported as telemetry attributes.
+
+
+* Interrupted ordinary operations
+
+An explicit outer work scope may retain numeric attempt, route and backoff
+history after a finite ordinary invocation unwinds and settles. Resume only
+the exact conversation, owner and cancellation epoch, under the original caller
+deadline and unchanged route declaration. Rebuild the current conversation and
+tools and resolve ordinary credentials for the new invocation. The scope owns
+terminal disposal; a second consumer cannot claim the same retired history.

@@ -5,6 +5,16 @@
 (defparameter *llm-usage-events-file* nil
   "Override the JSONL destination; NIL uses ANALYTICS_EVENTS_FILE at request time.")
 
+(defparameter *provider-request-cost-owner* nil
+  "A fresh per-invocation cell naming its successful attempt provider, or NIL outside a call.")
+
+(defmethod provider-attempt-turn :around
+    ((provider subscription-provider) (conversation conversation) &key &allow-other-keys)
+  "Attribute a completed attempt without settling the surrounding logical request."
+  (multiple-value-prog1 (call-next-method)
+    (when *provider-request-cost-owner*
+      (setf (first *provider-request-cost-owner*) provider))))
+
 (-> llm-usage--destination () (or null pathname string))
 (defun llm-usage--destination ()
   "Return the configured destination, or NIL when export is disabled."
@@ -28,7 +38,12 @@
                 "source" "autolith" "kind" "llm-usage"
                 "actor" (or (uiop:getenv "ANALYTICS_ACTOR")
                             (uiop:getenv "USER") (uiop:getenv "USERNAME") "unknown")
-                "model" (or (conversation-model conversation) "unknown")
+                "model" (or (let ((configuration
+                                    (and *provider-request-cost-owner*
+                                         (provider--cost-configuration
+                                          (first *provider-request-cost-owner*)))))
+                              (and configuration (config :model configuration)))
+                            (conversation-model conversation) "unknown")
                 "requests" 1 "wall_s" wall-seconds))
         (usage (provider-result-usage result)))
     (when (hash-table-p usage)
@@ -64,10 +79,11 @@
     ((provider t) (conversation conversation) &key &allow-other-keys)
   "Check the cost limit, then record and optionally export successful requests."
   (provider-cost-check provider)
-  (let* ((destination (llm-usage--destination))
-         (started     (get-internal-real-time))
-         (results     (multiple-value-list (call-next-method))))
-    (provider-cost-record provider (first results))
+  (let* ((*provider-request-cost-owner* (list provider))
+         (destination                   (llm-usage--destination))
+         (started                       (get-internal-real-time))
+         (results                       (multiple-value-list (call-next-method))))
+    (provider-cost-record (first *provider-request-cost-owner*) (first results))
     (when destination
       (llm-usage--export
        conversation (first results) :destination destination

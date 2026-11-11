@@ -119,6 +119,15 @@
                                                      (make-string-input-stream source))))
               (failures                       nil)
               (expired                        nil)
+              (reading-p                      nil)
+              (read-line                      (symbol-function 'sse-read-line-within-inactivity-deadline))
+              (deadline                       (symbol-function 'provider-call-with-response-deadline))
+              (*sse-read-line-function*
+                (lambda (stream)
+                  ;; Bind the installed function hook, not its already captured name.
+                  (setf reading-p t)
+                  (unwind-protect (funcall read-line stream)
+                    (setf reading-p nil))))
               (*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
          (credential-source-save
           (credential-manager-primary-source (provider-credential-manager provider))
@@ -127,11 +136,15 @@
           (when (eq mode ':inactivity)
             (list (list 'provider-call-with-response-deadline
                         (lambda (seconds function)
-                          (test-assert (= seconds *sse-inactivity-seconds*) "The SSE reader owns this inactivity deadline.")
-                          (unless expired
-                            (setf expired t)
-                            (error 'sb-sys:deadline-timeout))
-                          (funcall function)))))
+                          (if reading-p
+                              (progn
+                                (test-assert (= seconds *sse-inactivity-seconds*)
+                                             "The SSE reader owns this inactivity deadline.")
+                                (unless expired
+                                  (setf expired t)
+                                  (error 'sb-sys:deadline-timeout))
+                                (funcall function))
+                              (funcall deadline seconds function))))))
           (lambda ()
             (multiple-value-bind (bodies results)
                 (test-telemetry-hooks--capture

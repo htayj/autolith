@@ -1516,7 +1516,10 @@
                                                                                        (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))))))
              (values (make-instance 'test-character-input-stream :source source) 200 nil)))
           (:http
-           (values (make-instance 'test-character-input-stream :source "Synthetic HTTP failure") 500 nil))
+           ;; Terminal failure uses HTTP400; opening HTTP500 recovery belongs to the caller lifetime.
+           (values (make-instance 'test-character-input-stream :source "Synthetic HTTP failure") 400 nil))
+          (:http-owner-expiry
+           (values (make-instance 'test-character-input-stream :source "Persistent HTTP failure") 500 nil))
           (otherwise
            (let* ((mode   *context-measured-lifecycle-mode*)
                   (usage  (if (hash-table-p mode) mode (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))
@@ -1604,6 +1607,42 @@
              (when (member mode '(:cancel :downstream))
                (test-assert completion-seen "Cancellation/downstream failure occurs after actual completion."))))
          (test-assert (equal before (conversation-usage owner)) "Failed attempts append no paid usage metadata."))
+       (let ((before       (copy-tree (conversation-usage owner)))
+             (calls        (context-admission-test-provider-network-calls provider))
+             (remaining    10)
+             (waits        0)
+             (entries      0)
+             (ticket       nil)
+             (owner-checks 0))
+         (test-assert
+          (eq :owner-ended
+              (catch 'owner-expiry-guard
+                (let ((*context-measured-lifecycle-mode* :http-owner-expiry)
+                      (*provider-connection-owner-check*
+                        (lambda () (incf owner-checks) remaining))
+                      (*bounded-retry-sleep-function*
+                        (lambda (seconds)
+                          (test-assert (plusp seconds) "Opening recovery starts with positive caller lifetime.")
+                          (when (> (incf waits) 1) (throw 'owner-expiry-guard :extra-wait))
+                          (test-assert (equal receipt (conversation-input-measurement owner)) "A retrying failure cannot publish measured input.")
+                          (test-assert (equal before (conversation-usage owner)) "A retrying failure cannot publish paid usage.")
+                          (setf remaining 0)))
+                      (*context-measured-transport-hook*
+                        (lambda ()
+                          ;; Bound a broken expiry control without disguising its extra dispatch.
+                          (when (> (incf entries) 1) (throw 'owner-expiry-guard :extra-dispatch)))))
+                  (handler-case
+                      (progn
+                        (setf ticket (nth-value 1 (context-measured-tests--attempt fixture)))
+                        :returned)
+                    (provider-owner-ended () :owner-ended)))))
+          "Perpetual HTTP500 ends with the specific caller-expiry condition.")
+         (test-assert (plusp owner-checks) "The ordinary provider episode inherits the caller lifetime check.")
+         (test-assert (= waits 1) "Caller ownership expires in the first opening-recovery wait.")
+         (test-assert (and (= entries 1) (= (1+ calls) (context-admission-test-provider-network-calls provider))) "Expiry prevents a second actual transport dispatch.")
+         (test-assert (null ticket) "Caller expiry cannot return a paid measurement ticket.")
+         (test-assert (equal receipt (conversation-input-measurement owner)) "Caller expiry preserves the earned measurement.")
+         (test-assert (equal before (conversation-usage owner)) "Caller expiry appends no paid usage metadata."))
        (let ((*context-measured-lifecycle-mode* (json-object "input_tokens" 170000 "output_tokens" 30 "total_tokens" 170030)))
          (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
            (test-assert (not (null ticket)) "A later successful retry earns its own ticket.")

@@ -2,6 +2,8 @@
 
 ;;;; -- Provider Protocol --
 
+;; These streamed error types carry no HTTP status in the pinned wire client.
+;; Normalize these exact variants for caller-lifetime recovery and streaming safety.
 (setf *provider-retryable-event-error-codes*
       (union '("service_unavailable_error" "overloaded_error" "rate_limit_error")
              *provider-retryable-event-error-codes*
@@ -579,12 +581,19 @@ the requests of a turn for the same reason, at commit 6f51c65958."
   (declare (type oauth-credentials credentials)
            (type conversation conversation))
   (let ((configuration (provider-configuration provider)))
-    (provider-post-event-stream
-     (config :provider-endpoint configuration)
-     (json-encode-utf8 request)
-     :headers      (provider--codex-request-headers
-                    provider credentials conversation :accept "text/event-stream")
-     :keep-alive-p t)))
+    (multiple-value-bind (body status headers)
+        (provider-post-event-stream
+         (config :provider-endpoint configuration)
+         (json-encode-utf8 request)
+         :headers      (provider--codex-request-headers
+                        provider credentials conversation :accept "text/event-stream")
+         :keep-alive-p t)
+      (if (and (integerp status) (>= status 400))
+          (progn
+            (provider-note-response-headers provider headers)
+            (provider--codex-signal-status-failure
+             provider status :headers headers :raw-body (provider--error-body-text body)))
+          (values body status headers)))))
 
 (defmethod provider-open-native-compaction
     ((provider codex-subscription-provider)
@@ -854,8 +863,10 @@ and codes follow the Codex reference at commit 6f51c65958."
   "Open an authenticated product request through portable transport normalization."
   (provider--call-with-transport-normalization
    (lambda ()
-     (provider-open-response-stream provider request :credentials credentials
-                                    :conversation                 conversation))
+     (provider--call-opening
+      (lambda ()
+        (provider-open-response-stream provider request :credentials credentials
+                                       :conversation                 conversation))))
    :terminal-errors-p t))
 
 (-> provider--open-native-compaction
@@ -1005,15 +1016,25 @@ are request-scoped and included in transport and result redaction."))
                     :code       code
                     :request-id request-id)))
 
+(-> provider--connection-display-endpoint (subscription-provider) string)
+(defun provider--connection-display-endpoint (provider)
+  "Read only optional static presentation data, never resolve a dynamic request endpoint."
+  (provider--safe-endpoint
+   (handler-case (config :provider-endpoint (provider-configuration provider))
+     (configuration-error () nil))))
+
 (defclass provider-retries-exhausted-event (provider-attempt-failed-event)
   ()
   (:documentation "The final failed attempt after the transient retry budget was spent."))
 
 (-> provider--call-with-bounded-retries
-    (subscription-provider function function)
+    (subscription-provider function function
+     &key (:recovery provider-connection-recovery) (:select-provider function))
     t)
 (defun provider--call-with-bounded-retries
-    (provider attempt-function event-callback)
+    (provider attempt-function event-callback
+     &key (recovery (make-provider-connection-recovery))
+       (select-provider (lambda () provider)))
   "Call ATTEMPT-FUNCTION with bounded authentication and persistent transport recovery.
 
 ATTEMPT-FUNCTION receives the credential refresh flag and the event callback
@@ -1024,34 +1045,64 @@ original condition or weakening the streaming safety limit."
         (maximum-retries    *provider-maximum-transient-retries*))
     (labels ((observe (event)
                "Retain the current request's last failure before forwarding EVENT."
+               (when (typep event '(or assistant-delta-event reasoning-delta-event
+                                      cl-llm-provider-api:generation-progress-event
+                                      provider-item-event))
+                 (setf (provider-connection-recovery-generation-started-p recovery) t))
                (when (typep event 'provider-attempt-failed-event)
                  (setf last-failure event)
                  (when (provider-attempt-failed-event-retryable-p event)
                    (incf retryable-failures)))
-               (funcall event-callback event))
+               (handler-case (funcall event-callback event)
+                 (error (condition)
+                   (error 'provider-observer-failure :cause condition))))
 
              (attempt-with-authentication (event-callback)
                "Run one logical request with bounded credential recovery."
-               (let* ((manager       (provider-credential-manager provider))
-                      (refreshable-p (credential-manager-refreshable-p manager)))
+                (let* ((selected      (funcall select-provider))
+                       (manager       (provider-credential-manager selected))
+                       (refreshable-p (credential-manager-refreshable-p manager)))
+                 (provider--check-connection-owner recovery)
+                 (setf (provider-connection-recovery-endpoint recovery)
+                       (provider--connection-display-endpoint selected))
+                 (let ((index (provider-connection-recovery-route-index recovery)))
+                   (when (and (provider-connection-recovery-last-route-index recovery)
+                              (/= index (provider-connection-recovery-last-route-index recovery)))
+                     (provider--connection-status recovery :route-changed))
+                   (setf (provider-connection-recovery-last-route-index recovery) index))
+                 (provider--connection-status recovery :attempting)
                  (call-with-credential-refresh
                   (lambda (force-refresh)
-                    (provider--call-with-transport-normalization
-                     (lambda ()
-                       (funcall attempt-function force-refresh event-callback))))
+                   (provider--check-connection-owner recovery)
+                   (provider--call-with-transport-normalization
+                    (lambda ()
+                      (funcall attempt-function force-refresh event-callback))))
                   :refreshable-p refreshable-p
                   :exhausted-function
                   (lambda (condition)
                     (error (provider--authentication-condition
-                            provider condition :refreshable-p refreshable-p)))))))
+                             selected condition :refreshable-p refreshable-p)))))))
       (if *provider-compaction-recovery-permit*
           ;; A recovery permit authorizes one dispatch, never an authentication or
           ;; streaming retry. Preserve the original unrelated failure for the caller.
           (provider--call-with-transport-normalization
            (lambda () (funcall attempt-function nil event-callback)))
           (handler-case
-              (call-with-streaming-retries #'attempt-with-authentication #'observe
-                                          :maximum-retries maximum-retries)
+              (provider--call-with-connection-episode
+               recovery
+               (lambda ()
+                 (setf (provider-connection-recovery-event-callback recovery) #'observe)
+                 (provider--call-with-connection-status
+                  recovery
+                  (lambda ()
+                    (call-with-streaming-retries
+                     #'attempt-with-authentication #'observe
+                     :maximum-retries maximum-retries
+                     :call-with-attempt
+                     (lambda (attempt)
+                       (provider--call-with-connection-recovery recovery attempt)))))))
+            (provider-observer-failure (condition)
+              (error (provider-observer-failure-cause condition)))
             (provider-retryable-error (condition)
               ;; The same final attempt must escape the ladder. A callback failure,
               ;; cancellation, or streaming safety stop is not transient exhaustion.
@@ -1077,21 +1128,53 @@ original condition or weakening the streaming safety limit."
      event-callback
      goal-context
      compaction-p)
-  "Stream one subscription turn with bounded authentication and transport retries."
+  "Stream one logical request with request-local serial fallback and credential recovery."
   (declare (type vector tool-namespaces)
            (type function event-callback))
-  (provider--call-with-bounded-retries
-   provider
-   (lambda (force-refresh attempt-callback)
-     (provider-attempt-turn
-      provider
-      conversation
-      :tool-namespaces tool-namespaces
-      :event-callback  attempt-callback
-      :force-refresh   force-refresh
-      :goal-context    goal-context
-      :compaction-p    compaction-p))
-   event-callback))
+  (let* ((configuration (provider-configuration provider))
+         (recovery      (make-provider-connection-recovery))
+         (routes        nil)
+         (providers     nil))
+    ;; Empty mappings preserve ordinary unregistered/custom provider operation.
+    ;; A compaction permit still authorizes precisely one original dispatch.
+    (unless (or *provider-compaction-recovery-permit*
+                (null (configuration--fallback-mappings
+                       (config :provider-fallback-mappings configuration))))
+      (multiple-value-bind (resolved threshold) (provider-routes-resolve configuration)
+        (setf routes (coerce resolved 'vector)
+              providers (make-array (length routes) :initial-element nil)
+              (aref providers 0) provider
+              (provider-connection-recovery-route-count recovery) (length routes)
+              (provider-connection-recovery-route-threshold recovery) threshold)))
+    (unless (or compaction-p *provider-compaction-recovery-permit*)
+      (provider--restore-suspension recovery conversation configuration)
+      (when (and *provider-connection-capture*
+                 (eq conversation (first *provider-connection-capture*)))
+        (setf (second *provider-connection-capture*) recovery
+              (third *provider-connection-capture*) configuration)))
+    (labels ((selected-provider ()
+               "Construct only the selected route through its ordinary local factory."
+               (if (null routes)
+                   provider
+                   (let ((index (provider-connection-recovery-route-index recovery)))
+                     (or (aref providers index)
+                         (setf (aref providers index)
+                               (provider-create
+                                (provider-route-configuration (aref routes index)
+                                                              configuration))))))))
+      (provider--call-with-bounded-retries
+       provider
+       (lambda (force-refresh attempt-callback)
+         ;; Rebuild from the logical conversation and tools, never a previous wire request.
+         (provider-attempt-turn
+          (selected-provider)
+          conversation
+          :tool-namespaces tool-namespaces
+          :event-callback  attempt-callback
+          :force-refresh   force-refresh
+          :goal-context    goal-context
+          :compaction-p    compaction-p))
+       event-callback :recovery recovery :select-provider #'selected-provider))))
 
 
 ;;;; -- Native Responses Compaction --

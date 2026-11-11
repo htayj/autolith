@@ -153,6 +153,44 @@ Ordinary native defaults remain lazy and follow the current environment."
                     (gethash configuration *configuration-legacy-xdg-root-choices*)))
             root)))))
 
+(-> configuration--fallback-mappings (string) list)
+(defun configuration--fallback-mappings (text)
+  "Decode explicit ordered route chains, rejecting malformed or duplicate pairs."
+  (labels ((reject ()
+             (error 'configuration-error :message "Invalid provider fallback mappings."))
+
+           (pair (value)
+             (unless (and (typep value '(vector t)) (= 2 (length value))
+                          (every #'non-empty-string-p value))
+               (reject))
+             (list (string-downcase (aref value 0)) (aref value 1))))
+    (if (zerop (length text))
+        nil
+        (let ((value     (handler-case (json-decode text)
+                           (json-error () (reject))))
+              (primaries nil))
+          (unless (typep value '(vector t))
+            (reject))
+          (loop for chain across value
+                collect
+                (progn
+                  (unless (and (typep chain '(vector t)) (>= (length chain) 2))
+                    (reject))
+                  (let ((pairs (map 'list #'pair chain)))
+                    (when (or (member (first pairs) primaries :test #'equal)
+                              (/= (length pairs)
+                                  (length (remove-duplicates pairs :test #'equal))))
+                      (reject))
+                    (push (first pairs) primaries)
+                    pairs)))))))
+
+(-> configuration--fallback-mappings-problem (string t) (option string))
+(defun configuration--fallback-mappings-problem (text configuration)
+  "Return a terminal settings validation problem for malformed route chains."
+  (declare (ignore configuration))
+  (handler-case (progn (configuration--fallback-mappings text) nil)
+    (configuration-error () "Invalid provider fallback mappings.")))
+
 
 ;;;; -- Settings --
 
@@ -306,6 +344,22 @@ Ordinary native defaults remain lazy and follow the current environment."
   :default                        (lambda (configuration)
                                     (declare (ignore configuration))
                                     *default-reasoning-effort*))
+
+(define-setting :provider-fallback-mappings (string-setting)
+  :label                                    "Provider fallback mappings"
+  :group                                    :model
+  :documentation                            "JSON route chains: each chain starts with its explicit primary provider/model pair, followed by authorized fallback pairs."
+  :scope                                    :durable
+  :validator                                'configuration--fallback-mappings-problem
+  :default                                  "")
+
+(define-setting :provider-fallback-threshold (integer-setting)
+  :label                                     "Provider fallback threshold"
+  :group                                     :model
+  :documentation                             "Consecutive instability failures per request and route before advancing to an explicitly configured fallback."
+  :type                                      '(integer 1)
+  :scope                                     :durable
+  :default                                   3)
 
 (define-setting :openrouter-provider-routing (string-setting)
   :label                                     "OpenRouter provider routing"
