@@ -38,8 +38,14 @@ FIRST is :PENDING until a provider admits the request, then :ENTERED.
 REST holds the condition from a local refusal. Function entry and condition
 class do not establish zero usage.")
 
-(defparameter *provider-image-token-estimate* 16384
-  "Token allowance per image when provider token counts are unavailable.")
+(defparameter *provider-image-token-estimate* nil
+  "Optional portable admission allowance per image, independent of paid usage.
+
+NIL follows the current local image-preparation patch cap dynamically. This
+fallback reflects locally prepared images, not measured costs for arbitrary
+remote or MCP images or every model's image-token multiplier. Bind an explicit
+allowance or specialize provider accounting for those policies. Base64 bytes
+and URL length are never charged as text tokens.")
 
 (defgeneric provider-request-input-token-estimate (provider request)
   (:documentation
@@ -272,7 +278,7 @@ messages that later change fail closed."
   (typecase value
     (hash-table
      (if (provider-context--image-p value)
-         (values (* 4 *provider-image-token-estimate*) t)
+         (values (* 4 (or *provider-image-token-estimate* *image-input-maximum-patches*)) t)
          (let ((characters 2)
                (non-text-p nil))
            (maphash

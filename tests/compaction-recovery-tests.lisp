@@ -999,39 +999,40 @@
 (-> test-compaction-recovery-recent-images () null)
 (defun test-compaction-recovery-recent-images ()
   "Admit the real summary projection with forty-seven protected recent images at 600K."
-  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000")
-                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "4096"))
-    (with-test-configuration (configuration)
-      (dolist (separate-p '(nil t))
-        (let* ((conversation (conversation-create configuration))
-               (provider     (make-instance 'compaction-recovery-test-provider :configuration configuration))
-               (state        (make-compaction-recovery))
-               (items        (compaction-image-tests--items 100000 :separate-p separate-p))
-               (before       (mapcar #'json-encode items))
-               (source       (conversation-compaction-summary-view conversation items))
-               (view         (compaction-recovery-text-view state (compaction-recovery-view state source))))
-          (compaction-recovery-test-small-context
-           (lambda ()
-             (let* ((raw     (provider-request-object provider source #() :compaction-p t))
-                    (request (provider-request-object provider view #() :compaction-p t))
-                    (decoded (compaction-image-tests--transcript view))
-                    (outputs (remove-if-not (lambda (item) (json-string= (json-get item "type") "function_call_output")) decoded)))
-               (test-assert (> (provider-request-input-token-estimate provider raw) 600000)
-                            "The unknown-model conservative raw image allowance exceeds this window.")
-               (test-assert (= 47 (length outputs)) "All recent correlated outputs are retained.")
-               (test-assert (every (lambda (item)
-                                    (json-string= (json-get (aref (json-get item "output") 1) "type") "input_text")) outputs)
-                            "Every recent image, including protected newest images, is represented by a notice.")
-               (test-assert (null (handler-case (provider-check-request-context provider request)
-                                    (provider-context-budget-error (condition) condition)))
-                            "Actual summary request plus positive output reserve fits 600K after Tier3.")
-               (test-assert (>= (provider-request-output-reserve provider request) 4096) "Configured and wire output headroom is charged.")
-               (format t "~&RECENT-IMAGES separate=~S raw=~D projected=~D reserve=~D~%"
-                       separate-p (provider-request-input-token-estimate provider raw)
-                       (provider-request-input-token-estimate provider request)
-                       (provider-request-output-reserve provider request)))))
-          (test-assert (equal before (mapcar #'json-encode items)) "Source images survive summary preflight unchanged.")))))
-  nil)
+  (let ((*provider-image-token-estimate* 16384))
+    (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000")
+                            ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "4096"))
+      (with-test-configuration (configuration)
+        (dolist (separate-p '(nil t))
+          (let* ((conversation (conversation-create configuration))
+                 (provider     (make-instance 'compaction-recovery-test-provider :configuration configuration))
+                 (state        (make-compaction-recovery))
+                 (items        (compaction-image-tests--items 100000 :separate-p separate-p))
+                 (before       (mapcar #'json-encode items))
+                 (source       (conversation-compaction-summary-view conversation items))
+                 (view         (compaction-recovery-text-view state (compaction-recovery-view state source))))
+            (compaction-recovery-test-small-context
+             (lambda ()
+               (let* ((raw     (provider-request-object provider source #() :compaction-p t))
+                      (request (provider-request-object provider view #() :compaction-p t))
+                      (decoded (compaction-image-tests--transcript view))
+                      (outputs (remove-if-not (lambda (item) (json-string= (json-get item "type") "function_call_output")) decoded)))
+                 (test-assert (> (provider-request-input-token-estimate provider raw) 600000)
+                              "The unknown-model conservative raw image allowance exceeds this window.")
+                 (test-assert (= 47 (length outputs)) "All recent correlated outputs are retained.")
+                 (test-assert (every (lambda (item)
+                                      (json-string= (json-get (aref (json-get item "output") 1) "type") "input_text")) outputs)
+                              "Every recent image, including protected newest images, is represented by a notice.")
+                 (test-assert (null (handler-case (provider-check-request-context provider request)
+                                      (provider-context-budget-error (condition) condition)))
+                              "Actual summary request plus positive output reserve fits 600K after Tier3.")
+                 (test-assert (>= (provider-request-output-reserve provider request) 4096) "Configured and wire output headroom is charged.")
+                 (format t "~&RECENT-IMAGES separate=~S raw=~D projected=~D reserve=~D~%"
+                         separate-p (provider-request-input-token-estimate provider raw)
+                         (provider-request-input-token-estimate provider request)
+                         (provider-request-output-reserve provider request)))))
+            (test-assert (equal before (mapcar #'json-encode items)) "Source images survive summary preflight unchanged.")))))
+    nil))
 
 (-> test-compaction-recovery-image-text-controls () null)
 (defun test-compaction-recovery-image-text-controls ()
@@ -1065,51 +1066,52 @@
 (-> test-compaction-recovery-image-summary-transport () null)
 (defun test-compaction-recovery-image-summary-transport ()
   "Recover a real portable summary at the inert transport with positive reported usage."
-  (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000")
-                          ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "4096"))
-    (with-test-configuration (configuration)
-      (let* ((conversation (conversation-create configuration))
-             (provider     (make-instance 'compaction-recovery-test-provider
-                                          :configuration configuration
-                                          :results       (list (agent-test-result
-                                                                "summary" (list (agent-test-compaction-message))
-                                                                :usage (json-object "input_tokens" 120 "output_tokens" 30)))))
-             (items        (compaction-image-tests--items 100000))
-             (source       (conversation-compaction-summary-view conversation items))
-             (before       (mapcar #'json-encode items))
-             (state        (make-compaction-recovery))
-             (result       nil)
-             (candidate    nil)
-             (failure      nil))
-        (compaction-recovery-test-small-context
-         (lambda ()
-           (handler-case
-               (multiple-value-setq (result candidate)
-                 (compaction-recovery-call
-                  state provider source
-                  :dispatch  (lambda (view)
-                               (provider-stream-turn provider view :tool-namespaces #() :compaction-p t
-                                                     :event-callback (lambda (event) (declare (ignore event)))))
-                  :preflight (lambda (view)
-                               (provider-check-request-context
-                                provider (provider-request-object provider view #() :compaction-p t)))))
-             (provider-context-budget-error (condition) (setf failure condition)))))
-        (test-assert (null failure) "All protected images permit portable recovery through the actual admission boundary.")
-        (test-assert (= 1 (context-admission-test-provider-network-calls provider)) "Only the admitted summary reaches transport.")
-        (when result
-          (test-assert (= 120 (json-get (provider-result-usage result) "input_tokens")) "Positive paid input usage is preserved.")
-          (test-assert (= 30 (json-get (provider-result-usage result) "output_tokens")) "Positive paid output usage is preserved."))
-        (test-assert (equal before (mapcar #'json-encode items)) "Local refusals and successful recovery do not mutate canonical media.")
-        (test-assert (= 1 (count :plain-text (compaction-recovery-notes state)
-                               :key          (lambda (note) (getf note :tier)))) "Tier3 runs once across refused candidates.")
-        (when candidate
-          (let ((notes (copy-tree (compaction-recovery-notes state))))
-            (compaction-recovery-test-small-context
-             (lambda ()
-               (provider-check-request-context
-                provider (provider-request-object provider (compaction-recovery-view state candidate) #() :compaction-p t))))
-            (test-assert (equal notes (compaction-recovery-notes state)) "Readmission does not duplicate omission audit entries."))))))
-  nil)
+  (let ((*provider-image-token-estimate* 16384))
+    (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "600000")
+                            ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "4096"))
+      (with-test-configuration (configuration)
+        (let* ((conversation (conversation-create configuration))
+               (provider     (make-instance 'compaction-recovery-test-provider
+                                            :configuration configuration
+                                            :results       (list (agent-test-result
+                                                                  "summary" (list (agent-test-compaction-message))
+                                                                  :usage (json-object "input_tokens" 120 "output_tokens" 30)))))
+               (items        (compaction-image-tests--items 100000))
+               (source       (conversation-compaction-summary-view conversation items))
+               (before       (mapcar #'json-encode items))
+               (state        (make-compaction-recovery))
+               (result       nil)
+               (candidate    nil)
+               (failure      nil))
+          (compaction-recovery-test-small-context
+           (lambda ()
+             (handler-case
+                 (multiple-value-setq (result candidate)
+                   (compaction-recovery-call
+                    state provider source
+                    :dispatch  (lambda (view)
+                                 (provider-stream-turn provider view :tool-namespaces #() :compaction-p t
+                                                       :event-callback (lambda (event) (declare (ignore event)))))
+                    :preflight (lambda (view)
+                                 (provider-check-request-context
+                                  provider (provider-request-object provider view #() :compaction-p t)))))
+               (provider-context-budget-error (condition) (setf failure condition)))))
+          (test-assert (null failure) "All protected images permit portable recovery through the actual admission boundary.")
+          (test-assert (= 1 (context-admission-test-provider-network-calls provider)) "Only the admitted summary reaches transport.")
+          (when result
+            (test-assert (= 120 (json-get (provider-result-usage result) "input_tokens")) "Positive paid input usage is preserved.")
+            (test-assert (= 30 (json-get (provider-result-usage result) "output_tokens")) "Positive paid output usage is preserved."))
+          (test-assert (equal before (mapcar #'json-encode items)) "Local refusals and successful recovery do not mutate canonical media.")
+          (test-assert (= 1 (count :plain-text (compaction-recovery-notes state)
+                                 :key          (lambda (note) (getf note :tier)))) "Tier3 runs once across refused candidates.")
+          (when candidate
+            (let ((notes (copy-tree (compaction-recovery-notes state))))
+              (compaction-recovery-test-small-context
+               (lambda ()
+                 (provider-check-request-context
+                  provider (provider-request-object provider (compaction-recovery-view state candidate) #() :compaction-p t))))
+              (test-assert (equal notes (compaction-recovery-notes state)) "Readmission does not duplicate omission audit entries."))))))
+    nil))
 
 
 ;;;; -- Production Streaming Native Fallback --
