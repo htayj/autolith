@@ -1678,6 +1678,11 @@
   test-effort-switch
   test-public-goal-actions
   test-session-goal
+  test-session-goal-user-decision
+  test-goal-disposition-contract
+  test-goal-disposition-failures
+  test-goal-decision-reentry
+  test-goal-disposition-boundaries
   test-goal-queued-input-boundary
   test-goal-queued-unlimited-clear
   test-goal-queued-input-fifo-budget

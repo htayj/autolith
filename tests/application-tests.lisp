@@ -10274,3 +10274,357 @@
           (test-assert (eq :paused (getf (application-goal application) :status))
                        "the resumed loop observes its numeric cap"))))))
   nil)
+
+(-> test-session-goal-user-decision () null)
+(defun test-session-goal-user-decision ()
+  "Pause the first unmarked decision request before admitting another turn."
+  (with-test-configuration (configuration)
+    (let* ((conversation (conversation-create configuration))
+           (terminal     (make-instance 'recording-terminal :columns 80))
+           (ask          "This changes behavior, so I need your approval first. Should checkpoint descriptors inherit the caller setting, or keep their own setting? I will wait for that scope decision before implementing it.")
+           (item         (json-object "type" "message" "role" "assistant"
+                                      "content" (json-array (json-object "type" "output_text" "text" ask))))
+           (provider     (make-instance 'scripted-provider
+                                        :results (list (agent-test-result "first-ask" (list item) :turn-completion ':end)
+                                                       (agent-test-result "repeated-ask" (list item) :turn-completion ':end))))
+           (registry     (make-default-tool-registry))
+           (application  (make-instance 'application :configuration configuration
+                                        :conversation conversation :provider provider
+                                        :tool-registry registry :worker nil
+                                        :ui                         (terminal-ui-create :terminal terminal))))
+      (setf (application-agent application)
+            (agent-create :configuration configuration :provider provider
+                          :conversation conversation :tool-registry registry :worker nil)
+            (application-goal application)
+            (list :objective "Resolve the checkpoint behavior" :status ':active
+                  :continuations 0 :created-at (get-universal-time)))
+      (terminal-ui-start (application-ui application))
+      (unwind-protect
+           (test-call-with-function-replacements
+            (list (list 'application-job-completions-awaited-p
+                        (lambda (app)
+                          (declare (ignore app))
+                          (>= (length (scripted-provider-input-counts provider)) 2)))
+                  (list 'provider-stream-turn
+                        (let ((original (symbol-function 'provider-stream-turn)))
+                          (lambda (p c &rest keys)
+                            (if (eq *telemetry-request-role* ':goal-disposition)
+                                (agent-test-result "disposition"
+                                                   (list (json-object "type" "message" "role" "assistant"
+                                                                      "content" (json-array (json-object "type" "output_text"
+                                                                                                           "text" "{\"outcome\":\"await-user\",\"evidence\":\"I need your approval first\"}"))))
+                                                   :turn-completion ':end)
+                                (apply original p c keys))))))
+            (lambda ()
+              (application-run-message application "Investigate the checkpoint behavior.")
+              (test-assert (= 1 (length (scripted-provider-input-counts provider)))
+                           "the first question consumes only one ordinary response")
+              (test-assert (zerop (getf (application-goal application) :continuations))
+                           "no automatic continuation was admitted")
+              (test-assert (eq ':paused (getf (application-goal application) :status))
+                           "the unanswered decision pauses the goal")
+              (test-assert (eq ':awaiting-user (getf (application-goal application) :pause-reason))
+                           "the pause records an unresolved user decision")
+              (let ((before (length (conversation-records-newest conversation 100))))
+                (application--run-goal-continuations application)
+                (application--run-goal-continuations application)
+                (test-assert (= before (length (conversation-records-newest conversation 100)))
+                             "reentry creates no duplicate transition"))))
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> decision-test-result (string) provider-result)
+(defun decision-test-result (text)
+  "Create a complete scripted assistant reply for a disposition request."
+  (agent-test-result
+   "decision-test"
+   (list (json-object "type" "message" "role" "assistant"
+                      "content" (json-array (json-object "type" "output_text" "text" text))))
+   :turn-completion ':end))
+
+(-> test-call-with-decision-application (function) null)
+(defun test-call-with-decision-application (function)
+  "Exercise FUNCTION with a private application and real-user request."
+  (with-test-configuration (configuration)
+    (let* ((conversation (conversation-create configuration))
+           (provider     (make-instance 'scripted-provider :results nil))
+           (terminal     (make-instance 'recording-terminal :columns 80))
+           (registry     (make-default-tool-registry))
+           (application  (make-instance 'application :configuration configuration
+                                        :conversation conversation :provider provider
+                                        :tool-registry registry :worker nil
+                                        :ui                         (terminal-ui-create :terminal terminal))))
+      (setf (application-agent application)
+            (agent-create :configuration configuration :provider provider
+                          :conversation conversation :tool-registry registry :worker nil)
+            (application-goal application)
+            (list :objective "Implement the chosen product behavior" :status ':active
+                  :continuations 0 :created-at (get-universal-time)))
+      (conversation-append-user-message conversation "Investigate the product behavior.")
+      (terminal-ui-start (application-ui application))
+      (unwind-protect (funcall function application provider terminal)
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> test-goal-disposition-contract () null)
+(defun test-goal-disposition-contract ()
+  "Exercise semantic transport isolation and negative outcomes, not live model accuracy."
+  (dolist (reply '("Would you like an optional summary? The work is complete enough to continue independently."
+                   "Why repeat a calculation? I am implementing the fix now."
+                   "I will read the source and run the affected checks."
+                   "I could use either local tool. I chose the available one and continued."
+                   "The document quotes: Should this be enabled? I am reviewing its implementation."
+                   "The scope choice is resolved by your previous answer. Continuing."
+                   "I can continue the independent part while awaiting optional feedback."
+                   "Ordinary autonomous progress."))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let* ((goal (application-goal application)) (calls 0) (operation nil) (costs 0)
+              (*test-goal-disposition-handler*
+                (lambda (p conversation namespaces)
+                  (declare (ignore p))
+                  (incf calls)
+                  (setf operation *provider-connection-operation*)
+                  (test-assert (and (zerop (length namespaces)) (not *provider-hosted-tools-enabled-p*)
+                                    (= *provider-maximum-output-tokens* 512))
+                               "one tool-free bounded request")
+                  (test-assert (and (eq *provider-connection-owner* goal)
+                                    (realp (provider--caller-deadline)))
+                               "the request inherits the exact goal and a finite deadline")
+                  (let* ((item    (first (conversation-input-items conversation)))
+                         (request (json-decode (json-get (aref (json-get item "content") 0) "text"))))
+                    (test-assert (and (= (hash-table-count request) 3)
+                                      (equal (json-get request "assistant_reply") reply)
+                                      (equal (json-get request "latest_user_request") "Investigate the product behavior."))
+                                 "the isolated request has only the three complete escaped fields"))
+                  (decision-test-result "{\"outcome\":\"continue\"}"))))
+         (conversation-append-user-message (application-conversation application)
+                                           "Automatic continuation is not the latest real request."
+                                           :automatic-p t)
+         (test-call-with-function-replacements
+          (list (list 'provider-cost-record
+                      (let ((original (symbol-function 'provider-cost-record)))
+                        (lambda (&rest arguments)
+                          (incf costs)
+                          (apply original arguments)))))
+          (lambda ()
+            (application--call-with-goal-connection-owner
+             application (lambda () (application--note-goal-turn application (decision-test-result reply))))))
+         (test-assert (and (= calls 1) (= costs 1) (eq (getf goal :status) ':active))
+                      "ordinary progress continues after one normally accounted request")
+         (test-assert (eq (provider-operation-state operation) ':disposed)
+                      "the auxiliary operation is retired on return")))))
+  (dolist (reply (list (format nil "I need a product decision before proceeding.~%[GOAL-AWAITING-USER]")
+                       "Quoted [GOAL-AWAITING-USER] is documentation, not an outcome."
+                       (format nil "Example:~%```~%[GOAL-AWAITING-USER]~%```")
+                       (format nil "Unclosed example:~%~~~~~~text~%[GOAL-AWAITING-USER]")
+                       (format nil "  > Quoted request~%[GOAL-AWAITING-USER]")))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let ((calls                           0)
+             (*test-goal-disposition-handler* nil))
+         (setf *test-goal-disposition-handler*
+               (lambda (p c namespaces)
+                 (declare (ignore p c namespaces))
+                 (incf calls)
+                 (decision-test-result "{\"outcome\":\"continue\"}")))
+         (application--note-goal-turn application (decision-test-result reply))
+         (test-assert (if (equal reply (format nil "I need a product decision before proceeding.~%[GOAL-AWAITING-USER]"))
+                          (and (zerop calls) (eq (getf (application-goal application) :pause-reason) ':awaiting-user))
+                          (and (= calls 1) (eq (getf (application-goal application) :status) ':active)))
+                      "only a scoped unquoted waiting outcome bypasses classification")))))
+  nil)
+
+(-> test-goal-disposition-failures () null)
+(defun test-goal-disposition-failures ()
+  "Conservatively pause invalid results and reject stale owners without retry loops."
+  (dolist (mode '(:malformed :indeterminate :bad-evidence :error :deadline :expiry :overcap :cancel :replace))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let* ((goal (application-goal application)) (calls 0) (operation nil)
+              (*provider-opening-timeout-seconds* (if (eq mode ':expiry) 0.01 30))
+              (*test-goal-disposition-handler*
+                (lambda (p c namespaces)
+                  (declare (ignore p c namespaces))
+                  (incf calls)
+                  (setf operation *provider-connection-operation*)
+                  (case mode
+                    (:error
+                     (error 'provider-error :message "Offline test failure"))
+                    (:deadline
+                     (error 'sb-sys:deadline-timeout :seconds 0))
+                    (:expiry
+                     (sleep 0.1))
+                    (:cancel
+                     (provider-cancel-connection-owner goal))
+                    (:replace
+                     (setf (application-goal application) (copy-list goal))))
+                  (decision-test-result
+                   (case mode
+                     (:malformed
+                      "not JSON")
+                     (:indeterminate
+                      "{\"outcome\":\"indeterminate\"}")
+                     (:bad-evidence
+                      "{\"outcome\":\"await-user\",\"evidence\":\"absent excerpt\"}")
+                     (otherwise
+                      "{\"outcome\":\"await-user\",\"evidence\":\"Choose the behavior\"}"))))))
+         (application--call-with-goal-connection-owner
+          application
+          (lambda ()
+            (application--note-goal-turn
+             application (decision-test-result (if (eq mode ':overcap)
+                                                  (make-string 33000 :initial-element #\x)
+                                                  "Choose the behavior before I proceed.")))))
+         (test-assert (= calls (if (eq mode ':overcap) 0 1)) "no corrective auxiliary loop")
+         (test-assert (if (member mode '(:cancel :replace))
+                          (eq (getf (application-goal application) :status) ':active)
+                          (and (eq (getf (application-goal application) :status) ':paused)
+                               (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)))
+                      "unavailable is honest and stale results cannot pause a new owner")
+         (when operation
+           (test-assert (eq (provider-operation-state operation) ':disposed) "failure disposes request identity"))))))
+  nil)
+
+(-> test-goal-decision-reentry () null)
+(defun test-goal-decision-reentry ()
+  "Persist waiting once and reenter on real prose without treating continue as approval."
+  (test-call-with-decision-application
+   (lambda (application provider terminal)
+     (declare (ignore terminal))
+     (let ((calls 0) (notices nil)
+           (*test-goal-disposition-handler* nil))
+       (setf *test-goal-disposition-handler*
+             (lambda (p c namespaces)
+               (declare (ignore p c namespaces))
+               (incf calls)
+               (decision-test-result "{\"outcome\":\"await-user\",\"evidence\":\"Choose the behavior\"}")))
+       (test-call-with-function-replacements
+        (list (list 'application-present
+                    (let ((original (symbol-function 'application-present)))
+                      (lambda (app entry &key identifier)
+                        (when (and (listp identifier) (eq (first identifier) ':goal-disposition))
+                          (push identifier notices))
+                        (funcall original app entry :identifier identifier)))))
+        (lambda ()
+          (application--note-goal-turn application (decision-test-result "Choose the behavior before I proceed."))
+          (let* ((conversation (application-conversation application))
+                 (sibling      (make-instance 'application :configuration (application-configuration application)
+                                               :conversation              (conversation-load-by-id
+                                                                           (application-configuration application)
+                                                                           (conversation-identifier conversation))
+                                               :ui                        (application-ui application))))
+            (application--load-goal sibling)
+            (test-assert (eq (getf (application-goal sibling) :pause-reason) ':awaiting-user)
+                         "a fresh object restores the durable pause reason")
+            (application--run-goal-continuations application)
+            (application--run-goal-continuations sibling)
+            (application-render-records application)
+            (application-goal-request application ':status nil)
+            (test-assert (and (= calls 1) (= (length notices) 1))
+                         "reload, rendering, status and repeated loop entry neither wake nor renotify"))
+          (setf (scripted-provider-results provider)
+                (list (decision-test-result "Continue does not resolve the scope. Choose the behavior before I proceed.")
+                      (decision-test-result "Implemented the chosen behavior. [GOAL-COMPLETE]")))
+          (application-run-message application "continue")
+          (test-assert (and (= calls 2) (= (length notices) 2)
+                            (not (equal (first notices) (second notices)))
+                            (eq (getf (application-goal application) :pause-reason) ':awaiting-user)
+                            (zerop (getf (application-goal application) :continuations)))
+                       "bare continue permits one response, not authorization or automatic repetition")
+          (application-run-message application "Use their own setting.")
+          (test-assert (and (eq (getf (application-goal application) :status) ':complete) (= calls 2))
+                       "a real answer can complete and completion bypasses the auxiliary request"))))))
+  nil)
+
+(-> test-goal-disposition-boundaries () null)
+(defun test-goal-disposition-boundaries ()
+  "Keep goal authority and input boundaries separate from disposition inference."
+  (dolist (mode '(:no-goal :mission :completion))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let ((calls 0) (*test-goal-disposition-handler* nil))
+         (setf *test-goal-disposition-handler*
+               (lambda (p c namespaces)
+                 (declare (ignore p c namespaces))
+                 (incf calls)
+                 (error "Excluded goal requested semantic inference")))
+         (case mode
+           (:no-goal
+            (setf (application-goal application) nil))
+           (:mission
+            (setf (getf (application-goal application) :kind) ':mission)))
+         (application--note-goal-turn
+          application
+          (decision-test-result (if (eq mode ':completion)
+                                    "Done. [GOAL-COMPLETE] [GOAL-AWAITING-USER]"
+                                    "Which product behavior should I choose?")))
+         (test-assert (zerop calls) "no goal, mission, and authoritative completion bypass inference")
+         (when (eq mode ':completion)
+           (test-assert (eq (getf (application-goal application) :status) ':complete)
+                        "waiting cannot override authoritative completion"))))))
+  (dolist (mode '(:explicit-pause :blank :synthetic))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore terminal))
+       (let ((calls 0) (*test-goal-disposition-handler* nil))
+         (setf *test-goal-disposition-handler*
+               (lambda (p c namespaces)
+                 (declare (ignore p c namespaces))
+                 (incf calls)
+                 (decision-test-result "{\"outcome\":\"await-user\",\"evidence\":\"Choose the behavior\"}")))
+         (application--note-goal-turn application (decision-test-result "Choose the behavior before I proceed."))
+         (when (eq mode ':explicit-pause)
+           (let* ((owner      (application-goal application))
+                  (generation (provider--connection-owner-generation owner)))
+             (application-goal-request application ':pause nil)
+             (test-assert (= (provider--connection-owner-generation owner) (1+ generation))
+                          "explicit pause cancels the original owner before removing automatic metadata")))
+         (setf (scripted-provider-results provider) (list (decision-test-result "An ordinary manual response.")))
+         (handler-case
+             (application-run-message application
+                                      (case mode
+                                        (:explicit-pause
+                                         "My next unrelated message")
+                                        (:blank
+                                         "   ")
+                                        (:synthetic
+                                         *application-goal-continuation-prompt*)))
+           (configuration-error ()
+             (test-assert (eq mode ':blank) "blank submissions are rejected before any request")))
+         (test-assert (and (= calls 1) (eq (getf (application-goal application) :status) ':paused))
+                      "explicit pause, blank input, and synthetic continuation do not reactivate waiting work")
+         (when (eq mode ':explicit-pause)
+           (test-assert (null (getf (application-goal application) :pause-reason))
+                        "an explicit pause supersedes an automatic waiting reason"))))))
+  (dolist (field '(:objective :request :utf8-reply :provider))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let ((calls 0) (*test-goal-disposition-handler* nil))
+         (setf *test-goal-disposition-handler*
+               (lambda (p c namespaces)
+                 (declare (ignore p c namespaces))
+                 (incf calls)
+                 (error "An oversized or unavailable request reached the provider")))
+         (case field
+           (:objective
+            (setf (getf (application-goal application) :objective)
+                  (make-string 33000 :initial-element #\x)))
+           (:request
+            (conversation-append-user-message (application-conversation application)
+                                             (make-string 33000 :initial-element #\x)))
+           (:provider
+            (setf (application-provider application) nil)))
+         (application--note-goal-turn
+          application (decision-test-result (if (eq field ':utf8-reply)
+                                                (make-string 17000 :initial-element #\GREEK_SMALL_LETTER_LAMDA)
+                                                "Choose the behavior before I proceed.")))
+         (test-assert (and (zerop calls)
+                           (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
+                      "complete fields are refused rather than truncated and missing providers pause honestly")))))
+  nil)

@@ -121,7 +121,19 @@ or =(goal :clear)=. Edit it in place with =(goal :update "NEW-OBJECTIVE")=.
 String arguments are literal objectives, including ="pause"=. Unknown keyword
 actions signal =application-goal-error= without changing the goal.
 
-Lightweight goals pause after eight automatic continuation turns between user
+Lightweight goals pause when a final reply needs an unresolved product, scope,
+or authority decision. Reply with the decision to resume. A bare =continue=
+permits another response; it does not authorize an unanswered choice. Explicit
+=(goal :pause)= requires =(goal :resume)= rather than ordinary prose.
+
+For unmarked replies, Autolith makes one isolated, tool-free model request using
+the objective, latest real-user request, and complete final reply. This adds
+latency and metered usage; semantic classification can be wrong. The request is
+bounded to 30 seconds, 32 KiB of escaped input, an 8192-token input estimate,
+and 512 output tokens. An unavailable or uncertain result pauses conservatively
+with a distinct notice. It never declares completion or verifies a mission.
+
+Lightweight goals also pause after eight automatic continuation turns between user
 messages by default. Set =(settings :goal-continuation-limit 16)= to change the
 limit, or =(settings :goal-continuation-limit :unlimited)= to remove it. The
 setting is durable. A completed lightweight goal permits ordinary session-owned

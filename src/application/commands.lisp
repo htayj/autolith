@@ -1625,11 +1625,19 @@ NIL and :STATUS show the goal. :UPDATE takes one string objective; :PAUSE,
        (application--replace-lightweight-goal application nil)
        (application-present application "The session goal was cleared."))
       ((eq request ':pause)
-       (if (and goal (eq (getf goal :status) ':active))
-           (progn
-             (setf (getf (application-goal application) :status) ':paused)
+       (if (and goal
+                (or (eq (getf goal :status) ':active)
+                    (and (not (mission-goal-p goal))
+                         (eq (getf goal :status) ':paused)
+                         (member (getf goal :pause-reason) '(:awaiting-user :disposition-unavailable)))))
+           (let ((owner goal))
+             (unless (mission-goal-p goal)
+               (remf goal :pause-reason)
+               (remf goal :disposition-request))
+             (setf (getf goal :status) ':paused
+                   (application-goal application) goal)
              (application--record-goal application)
-             (provider-cancel-connection-owner goal)
+             (provider-cancel-connection-owner owner)
              (application-present application "The session goal is paused."))
            (application-present application "No active goal to pause.")))
       ((eq request ':resume)
@@ -1638,8 +1646,11 @@ NIL and :STATUS show the goal. :UPDATE takes one string objective; :PAUSE,
              (if (mission-goal-p goal)
                  (application-mission-resume application)
                  (progn
-                   (setf (getf (application-goal application) :status) ':active
-                         (getf (application-goal application) :continuations) 0)
+                   (remf goal :pause-reason)
+                   (remf goal :disposition-request)
+                   (setf (getf goal :status) ':active
+                         (getf goal :continuations) 0
+                         (application-goal application) goal)
                    (application--record-goal application)))
              (application-present application
                                   "The session goal is active again.")

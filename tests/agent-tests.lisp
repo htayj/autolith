@@ -85,6 +85,9 @@
         (native-scripted-provider-native-input-snapshots provider))
   (pop (native-scripted-provider-native-items provider)))
 
+(defvar *test-goal-disposition-handler* nil
+  "Optional isolated auxiliary transport for deterministic goal-disposition tests.")
+
 (defmethod provider-stream-turn
     ((provider scripted-provider)
      (conversation conversation)
@@ -96,6 +99,16 @@
   "Return PROVIDER's next scripted result after recording request state."
   (declare (type vector tool-namespaces)
            (type function event-callback))
+  (when (eq *telemetry-request-role* ':goal-disposition)
+    (return-from provider-stream-turn
+      (if *test-goal-disposition-handler*
+          (funcall *test-goal-disposition-handler* provider conversation tool-namespaces)
+          (agent-test-result
+           "ordinary-disposition"
+           (list (json-object "type" "message" "role" "assistant"
+                              "content" (json-array (json-object "type" "output_text"
+                                                                   "text" "{\"outcome\":\"continue\"}"))))
+           :turn-completion ':end))))
   (let ((input-items
           (conversation-input-items-for-request
            conversation
