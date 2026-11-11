@@ -65,3 +65,187 @@
           (tool-registry-close-runtime-state (application-tool-registry application))
           (terminal-ui-stop (application-ui application))))))
   nil)
+
+(-> test-mission-draft-ticket-accounting () null)
+(defun test-mission-draft-ticket-accounting ()
+  "Reject forged purpose authority before reserving and charge only the candidate."
+  (with-test-configuration (configuration)
+    (let ((application (mission-test--application configuration))
+          (pool        (make-job-pool :name "candidate-admission" :maximum-concurrency 1
+                                      :maximum-batch-size 1 :maximum-live-jobs 1 :start-threads-p nil)))
+      (unwind-protect
+           (progn
+             (application-mission-start application (mission-test--specification))
+             (let ((working  (copy-tree (application-goal application)))
+                   (accepted (mission-draft-test--submit application :draft (mission-test--specification))))
+               (test-assert accepted "actual draft admission exists")
+               (when accepted
+                 (let* ((context (slot-value application 'mission-draft-context))
+                        (goal    (mission-context-goal context))
+                        (job     (first (job-pool-submit-batch pool
+                                         (list (list :name "candidate-review" :inline-only-p t
+                                                     :function (lambda (ignored) (declare (ignore ignored))))))))
+                        (ticket  (mission-draft-register-review context job)))
+                   (dolist (variant '(:absent :fabricated :foreign))
+                     (let ((*mission-admitted-operation* (if (eq variant ':foreign) (list :foreign) job))
+                           (*mission-candidate-ticket*
+                             (case variant
+                               (:absent
+                                nil)
+                               (:fabricated
+                                (make-instance 'mission-draft-ticket :context context :job job
+                                               :review-id (mission-draft-ticket-review-id ticket)
+                                               :revision  (mission-draft-ticket-revision ticket)
+                                               :digest    (mission-draft-ticket-digest ticket)))
+                               (t
+                                ticket))))
+                       (test-assert (handler-case (progn (mission--reserve-inference context) nil)
+                                      (mission-error () t)) "unregistered or foreign authority refuses before reservation")
+                       (test-assert (zerop (getf goal :turns-used)) "refusal consumes no ordinary request")))
+                   (let ((*mission-admitted-operation* job) (*mission-candidate-ticket* ticket))
+                     (let ((reservation (mission--reserve-inference context)))
+                       (mission--settle-inference context reservation 3))
+                     (test-assert (and (= 1 (getf goal :turns-used)) (= 3 (getf goal :tokens-used))
+                                       (zerop (getf goal :requests-outstanding)) (zerop (getf goal :tokens-reserved)))
+                                  "registered purpose uses candidate ordinary reservation and measured settlement")
+                     (test-assert (equal working (application-goal application)) "candidate settlement does not charge working mission")
+                    (let ((pending-reservation (mission--reserve-inference context)))
+                      (test-assert (mission-draft-test--submit application :draft (mission-test--specification)) "editing admitted")
+                      (test-assert (handler-case (progn (mission--reserve-inference context) nil) (mission-error () t))
+                                   "same specification with newer revision invalidates old ticket")
+                      (test-assert (= 2 (getf goal :turns-used)) "stale ticket cannot spend")
+                      (test-assert (mission-draft-test--submit application :draft-replace (mission-test--specification)) "replacement admitted")
+                      (let ((replacement (slot-value application 'mission-draft)))
+                        (test-assert (not (equal (getf goal :candidate-id) (getf replacement :candidate-id))) "replacement allocates new identity")
+                        (mission--settle-inference context pending-reservation nil)
+                        (test-assert (and (= 1 (getf goal :unknown-usage)) (eq :blocked (getf goal :status))
+                                          (zerop (getf goal :requests-outstanding))
+                                          (zerop (getf replacement :turns-used))
+                                          (zerop (getf replacement :unknown-usage)))
+                                     "stale unknown settlement charges and quarantines only its originating identity")
+                        (test-assert (eq replacement (slot-value application 'mission-draft)) "stale originating accounting publishes audit only"))))))))
+        (job-pool-close pool)
+        (tool-registry-close-runtime-state (application-tool-registry application))
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> test-mission-draft-review-transactions () null)
+(defun test-mission-draft-review-transactions ()
+  "Exercise append rollback, exact release and paid retry through owned jobs."
+  (with-test-configuration (configuration)
+    (let ((application (mission-test--application configuration))
+          (pool        (make-job-pool :name "candidate-transactions" :maximum-concurrency 1
+                                     :maximum-batch-size 1 :maximum-live-jobs 4 :start-threads-p nil)))
+      (unwind-protect
+           (progn
+             (application-mission-start application (mission-test--specification))
+             (application-mission-draft-edit application (mission-test--specification))
+             (let* ((context (application-mission-draft-context application))
+                    (goal    (mission-context-goal context))
+                    (before  (copy-tree goal))
+                    (working (copy-tree (application-goal application)))
+                    (job     (first (job-pool-submit-batch pool
+                                      (list (list :name "review-one" :inline-only-p t
+                                                  :function (lambda (ignored) (declare (ignore ignored)))))))))
+               (test-assert
+                (test-call-with-function-replacements
+                 (list (list 'conversation-append-record
+                             (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (mission--reject ':fixture-append "Private append failure."))))
+                 (lambda ()
+                   (handler-case (progn (mission-draft-register-review context job) nil)
+                     (mission-error () t))))
+                "actual registration append fails")
+               (test-assert (equal before goal) "failed registration rolls back exact candidate fields")
+               (test-assert (null (mission-context-candidate-ticket context)) "failed append publishes no ticket")
+               (test-assert (equal working (application-goal application)) "failed append does not touch working identity")
+               (let ((ticket (mission-draft-register-review context job)))
+                 (let ((*mission-admitted-operation* job) (*mission-candidate-ticket* ticket))
+                   (let ((reservation (mission--reserve-inference context)))
+                     (mission--settle-inference context reservation 3)))
+                 (test-assert (handler-case
+                                  (progn (mission-draft-register-review context job) nil)
+                                (mission-error () t)) "duplicate claim refuses")
+                 (test-assert (fboundp 'mission-draft-release-review) "host release lifecycle exists")
+                 (when (fboundp 'mission-draft-release-review)
+                   (test-assert (funcall 'mission-draft-release-review context ticket :reason ':completed)
+                                "exact settled ticket completes")
+                   (application-mission-draft-edit application (mission-test--specification))
+                   (let* ((second-job (first (job-pool-submit-batch pool
+                                               (list (list :name "review-two" :inline-only-p t
+                                                           :function (lambda (ignored) (declare (ignore ignored))))))))
+                          (next       (mission-draft-register-review context second-job)))
+                     (test-assert (not (funcall 'mission-draft-release-review context ticket :reason ':completed))
+                                  "late old release cannot clear a fresh claim")
+                     (test-assert (eq next (mission-context-candidate-ticket context)) "new exact ticket retained")
+                     (let ((*mission-admitted-operation* second-job) (*mission-candidate-ticket* next))
+                       (let ((reservation (mission--reserve-inference context)))
+                         (test-assert (handler-case
+                                          (progn (funcall 'mission-draft-release-review context next :reason ':completed) nil)
+                                        (mission-error () t)) "inflight reservation prevents release")
+                         (mission--settle-inference context reservation 4)))
+                     (test-assert (and (= 2 (getf goal :turns-used)) (= 7 (getf goal :tokens-used)))
+                                  "retry preserves normal accounting")
+                     (test-assert (funcall 'mission-draft-release-review context next :reason ':cancelled)
+                                  "settled cancellation releases only candidate authority")))
+                 (test-assert (equal working (application-goal application)) "retry leaves working mission unchanged"))))
+        (job-pool-close pool)
+        (tool-registry-close-runtime-state (application-tool-registry application))
+        (terminal-ui-stop (application-ui application)))))
+  nil)
+
+(-> test-mission-draft-session-rollback () null)
+(defun test-mission-draft-session-rollback ()
+  "Switch actual conversations and roll back an installed runtime failure."
+  (with-test-configuration (configuration)
+    (let* ((application (mission-test--application configuration))
+           (origin      (application-conversation application))
+           (other       (conversation-create configuration)))
+      (unwind-protect
+           (test-call-with-function-replacements
+            (list (list 'provider-create
+                        (lambda (&rest arguments)
+                          (declare (ignore arguments))
+                          (make-instance 'scripted-provider :results nil))))
+            (lambda ()
+              (application-mission-start application (mission-test--specification))
+              (application-mission-draft-edit application (mission-test--specification))
+              (let ((working         (application-goal application))
+                    (draft           (application-mission-draft application))
+                    (context         (application-mission-draft-context application))
+                    (working-context (mission-context-find configuration)))
+                (test-assert
+                 (test-call-with-function-replacements
+                  (list (list 'application-publish-recovery-session
+                              (lambda (&rest arguments)
+                                (declare (ignore arguments))
+                                (mission--reject ':fixture-switch "Private installation failure."))))
+                  (lambda ()
+                    (handler-case (progn (application-install-conversation application other) nil)
+                      (error () t))))
+                 "actual installed-conversation transaction fails")
+                (test-assert (and (eq working (application-goal application))
+                                  (eq draft (application-mission-draft application))
+                                  (eq context (application-mission-draft-context application))
+                                  (eq origin (application-conversation application)))
+                             "rollback retains exact working and candidate identities")
+                (test-assert (eq working-context (mission-context-find configuration))
+                             "rollback restores default working registry")
+                (application-install-conversation application other)
+                (test-assert (and (null (application-goal application))
+                                  (null (application-mission-draft application)))
+                             "actual switch loads independent empty slots")
+                (application-install-conversation application origin)
+                (test-assert (and (equal (getf working :objective) (getf (application-goal application) :objective))
+                                  (equal (getf draft :candidate-id)
+                                         (getf (application-mission-draft application) :candidate-id)))
+                             "actual return restores both durable slots")
+                (test-assert (eq (application-goal application)
+                                 (mission-context-goal (mission-context-find (application-configuration application))))
+                             "returned default registry belongs to working mission"))))
+        (when (application-conversation-lease application)
+          (conversation-lease-release (application-conversation-lease application)))
+        (tool-registry-close-runtime-state (application-tool-registry application))
+        (terminal-ui-stop (application-ui application)))))
+  nil)

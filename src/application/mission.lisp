@@ -1,5 +1,9 @@
 (in-package #:autolith)
 
+(defparameter *mission-candidate-ticket* nil "Host-bound candidate purpose authority, absent for ordinary work.")
+
+(defparameter *mission-candidate-request-id* nil "Exact candidate operation identity captured by the accounting owner.")
+
 ;;;; -- Verified Session Goals --
 
 (defparameter *mission-operation-milliseconds* 900000
@@ -274,8 +278,10 @@
 (-> mission--remaining-milliseconds (mission-context) integer)
 (defun mission--remaining-milliseconds (context)
   "Return the remaining durable wall-clock budget, including time away."
-  (* 1000 (- (getf (mission-context-goal context) :deadline)
-             (get-universal-time))))
+  (let ((goal (mission-context-goal context)))
+    (if (and (getf goal :candidate-id) (null (getf goal :activated-at)))
+        *mission-operation-milliseconds*
+        (* 1000 (- (getf goal :deadline) (get-universal-time))))))
 
 (-> mission--operation-draining-p (mission-context t) boolean)
 (defun mission--operation-draining-p (context job)
@@ -298,32 +304,44 @@
 NEW-WORK-P requires an active mission. Hard budgets apply to both paths."
   (let* ((goal        (mission-context-goal context))
          (application (mission-context-application context)))
-    (unless (eq goal (application-goal application))
-      (mission--reject ':replaced "The mission was replaced."))
-    (unless (or (eq (getf goal :status) ':active)
-                (and (not new-work-p)
-                     (mission--operation-draining-p context *mission-admitted-operation*)))
-      (mission--reject (getf goal :status) "The mission is not active."))
-    (when (and (eq (getf goal :status) ':active)
+    (if (getf goal :candidate-id)
+        (unless (mission-draft-ticket-current-p context *mission-candidate-ticket*)
+          (mission--reject ':candidate-authority "No exact current candidate review admission."))
+        (progn
+          (unless (eq goal (application-goal application))
+            (mission--reject ':replaced "The mission was replaced."))
+          (unless (or (eq (getf goal :status) ':active)
+                      (and (not new-work-p)
+                           (mission--operation-draining-p context *mission-admitted-operation*)))
+            (mission--reject (getf goal :status) "The mission is not active."))))
+    (mission--admit-budget context :inference-p inference-p :new-work-p new-work-p))
+  nil)
+
+(-> mission--admit-budget (mission-context &key (:inference-p boolean) (:new-work-p boolean)) null)
+(defun mission--admit-budget (context &key (inference-p t) new-work-p)
+  "Apply the same finite budget and settling policy after exact slot authorization."
+  (let ((goal (mission-context-goal context)))
+    (when (and (or (eq (getf goal :status) ':active) (getf goal :candidate-id))
                (mission--unknown-usage-blocks-p goal)
                (or inference-p new-work-p))
       (mission--reject ':mission-usage-quarantine
                        "Mission usage is unknown; inference and new work require explicit spending authority."))
+    (when (and (eq (mission-exhaustion--policy context) :evaluate)
+               (getf (getf goal :exhaustion) :pending))
+      (mission--reject :exhaustion-evaluation "Mission review is pending; new work is not admitted."))
     (unless (plusp (mission--remaining-milliseconds context))
-      (when (and (eq (mission-exhaustion--policy context) :evaluate)
-                 (plusp (getf goal :requests-outstanding 0)))
-        (mission--reject :exhausted "Mission deadline elapsed; admitted requests must settle first."))
       (mission-exhaustion--trigger context :wall)
-      (mission--transition context ':exhausted "Mission-wide wall-clock budget exhausted.")
+      (unless (plusp (getf goal :requests-outstanding 0))
+        (mission--transition context ':exhausted "Mission-wide wall-clock budget exhausted."))
       (mission--reject ':exhausted "Mission-wide wall-clock budget exhausted."))
     (when (and inference-p
                (or (>= (getf goal :turns-used) (getf goal :turn-limit))
                    (>= (getf goal :tokens-used) (getf goal :token-limit))))
-      ;; Requests already admitted retain their allowance to finish and settle.
-      (unless (plusp (getf goal :requests-outstanding))
-        (mission-exhaustion--trigger context
-                                     (if (>= (getf goal :turns-used) (getf goal :turn-limit))
-                                         :turns :tokens))
+      (mission-exhaustion--trigger context
+                                   (if (>= (getf goal :turns-used) (getf goal :turn-limit))
+                                       :turns :tokens))
+      ;; Already admitted requests retain their allowance and settle normally.
+      (unless (plusp (getf goal :requests-outstanding 0))
         (mission--transition context ':exhausted "Mission-wide work budget exhausted."))
       (mission--reject ':exhausted "Mission-wide work budget exhausted.")))
   nil)
@@ -417,9 +435,7 @@ preserving the calling thread's provider bindings and authorization callbacks."
                  (when caller-check (funcall caller-check))
                (unless (and (= epoch (provider--connection-owner-generation goal))
                             (or (null context)
-                                (and (eq goal (application-goal (mission-context-application context)))
-                                     (or (eq (getf goal :status) ':active)
-                                         (mission--operation-draining-p context *mission-admitted-operation*)))))
+                                (mission--connection-context-owned-p context goal)))
                  (error 'provider-owner-ended :message "The ordinary operation no longer owns this request.")))))
          (transferred-p                   nil))
     (when owner
@@ -486,9 +502,7 @@ preserving the calling thread's provider bindings and authorization callbacks."
                 (lambda ()
                   (let ((caller-remaining (when caller-check (funcall caller-check)))
                         (goal             (mission-context-goal context)))
-                    (unless (and (eq goal (application-goal (mission-context-application context)))
-                                 (or (eq (getf goal :status) ':active)
-                                     (mission--operation-draining-p context *mission-admitted-operation*)))
+                    (unless (mission--connection-context-owned-p context goal)
                       (error 'provider-owner-ended :message "The mission no longer owns this request."))
                     (when *mission-admitted-operation*
                       (job-check-cancellation *mission-admitted-operation*))
@@ -516,9 +530,7 @@ preserving the calling thread's provider bindings and authorization callbacks."
             (lambda ()
               (let ((caller-remaining (when caller-check (funcall caller-check)))
                     (goal             (mission-context-goal context)))
-                (unless (and (eq goal (application-goal (mission-context-application context)))
-                             (or (eq (getf goal :status) ':active)
-                                 (mission--operation-draining-p context *mission-admitted-operation*)))
+                (unless (mission--connection-context-owned-p context goal)
                   (error 'provider-owner-ended :message "The mission no longer owns this native request."))
                 (when *mission-admitted-operation*
                   (job-check-cancellation *mission-admitted-operation*))
@@ -1020,7 +1032,9 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
 (-> mission-task-job-run (task-job) t)
 (defun mission-task-job-run (job)
   "Run a child using the exact mission and absolute deadline captured at admission."
-  (let ((context (task-job-mission-context job)))
+  (let* ((context                      (task-job-mission-context job))
+         (*mission-admitted-operation* job)
+         (*mission-candidate-ticket*   (and context (mission-context-candidate-ticket context))))
     (if context
         (progn
           (mission-exhaustion--admitting
@@ -1029,9 +1043,10 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
             (mission--supervise context "Mission child" (lambda () (task-job--run job)))))
         (task-job--run job))))
 
-(defmethod initialize-instance :after ((job session-job) &key mission-context &allow-other-keys)
+(defmethod initialize-instance :after ((job session-job) &key mission-context review-claim &allow-other-keys)
   "Capture exact mission identity before a session job can enter its worker queue."
-  (mission-context-bind mission-context job))
+  (mission-context-bind mission-context job)
+  (when review-claim (mission-draft-review-bind-job job review-claim)))
 
 (defparameter *mission-candidate-policy-audit* nil
   "Optional original candidate audit failure after confirmed durable publication.")
@@ -1173,3 +1188,106 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
         (setf (application-mission-draft application) goal
               (application-mission-draft-context application) context))))
   nil)
+
+(-> mission-draft-ticket-current-p (mission-context t) boolean)
+(defun mission-draft-ticket-current-p (context ticket)
+  "Require exact host registration, current slot/revision/digest and job ownership."
+  (let* ((application (mission-context-application context))
+         (goal        (mission-context-goal context)))
+    (and (application-candidate-active-p application)
+         (eq application (candidate-origin-application (mission-context-origin-owner context)))
+         (typep ticket 'mission-draft-ticket)
+         (eq ticket (mission-context-candidate-ticket context))
+         (eq context (mission-draft-ticket-context ticket))
+         (eq context (application-mission-draft-context application))
+         (eq goal (application-mission-draft application))
+         (eq (mission-context-conversation context) (application-conversation application))
+         (eq (getf goal :status) ':draft)
+         (eql (getf goal :specification-revision) (mission-draft-ticket-revision ticket))
+         (equal (getf goal :specification-digest) (mission-draft-ticket-digest ticket))
+         (eq *mission-admitted-operation* (mission-draft-ticket-job ticket))
+         (typep (mission-draft-ticket-job ticket) 'job)
+         (not (job-terminal-p (mission-draft-ticket-job ticket)))
+         (not (job-cancellation-requested-p (mission-draft-ticket-job ticket)))
+         (or (not (typep ticket 'mission-draft-review-claim)) (mission-draft-review-current-p ticket))
+         t)))
+
+(-> mission-draft-register-review (mission-context t) mission-draft-ticket)
+(defun mission-draft-register-review (context job)
+  "Register one host-owned attempt before any candidate request; no funding is allocated."
+  (with-recursive-lock-held ((mission-context-request-lock context))
+    (with-recursive-lock-held ((mission-context-lock context))
+      (let* ((application (mission-context-application context))
+             (goal        (mission-context-goal context)))
+        (unless (and (application-candidate-active-p application)
+                     (eq application (candidate-origin-application (mission-context-origin-owner context)))
+                     (typep job 'job) (not (job-terminal-p job)) (not (job-cancellation-requested-p job))
+                     (eq (mission-context-conversation context) (application-conversation application))
+                     (eq context (application-mission-draft-context application))
+                     (eq goal (application-mission-draft application)) (eq (getf goal :status) ':draft))
+          (mission--reject ':candidate-authority "Candidate registration is not current."))
+        (when (mission-context-candidate-ticket context)
+          (mission--reject ':candidate-claimed "Candidate already has a registered review."))
+        (let* ((review-id      (make-identifier))
+               (previous-claim (getf goal :candidate-claim))
+               (ticket         (make-instance 'mission-draft-ticket :context context :job job :review-id review-id
+                                             :revision (getf goal :specification-revision)
+                                             :digest   (getf goal :specification-digest))))
+          (handler-case
+              (progn
+                (setf (getf goal :candidate-claim)
+                      (list :review-id review-id :revision (getf goal :specification-revision)
+                            :digest (getf goal :specification-digest) :state ':registered))
+                (mission--record context)
+                (setf (mission-context-candidate-ticket context) ticket))
+            (serious-condition (condition)
+              (setf (getf goal :candidate-claim) previous-claim)
+              (error condition)))
+          ticket)))))
+
+(-> mission-draft-release-review (mission-context mission-draft-ticket &key (:reason keyword)) boolean)
+(defun mission-draft-release-review (context ticket &key (reason ':completed))
+  "Release only TICKET after ordinary settlement; cancel its job outside mission locks."
+  (unless (member reason '(:completed :cancelled :failed))
+    (mission--reject ':invalid "Invalid candidate review completion state."))
+  (when (eq reason ':cancelled)
+    (let ((owned-p
+            (with-recursive-lock-held ((mission-context-request-lock context))
+              (with-recursive-lock-held ((mission-context-lock context))
+                (and (eq context (mission-draft-ticket-context ticket))
+                     (eq ticket (mission-context-candidate-ticket context)))))))
+      (when owned-p
+        (job-cancel (mission-draft-ticket-job ticket) :reason ':candidate-review-cancelled))))
+  (with-recursive-lock-held ((mission-context-request-lock context))
+    (with-recursive-lock-held ((mission-context-lock context))
+      (let* ((goal  (mission-context-goal context))
+             (claim (getf goal :candidate-claim)))
+        (unless (and (eq context (mission-draft-ticket-context ticket))
+                     (eq ticket (mission-context-candidate-ticket context))
+                     (equal (getf claim :review-id) (mission-draft-ticket-review-id ticket))
+                     (eql (getf claim :revision) (mission-draft-ticket-revision ticket))
+                     (equal (getf claim :digest) (mission-draft-ticket-digest ticket)))
+          (return-from mission-draft-release-review nil))
+        (when (or (plusp (getf goal :requests-outstanding 0))
+                  (plusp (getf goal :tokens-reserved 0)))
+          (mission--reject ':candidate-settling "Candidate review requests must settle before release."))
+        (let ((previous-state (getf claim :state)))
+          (handler-case
+              (progn
+                (setf (getf claim :state) reason)
+                (mission--record context)
+                (setf (mission-context-candidate-ticket context) nil))
+            (serious-condition (condition)
+              (setf (getf claim :state) previous-state)
+              (error condition))))
+        t))))
+
+(-> mission--connection-context-owned-p (mission-context list) boolean)
+(defun mission--connection-context-owned-p (context goal)
+  "Validate the exact current working or claimed candidate owner before recovery."
+  (and (eq goal (mission-context-goal context))
+       (if (mission-context-origin-owner context)
+           (mission-draft-ticket-current-p context (mission-context-candidate-ticket context))
+           (and (eq goal (application-goal (mission-context-application context)))
+                (or (eq (getf goal :status) :active)
+                    (mission--operation-draining-p context *mission-admitted-operation*))))))

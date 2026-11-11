@@ -2123,3 +2123,13 @@
  test-mission-draft-review-verdict
  test-mission-draft-review-failure
  test-mission-draft-review-native)
+
+(define-test-suite mission-draft-host
+ test-mission-review287-native
+ test-mission-review287-refusals)
+
+(define-test-suite mission-draft-stateful
+ test-mission-draft-connection-ownership
+ test-mission-draft-ticket-accounting
+ test-mission-draft-review-transactions
+ test-mission-draft-session-rollback)
