@@ -126,12 +126,25 @@ or authority decision. Reply with the decision to resume. A bare =continue=
 permits another response; it does not authorize an unanswered choice. Explicit
 =(goal :pause)= requires =(goal :resume)= rather than ordinary prose.
 
-For unmarked replies, Autolith makes one isolated, tool-free model request using
-the objective, latest real-user request, and complete final reply. This adds
-latency and metered usage; semantic classification can be wrong. The request is
-bounded to 30 seconds, 32 KiB of escaped input, an 8192-token input estimate,
-and 512 output tokens. An unavailable or uncertain result pauses conservatively
-with a distinct notice. It never declares completion or verifies a mission.
+For unmarked, noncomplete replies on a supported route, Autolith makes one
+isolated, tool-free model request using only the objective, latest real-user
+request, and complete final reply. Request-local contributors and relax-mode
+instructions are excluded. Routing, model, and cache metadata are transport
+policy, not classification evidence. This adds latency and metered usage; semantic
+classification can be wrong. The request is bounded to 30 seconds, 32 KiB for
+the escaped fields plus fixed instructions, an 8192-token estimate of the final
+encoded input, and an enforceable 512-output-token remote ceiling. Every actual
+route, including fallback and retry, must support that ceiling. An unavailable
+or uncertain result pauses with a distinct notice. It cannot declare completion
+or verify a mission.
+
+*Codex tradeoff:* the pinned Codex subscription API cannot enforce the required
+512-output-token limit. Every unmarked, noncomplete plain-goal reply on Codex,
+including ordinary progress, therefore pauses as assessment unavailable without
+an auxiliary request. Autolith does not switch providers or relax the budget.
+Completion and explicit waiting markers retain their separate authority. Reply
+with real prose to permit another normal answer; status, rendering, reload, and
+synthetic continuations do not reactivate the paused goal.
 
 Lightweight goals also pause after eight automatic continuation turns between user
 messages by default. Set =(settings :goal-continuation-limit 16)= to change the

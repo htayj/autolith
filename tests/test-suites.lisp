@@ -2049,3 +2049,12 @@
 
 (define-test-suite compaction-provider-participation
   test-compaction-provider-participation)
+
+(define-test-suite goal-disposition-wire
+  test-goal-disposition-wire-isolation
+  test-goal-disposition-codex-refusal
+  test-goal-disposition-final-bounds
+  test-goal-disposition-isolation-unwind
+  test-goal-disposition-input-overhead
+  test-goal-disposition-codex-controls
+  test-goal-disposition-independent-context)

@@ -358,6 +358,7 @@ messages that later change fail closed."
 (defmethod provider-open-response-stream :before
     ((provider model-provider) (request hash-table) &key credentials conversation)
   "Admit the fully encoded streaming request after provider-specific modifications."
+  (provider-check-assessment-request provider request)
   (provider-context--admit-request provider request)
   (when (and conversation *provider-context-request*
              (eq conversation (getf *provider-context-request* :conversation)))
@@ -949,4 +950,87 @@ paths. A concurrent replacement or completion cannot publish this stale attempt.
     ((or error sb-sys:deadline-timeout) ()
       (when *provider-input-measurement-context*
         (setf (getf *provider-input-measurement-context* :proof) nil))))
+  nil)
+
+
+;;;; -- Bounded Auxiliary Assessment --
+
+(defparameter *provider-bounded-assessment-p* nil
+  "Require an enforceable 512-token wire ceiling and 8192 estimated input tokens.")
+
+(defgeneric provider-assessment-output-path (provider)
+  (:documentation "Return a supported final wire ceiling path, or NIL for an unknown transport.
+
+Participants must use the product final-admission boundary on every dispatch,
+including retries. A direct-return extension must decline participation."))
+
+(defmethod provider-assessment-output-path ((provider model-provider))
+  "Refuse routes without an admitted protocol and final transport boundary."
+  (declare (ignore provider))
+  nil)
+
+(defmethod provider-assessment-output-path ((provider openai-api-provider))
+  "Use the public Responses output ceiling."
+  (declare (ignore provider))
+  '("max_output_tokens"))
+
+(defmethod provider-assessment-output-path ((provider openai-compatible-provider))
+  "Use the actual Chat adapter's declared remote field."
+  (list (openai-compatible-provider-output-ceiling-field provider)))
+
+(defmethod provider-assessment-output-path ((provider anthropic-product-provider-mixin))
+  "Use the Messages ceiling, including the Vertex Messages adapter."
+  (declare (ignore provider))
+  '("max_tokens"))
+
+(defmethod provider-assessment-output-path ((provider gemini-product-provider-mixin))
+  "Use the GenerateContent ceiling, including the Vertex adapter."
+  (declare (ignore provider))
+  '("generationConfig" "maxOutputTokens"))
+
+(defmethod provider-assessment-output-path ((provider gemini-code-assist-provider))
+  "Validate the real inner GenerateContent ceiling in the routing envelope."
+  (cons "request" (call-next-method)))
+
+(-> provider-bounded-assessment-supported-p (model-provider) boolean)
+(defun provider-bounded-assessment-supported-p (provider)
+  "Require both remote ceiling capability and a participating final wire adapter."
+  (not (null (and (provider-output-ceiling-p provider)
+                  (provider-final-request-participation-p provider)
+                  (provider-assessment-output-path provider)))))
+
+(define-condition provider-assessment-bound-error (autolith-error)
+  ()
+  (:documentation "An auxiliary assessment cannot establish its finite request bounds."))
+
+(-> provider-check-assessment-route (model-provider) null)
+(defun provider-check-assessment-route (provider)
+  "Refuse an unsupported actual route before its authentication or request lookup."
+  (when (and *provider-bounded-assessment-p*
+             (not (provider-bounded-assessment-supported-p provider)))
+    (error 'provider-assessment-bound-error
+           :message "This route cannot enforce bounded goal assessment."))
+  nil)
+
+(defmethod provider-attempt-turn :before
+    ((provider model-provider) (conversation conversation)
+     &key tool-namespaces event-callback force-refresh goal-context compaction-p)
+  "Recheck each selected fallback or retry route before any auxiliary attempt."
+  (declare (ignore conversation tool-namespaces event-callback force-refresh goal-context compaction-p))
+  (provider-check-assessment-route provider))
+
+(-> provider-check-assessment-request (model-provider hash-table) null)
+(defun provider-check-assessment-request (provider request)
+  "Check only actual encoded remote fields, never the dynamically requested ceiling."
+  (when *provider-bounded-assessment-p*
+    (provider-check-assessment-route provider)
+    (let ((ceiling (reduce (lambda (object key)
+                             (and (json-object-p object) (json-get object key)))
+                           (provider-assessment-output-path provider) :initial-value request)))
+      (unless (eql ceiling 512)
+        (error 'provider-assessment-bound-error
+               :message "The final goal assessment request lacks its 512-token remote ceiling.")))
+    (when (> (provider-request-input-token-estimate provider request) 8192)
+      (error 'provider-assessment-bound-error
+             :message "The final goal assessment request exceeds 8192 estimated input tokens.")))
   nil)

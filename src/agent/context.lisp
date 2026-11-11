@@ -880,6 +880,20 @@ an empty history."
                         *context-delivery-diagnostic-limit*))))))
   nil)
 
+(-> call-with-isolated-request-context (function) t)
+(defun call-with-isolated-request-context (function)
+  "Call FUNCTION without invoking contributors or selecting external resolver receipts.
+
+The private resolver and empty dynamic contributions unwind with this scope;
+registrations and other threads are untouched. An overridden system prompt
+is exact in this scope, including with relax enabled."
+  (let ((*context-request-isolated-p*    t)
+        (*context-request-contributions* nil)
+        (*context-resolver*              (cl-llm-provider-api:make-context-resolver))
+        (*context-last-deliveries*       (make-hash-table :test #'equal))
+        (*context-last-delivery-order*   nil))
+    (funcall function)))
+
 (-> context-resolve-request
     (configuration conversation vector
      &key (:goal-context (option string)) (:compaction-p boolean)) context-delivery)
@@ -891,7 +905,9 @@ an empty history."
                                :tool-namespaces tool-namespaces
                                :goal-context goal-context :compaction-p compaction-p)))
     (multiple-value-bind (contributions failures)
-        (context--invoke-contributors request (context-contributor-registrations))
+        (if *context-request-isolated-p*
+            (values nil nil)
+            (context--invoke-contributors request (context-contributor-registrations)))
       (unless (every (lambda (value) (typep value 'context-contribution))
                      *context-request-contributions*)
         (error 'configuration-error

@@ -336,6 +336,7 @@
            (release                              (sb-thread:make-semaphore))
            (controller                           (application-input-controller-create application :start-reader-p nil :load-pending-p nil)))
       (declare (ignore registry))
+      (change-class provider 'bounded-goal-scripted-provider)
       (unwind-protect
            (let ((job (task-orchestrator-start-execution-job
                        runtime parent :tool-name "completion.fixture" :summary "held job"

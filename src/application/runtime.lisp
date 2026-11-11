@@ -4347,39 +4347,45 @@ model's calls in a turn."
          (provider-call-with-response-deadline
           (min 30 *provider-opening-timeout-seconds*)
           (lambda ()
-            (let* ((provider (application-provider application))
-                   (latest   (application--goal-latest-request (application-conversation application)))
-                   (request  (json-encode (json-object "objective" (getf goal :objective)
-                                                      "latest_user_request" latest
-                                                      "assistant_reply" reply))))
-              (if (or (null provider)
-                      (> (length (sb-ext:string-to-octets request :external-format ':utf-8)) 32768)
-                      (> (ceiling (+ (length request) (length *application-goal-disposition-system-prompt*)) 4) 8192))
+            (let ((provider (application-provider application)))
+              ;; Refuse before creating auxiliary state, authenticating or admitting a request.
+              (if (or (null provider) (not (provider-bounded-assessment-supported-p provider)))
                   ':indeterminate
-                  (let* ((conversation                      (conversation-create
-                                                             (application-configuration application)
-                                                             :storage-root (configuration-inference-root
-                                                                            (application-configuration application))))
-                         (*system-prompt-override*          *application-goal-disposition-system-prompt*)
-                         (*provider-maximum-output-tokens*  512)
-                         (*telemetry-request-role*          ':goal-disposition)
-                         (*provider-hosted-tools-enabled-p* nil)
-                         (*provider-tool-choice*            "none")
-                         (*provider-connection-operation*   (make-provider-operation)))
-                    (setf identity (conversation-identifier conversation)
-                          (conversation-input-items conversation) (list (user-message-item request)))
-                    (unwind-protect
-                         (progn
-                           (when *provider-connection-owner-check*
-                             (funcall *provider-connection-owner-check*))
-                           (application--goal-disposition-parse
-                            (or (provider-result-assistant-text
-                                 (provider-stream-turn provider conversation :tool-namespaces #()
-                                                       :event-callback                        (lambda (event)
-                                                                                                (declare (ignore event)) nil)))
-                                "")
-                            reply))
-                      (provider-operation-dispose *provider-connection-operation*)))))))
+                  (let* ((latest       (application--goal-latest-request (application-conversation application)))
+                         (request      (json-encode (json-object "objective" (getf goal :objective)
+                                                            "latest_user_request" latest
+                                                            "assistant_reply" reply)))
+                         (instructions *application-goal-disposition-system-prompt*))
+                    (if (> (+ (length (sb-ext:string-to-octets request :external-format ':utf-8))
+                              (length (sb-ext:string-to-octets instructions :external-format ':utf-8))) 32768)
+                        ':indeterminate
+                        (let* ((conversation                      (conversation-create
+                                                                   (application-configuration application)
+                                                                   :storage-root (configuration-inference-root
+                                                                                  (application-configuration application))))
+                               (*system-prompt-override*          instructions)
+                               (*provider-maximum-output-tokens*  512)
+                               (*provider-bounded-assessment-p*   t)
+                               (*telemetry-request-role*          ':goal-disposition)
+                               (*provider-hosted-tools-enabled-p* nil)
+                               (*provider-tool-choice*            "none")
+                               (*provider-connection-operation*   (make-provider-operation)))
+                          (setf identity (conversation-identifier conversation)
+                                (conversation-input-items conversation) (list (user-message-item request)))
+                          (unwind-protect
+                               (progn
+                                 (when *provider-connection-owner-check*
+                                   (funcall *provider-connection-owner-check*))
+                                 (application--goal-disposition-parse
+                                  (or (provider-result-assistant-text
+                                       (call-with-isolated-request-context
+                                        (lambda ()
+                                          (provider-stream-turn
+                                           provider conversation :tool-namespaces #()
+                                           :event-callback                        (lambda (event) (declare (ignore event)) nil)))))
+                                      "")
+                                  reply))
+                            (provider-operation-dispose *provider-connection-operation*)))))))))
        (error () ':indeterminate)
        (sb-sys:deadline-timeout () ':indeterminate))
      identity)))

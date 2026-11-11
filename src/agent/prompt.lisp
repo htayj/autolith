@@ -291,6 +291,9 @@ prompt instead of the full Autolith persona.")
      :template (request-context--template)
      :config   (request-context--config configuration :hurry-up-p hurry-up-p)))))
 
+(defparameter *context-request-isolated-p* nil
+  "Request-local exact-prompt and contributor isolation, never a configuration setting.")
+
 (-> system-prompt (configuration) string)
 (defun system-prompt (configuration)
   "Return the system prompt specialized for CONFIGURATION and this process's session date.
@@ -307,6 +310,7 @@ the cached prefix."
                 (org-templater:render
                  :template (system-prompt--template)
                  :config   (system-prompt--config configuration)))))))
-    (if (and *system-prompt-override* (config :relax-p configuration))
+    (if (and *system-prompt-override* (not *context-request-isolated-p*)
+             (config :relax-p configuration))
         (format nil "~A~2%WARNING: ~A" prompt *system-prompt-relax-warning*)
         prompt)))

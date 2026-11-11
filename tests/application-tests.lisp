@@ -8950,7 +8950,7 @@
                                              "text" "Still working."))))
                   (provider
                     (make-instance
-                     'scripted-provider
+                     'bounded-goal-scripted-provider
                      :results (list (agent-test-result "goal-1"
                                                        (list working-item)
                                                        :turn-completion ':end)
@@ -10284,7 +10284,7 @@
            (ask          "This changes behavior, so I need your approval first. Should checkpoint descriptors inherit the caller setting, or keep their own setting? I will wait for that scope decision before implementing it.")
            (item         (json-object "type" "message" "role" "assistant"
                                       "content" (json-array (json-object "type" "output_text" "text" ask))))
-           (provider     (make-instance 'scripted-provider
+           (provider     (make-instance 'bounded-goal-scripted-provider
                                         :results (list (agent-test-result "first-ask" (list item) :turn-completion ':end)
                                                        (agent-test-result "repeated-ask" (list item) :turn-completion ':end))))
            (registry     (make-default-tool-registry))
@@ -10347,7 +10347,7 @@
   "Exercise FUNCTION with a private application and real-user request."
   (with-test-configuration (configuration)
     (let* ((conversation (conversation-create configuration))
-           (provider     (make-instance 'scripted-provider :results nil))
+           (provider     (make-instance 'bounded-goal-scripted-provider :results nil))
            (terminal     (make-instance 'recording-terminal :columns 80))
            (registry     (make-default-tool-registry))
            (application  (make-instance 'application :configuration configuration
@@ -10627,4 +10627,437 @@
          (test-assert (and (zerop calls)
                            (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
                       "complete fields are refused rather than truncated and missing providers pause honestly")))))
+  nil)
+
+(-> test-goal-disposition-wire-isolation () null)
+(defun test-goal-disposition-wire-isolation ()
+  "Inspect real Responses encoders, ordinary controls, and shared receipt isolation."
+  (dolist (injected-p '(nil t))
+    (test-call-with-decision-application
+     (lambda (application scripted terminal)
+       (declare (ignore scripted terminal))
+       (let* ((configuration (application-configuration application))
+              (conversation  (application-conversation application))
+              (provider      (openai-api-provider-create configuration))
+              (calls 0) (invocations 0) (transport 0) (wire nil) (problem nil)
+              (name          (make-identifier))
+              (builtins      0)
+              (project       (merge-pathnames "wire-project/" (test-configuration-root configuration)))
+              (*context-request-contributions*
+                (when injected-p
+                  (list (make-context-contribution :identifier "inherited-339" :instruction "inherited-339")))))
+         (ensure-directories-exist (merge-pathnames "AUTOLITH.org" project))
+         (with-open-file (stream (merge-pathnames "AUTOLITH.org" project) :direction :output
+                                 :if-exists :supersede :external-format :utf-8)
+           (write-string "builtin-wire-339" stream))
+         (setf (application-provider application) provider
+               (config :working-directory configuration) project
+               (config :relax-p configuration) injected-p)
+         (when injected-p
+           (register-context-contributor
+            name (lambda (request)
+                   (declare (ignore request)) (incf invocations)
+                   (make-context-contribution :identifier "registered-339" :instruction "registered-339"))))
+         (unwind-protect
+              (let* ((ordinary-before    (json-encode (provider-request-object provider conversation #())))
+                     (before-invocations invocations)
+                     (before-receipts    (gethash (conversation-identifier conversation) *context-last-deliveries*))
+                     (before-order       (copy-list *context-last-delivery-order*)))
+                (let* ((*system-prompt-override* "ordinary-override")
+                       (effective                (system-prompt configuration)))
+                  (test-assert (if injected-p (not (equal effective "ordinary-override"))
+                                  (equal effective "ordinary-override"))
+                               "ordinary override prompts honor their own relax policy"))
+                (test-assert (search "builtin-wire-339" ordinary-before)
+                             "the real built-in project contributor is active outside isolation")
+                (test-call-with-function-replacements
+                 (list
+                  (list 'project-adaptation--context-contributor
+                        (let ((original (symbol-function 'project-adaptation--context-contributor)))
+                          (lambda (request) (incf builtins) (funcall original request))))
+                  (list 'provider-stream-turn
+                        (lambda (p c &key tool-namespaces event-callback goal-context compaction-p)
+                          (declare (ignore event-callback goal-context compaction-p))
+                          (incf calls)
+                          (handler-bind ((error (lambda (condition) (setf problem (princ-to-string condition)))))
+                            (setf wire (provider-request-object p c tool-namespaces))
+                            (provider-open-response-stream
+                             p wire :conversation c :credentials (make-instance 'oauth-credentials :access-token "inert")))
+                          (decision-test-result "{\"outcome\":\"continue\"}")))
+                  (list 'provider-post-event-stream
+                        (lambda (&rest arguments) (declare (ignore arguments)) (incf transport) nil)))
+                 (lambda ()
+                   (application--call-with-goal-connection-owner
+                    application
+                    (lambda () (application--note-goal-turn application (decision-test-result "Ordinary progress."))))))
+                (test-assert (null problem) (format nil "builder/admission condition: ~A" problem))
+                (test-assert (= calls 1) "assessment actually runs")
+                (test-assert (hash-table-p wire) "real wire projection captured")
+                (when wire
+                  (let* ((input        (json-get wire "input"))
+                         (developer    (find "developer" input :key (lambda (item) (json-get item "role")) :test #'equal))
+                         (instructions (and developer (json-get (elt (json-get developer "content") 0) "text")))
+                         (user         (find "user" input :key (lambda (item) (json-get item "role")) :test #'equal))
+                         (text         (json-get (elt (json-get user "content") 0) "text"))
+                         (object       (json-decode text)))
+                    (test-assert (equal instructions *application-goal-disposition-system-prompt*)
+                                 "exact fixed instructions, including with relax enabled")
+                    (test-assert (= (length input) 2) "only fixed developer instructions and user evidence")
+                    (test-assert (and (= (hash-table-count object) 3)
+                                      (equal (json-get object "objective") (getf (application-goal application) :objective))
+                                      (equal (json-get object "latest_user_request") "Investigate the product behavior.")
+                                      (equal (json-get object "assistant_reply") "Ordinary progress."))
+                                 "only three whole escaped fields"))
+                  (test-assert (zerop (length (json-get wire "tools"))) "no local or hosted tools"))
+                (test-assert (= transport 1) "real final admission reaches offline transport")
+                (test-assert (and (zerop builtins) (= invocations before-invocations))
+                             "neither built-in nor custom contributors run in the isolated request")
+                (test-assert (and (eq before-receipts (gethash (conversation-identifier conversation) *context-last-deliveries*))
+                                  (equal before-order *context-last-delivery-order*))
+                             "isolated assembly neither replaces nor evicts external diagnostic receipts")
+                (let ((ordinary-after (json-encode (provider-request-object provider conversation #()))))
+                  (test-assert (search "builtin-wire-339" ordinary-after)
+                               "ordinary return retains the built-in context")
+                  (when injected-p
+                    (test-assert (and (search "registered-339" ordinary-before)
+                                      (search "registered-339" ordinary-after)
+                                      (search "inherited-339" ordinary-before)
+                                      (search "inherited-339" ordinary-after)
+                                      (> invocations before-invocations))
+                                 "ordinary context before and after isolation retains its contributors"))))
+           (when injected-p (unregister-context-contributor name)))))))
+  nil)
+
+(-> test-goal-disposition-codex-refusal () null)
+(defun test-goal-disposition-codex-refusal ()
+  "Refuse the real unsupported Codex route before any auxiliary work."
+  (test-call-with-decision-application
+   (lambda (application scripted terminal)
+     (declare (ignore scripted terminal))
+     (let ((calls 0) (creations 0) (operations 0)
+           (provider (make-instance 'codex-subscription-provider
+                                    :configuration (application-configuration application))))
+       (setf (application-provider application) provider)
+       (test-assert (not (provider-output-ceiling-p provider)) "real pinned Codex capability")
+       (test-call-with-function-replacements
+        (list (list 'provider-stream-turn
+                    (lambda (&rest arguments)
+                      (declare (ignore arguments)) (incf calls)
+                      (decision-test-result "{\"outcome\":\"continue\"}")))
+              (list 'conversation-create
+                    (let ((original (symbol-function 'conversation-create)))
+                      (lambda (&rest arguments) (incf creations) (apply original arguments))))
+              (list 'make-provider-operation
+                    (let ((original (symbol-function 'make-provider-operation)))
+                      (lambda (&rest arguments) (incf operations) (apply original arguments)))))
+        (lambda ()
+          (application--call-with-goal-connection-owner
+           application
+           (lambda () (application--note-goal-turn application (decision-test-result "Ordinary progress."))))))
+       (test-assert (and (zerop calls) (zerop creations) (zerop operations))
+                    "no auxiliary stream, conversation or operation")
+       (test-assert (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)
+                    "honest durable unavailable pause")
+       (test-assert (zerop (getf (application-goal application) :continuations)) "no continuation consumed"))))
+  nil)
+
+(defclass bounded-goal-scripted-provider (scripted-provider)
+  ()
+  (:documentation "Offline disposition fixture with a bounded, tool-free scripted response contract."))
+
+(defmethod provider-output-ceiling-p ((provider bounded-goal-scripted-provider))
+  "The offline fixture enforces its response estimate locally, with no remote dispatch."
+  (declare (ignore provider))
+  t)
+
+(defmethod provider-final-request-participation-p ((provider bounded-goal-scripted-provider))
+  "This fixture returns bounded scripted results rather than using a wire transport."
+  (declare (ignore provider))
+  t)
+
+(defmethod provider-assessment-output-path ((provider bounded-goal-scripted-provider))
+  "Advertise only the isolated fixture protocol, never a production route."
+  (declare (ignore provider))
+  '("fixture-output-limit"))
+
+(defmethod provider-stream-turn :around
+    ((provider bounded-goal-scripted-provider) (conversation conversation)
+     &key tool-namespaces event-callback goal-context compaction-p)
+  "Enforce the deterministic fixture response limit after its scripted handler."
+  (declare (ignore tool-namespaces event-callback goal-context compaction-p))
+  (let ((result (call-next-method)))
+    (when (eq *telemetry-request-role* ':goal-disposition)
+      (assert (<= (ceiling (length (or (provider-result-assistant-text result) "")) 4) 512)))
+    result))
+
+(-> test-goal-disposition-final-bounds () null)
+(defun test-goal-disposition-final-bounds ()
+  "Validate real encoders and the final transport boundary, not a local binding."
+  (with-test-environment (("GOOGLE_CLOUD_PROJECT" "offline-bounds-fixture"))
+    (with-test-configuration (configuration)
+      (setf (config :vertex-project configuration) "offline-bounds-fixture")
+      (let* ((conversation                     (conversation-create configuration))
+             (credentials                      (make-instance 'oauth-credentials :access-token "inert" :account-id "inert"))
+             (transports                       0)
+             (*provider-maximum-output-tokens* 512)
+             (*provider-bounded-assessment-p*  t)
+             (*system-prompt-override*         *application-goal-disposition-system-prompt*))
+        (conversation-append-user-message conversation "Three-field evidence fixture.")
+        (test-call-with-function-replacements
+         (list (list 'provider-post-event-stream
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (incf transports)
+                       (values nil 200 nil)))
+               (list 'cl-llm-provider-api:vertex-open-response-stream
+                     (lambda (provider request &key credentials)
+                       (declare (ignore provider request credentials))
+                       (incf transports)
+                       (values nil 200 nil))))
+         (lambda ()
+           (dolist (provider
+                     (list (openai-api-provider-create configuration)
+                           (openai-compatible-provider-create
+                            configuration :name "bounded-chat" :family :openai
+                            :headers nil :reasoning-parameter nil :stream-usage-p t)
+                           (anthropic-provider-create configuration)
+                           (gemini-code-assist-provider-create
+                            configuration :credential-manager (credential-manager-create configuration))
+                           (vertex-gemini-provider-create configuration)
+                           (vertex-anthropic-provider-create configuration)))
+             (when (typep provider 'gemini-code-assist-provider)
+               (setf (gemini-code-assist-provider-setup-complete-p provider) t
+                     (gemini-code-assist-provider-project provider) "offline-bounds-fixture"))
+             (let* ((*provider-bounded-assessment-p*  nil)
+                    (*provider-maximum-output-tokens* 73)
+                    (ordinary                         (provider-request-object provider conversation #()))
+                    (limit                            (reduce (lambda (object key) (json-get object key))
+                                                       (provider-assessment-output-path provider) :initial-value ordinary)))
+               (test-assert (eql limit 73) "ordinary builders retain the caller's output policy")
+               (provider-open-response-stream provider ordinary :credentials credentials :conversation conversation))
+             (let* ((request (call-with-isolated-request-context
+                              (lambda () (provider-request-object provider conversation #()))))
+                    (path    (provider-assessment-output-path provider))
+                    (object  (reduce (lambda (object key) (json-get object key))
+                                    (butlast path) :initial-value request))
+                    (key     (first (last path)))
+                    (before  transports))
+               (test-assert (provider-bounded-assessment-supported-p provider)
+                            "the concrete route advertises its real remote ceiling")
+               (test-assert (eql (json-get object key) 512)
+                            "the actual encoded protocol field is 512")
+               (provider-open-response-stream provider request
+                                              :credentials credentials :conversation conversation)
+               (test-assert (= transports (1+ before))
+                            "the unchanged encoded request reaches the inert I/O boundary")
+               (dolist (replacement '(nil 513 "512"))
+                 (if replacement (setf (gethash key object) replacement) (remhash key object))
+                 (test-assert
+                  (handler-case
+                      (progn (provider-open-response-stream provider request
+                                                            :credentials credentials :conversation conversation) nil)
+                    (provider-assessment-bound-error () t))
+                  "missing, altered, or non-integer final fields fail closed")
+                 (test-assert (= transports (1+ before))
+                              "an unbounded request performs zero additional transports"))
+               (setf (gethash key object) 512)
+               ;; Framing and any late encoded additions count toward input admission.
+               (setf (gethash "late-input-overhead" request) (make-string 32768 :initial-element #\x))
+               (test-assert
+                (handler-case
+                    (progn (provider-open-response-stream provider request
+                                                          :credentials credentials :conversation conversation) nil)
+                  (provider-assessment-bound-error () t))
+                "the complete final envelope is measured before I/O")
+               (test-assert (= transports (1+ before))
+                            "late framing overflow dispatches nothing")))
+           (let ((provider (make-instance 'scripted-provider :results nil)))
+             (test-assert (not (provider-bounded-assessment-supported-p provider))
+                          "ordinary custom direct-return providers have no bounded contract")
+             (test-assert
+              (handler-case
+                  (progn (provider-check-assessment-route provider) nil)
+                (provider-assessment-bound-error () t))
+              "each actual fallback route is checked before an attempt"))
+           (let* ((provider (provider-create configuration))
+                  (request  (json-object "input" #() "max_output_tokens" 512))
+                  (before   transports))
+             (dotimes (attempt 2)
+               (declare (ignorable attempt))
+               (test-assert
+                (handler-case
+                    (progn (provider-open-response-stream provider request
+                                                          :credentials credentials :conversation conversation) nil)
+                  (provider-assessment-bound-error () t))
+                "a fabricated field cannot admit an unsupported actual route or retry")
+               (test-assert
+                (handler-case
+                    (progn (provider-attempt-turn provider conversation) nil)
+                  (provider-assessment-bound-error () t))
+                "each real unsupported attempt or retry stops before credential lookup"))
+             (test-assert (= before transports) "unsupported retries never reach I/O")))))))
+  nil)
+
+(-> test-goal-disposition-isolation-unwind () null)
+(defun test-goal-disposition-isolation-unwind ()
+  "Private resolvers and delivery receipts never replace the surrounding scope."
+  (let* ((*context-resolver* (cl-llm-provider-api:make-context-resolver))
+         (*context-request-contributions*
+           (list (make-context-contribution :identifier "outer" :instruction "outer")))
+         (resolver           *context-resolver*)
+         (contributions      *context-request-contributions*)
+         (private            nil))
+    (test-assert
+     (handler-case
+         (call-with-isolated-request-context
+          (lambda ()
+            (setf private *context-resolver*)
+            (test-assert (and *context-request-isolated-p* (null *context-request-contributions*)
+                              (not (eq private resolver)))
+                         "isolation owns a new resolver without inherited context")
+            (error 'simple-error :format-control "intentional isolation unwind")))
+       (simple-error () t))
+     "the fixture exercises exceptional exit")
+    (test-assert (and (eq resolver *context-resolver*)
+                      (eq contributions *context-request-contributions*)
+                      (not *context-request-isolated-p*))
+                 "exceptional exit restores the surrounding dynamic scope")
+    (call-with-isolated-request-context
+     (lambda ()
+       (test-assert (not (eq private *context-resolver*))
+                    "an independent isolated request receives no previous receipts"))))
+  nil)
+
+(-> test-goal-disposition-input-overhead () null)
+(defun test-goal-disposition-input-overhead ()
+  "Whole escaped UTF-8 fields plus exact instructions determine early admission."
+  (dolist (mode '(:instructions :escaped :utf8))
+    (test-call-with-decision-application
+     (lambda (application provider terminal)
+       (declare (ignore provider terminal))
+       (let* ((calls 0) (creations 0)
+              (reply (make-string (case mode
+                                   (:instructions
+                                    32100)
+                                   (:escaped
+                                    17000)
+                                   (:utf8
+                                    17000))
+                                  :initial-element (case mode
+                                                    (:escaped
+                                                     #\")
+                                                    (:utf8
+                                                     #\GREEK_SMALL_LETTER_LAMDA)
+                                                    (t
+                                                     #\x)))))
+         (setf (application-provider application)
+               (openai-api-provider-create (application-configuration application)))
+         (test-call-with-function-replacements
+          (list (list 'provider-stream-turn
+                      (lambda (&rest arguments) (declare (ignore arguments)) (incf calls)
+                        (decision-test-result "{\"outcome\":\"continue\"}")))
+                (list 'conversation-create
+                      (let ((original (symbol-function 'conversation-create)))
+                        (lambda (&rest arguments) (incf creations) (apply original arguments)))))
+          (lambda () (application--call-with-goal-connection-owner
+                      application
+                      (lambda () (application--note-goal-turn application (decision-test-result reply))))))
+         (test-assert (and (zerop calls) (zerop creations)
+                           (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable))
+                      "prompt overhead, JSON escaping, and UTF-8 bytes each stop whole-field overflow before state creation")
+         (test-assert (not (provider-output-ceiling-p (make-instance 'scripted-provider :results nil)))
+                      "the ordinary scripted provider does not acquire a production capability")))))
+  nil)
+
+(-> test-goal-disposition-codex-controls () null)
+(defun test-goal-disposition-codex-controls ()
+  "Unsupported Codex pauses durably, with one notice and prose-only reentry."
+  (test-call-with-decision-application
+   (lambda (application fixture terminal)
+     (declare (ignore fixture terminal))
+     (let ((provider (make-instance 'codex-subscription-provider
+                                    :configuration (application-configuration application)))
+           (calls 0) (notices nil) (entry-status nil))
+       (setf (application-provider application) provider
+             (agent-provider (application-agent application)) provider)
+       (test-call-with-function-replacements
+        (list (list 'provider-stream-turn
+                    (lambda (&rest arguments)
+                      (declare (ignore arguments))
+                      (incf calls)
+                      (push (getf (application-goal application) :status) entry-status)
+                      (decision-test-result "Ordinary progress.")))
+              (list 'application-present
+                    (let ((original (symbol-function 'application-present)))
+                      (lambda (app entry &key identifier)
+                        (when (and (listp identifier) (eq (first identifier) ':goal-disposition))
+                          (push identifier notices))
+                        (funcall original app entry :identifier identifier)))))
+        (lambda ()
+          (application--note-goal-turn application (decision-test-result "Ordinary progress."))
+          (let* ((conversation (application-conversation application))
+                 (sibling      (make-instance 'application :configuration (application-configuration application)
+                                                     :conversation        (conversation-load-by-id
+                                                                           (application-configuration application)
+                                                                           (conversation-identifier conversation))
+                                                     :ui                  (application-ui application))))
+            (application--load-goal sibling)
+            (test-assert (and (eq (getf (application-goal sibling) :status) ':paused)
+                              (eq (getf (application-goal sibling) :pause-reason) ':disposition-unavailable)
+                              (zerop (getf (application-goal sibling) :continuations)))
+                         "reload restores the honest unavailable pause without spending a continuation")
+            (application--run-goal-continuations application)
+            (application--run-goal-continuations sibling)
+            (application-render-records application)
+            (application-goal-request application ':status nil)
+            (test-assert (and (zerop calls) (= (length notices) 1))
+                         "loop entry, reload, rendering, and status neither wake nor renotify"))
+          (application-run-message application *application-goal-continuation-prompt*)
+          (test-assert (eq (getf (application-goal application) :status) ':paused)
+                       "synthetic prose never reactivates an unavailable goal")
+          (application-run-message application "Continue investigating.")
+          (test-assert (and (member ':active entry-status)
+                            (eq (getf (application-goal application) :pause-reason) ':disposition-unavailable)
+                            (zerop (getf (application-goal application) :continuations)))
+                       "real prose allows one normal answer before a new honest unavailable pause")
+          (test-assert (= (length notices) 2) "only a new automatic pause adds a notice"))))))
+  nil)
+
+(-> test-goal-disposition-independent-context () null)
+(defun test-goal-disposition-independent-context ()
+  "An ordinary request in another thread retains registered context during isolation."
+  (test-call-with-decision-application
+   (lambda (application fixture terminal)
+     (declare (ignore fixture terminal))
+     (let* ((configuration (application-configuration application))
+            (conversation  (application-conversation application))
+            (provider      (openai-api-provider-create configuration))
+            (name          (make-identifier))
+            (calls         0))
+       (register-context-contributor
+        name (lambda (request)
+               (declare (ignore request)) (incf calls)
+               (make-context-contribution :identifier "independent-wire" :instruction "independent-wire")))
+       (unwind-protect
+            (progn
+              (test-assert (search "independent-wire" (json-encode (provider-request-object provider conversation #())))
+                           "ordinary projection includes registered context before unwind")
+              (handler-case
+                  (call-with-isolated-request-context
+                   (lambda ()
+                     (let ((ordinary
+                             (sb-thread:join-thread
+                              (sb-thread:make-thread
+                               (lambda ()
+                                 (let ((*context-resolver* (cl-llm-provider-api:make-context-resolver)))
+                                   (json-encode (provider-request-object provider conversation #()))))
+                               :name "independent-goal-context-fixture"))))
+                       (test-assert (search "independent-wire" ordinary)
+                                    "a concurrently scoped ordinary request retains its context"))
+                     (error 'simple-error :format-control "intentional builder unwind")))
+                (simple-error () nil))
+              (test-assert (and (= calls 2)
+                                (search "independent-wire" (json-encode (provider-request-object provider conversation #()))))
+                           "the registry and ordinary projection survive exceptional isolation exit"))
+         (unregister-context-contributor name)))))
   nil)
