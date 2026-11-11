@@ -2593,6 +2593,72 @@
       (test-assert (zerop (getf snapshot :repeat-cycle-opens)) "A repeated default cycle starts no paid request.")))
   nil)
 
+(-> test-expanded-native-owner-goal-metadata () null)
+(defun test-expanded-native-owner-goal-metadata ()
+  "Keep trusted final metadata separate from extension values and nested accounting."
+  (test-call-with-decision-application
+   (lambda (application provider terminal)
+     (declare (ignore provider terminal))
+     (let* ((primary (decision-test-result "Which option?"))
+            (goal    (application-goal application))
+            (note    (symbol-function 'application--note-goal-turn)))
+       (setf (application-provider application)
+             (make-instance 'codex-subscription-provider :configuration (application-configuration application)))
+       (test-call-with-function-replacements
+        (list (list 'agent-run-user-turn
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (values primary '(:provider-record-sequence 999))))
+              (list 'application--maybe-refresh-conversation-title
+                    (lambda (owner) (declare (ignore owner)) nil)))
+        (lambda ()
+          (dotimes (i 2)
+            (test-assert (equal (multiple-value-list (application--run-turn application "Extension input."))
+                                (list nil primary))
+                         "record-shaped extension secondaries do not alter public return values"))
+          (test-assert (and (eq (getf goal :status) ':active)
+                            (null (getf goal :previous-question-p))
+                            (null (getf goal :last-response-sequence)))
+                       "extension secondaries cannot fabricate a durable question streak")))
+       (test-call-with-decision-application
+        (lambda (other other-provider other-terminal)
+          (declare (ignore other-provider other-terminal))
+          (setf (application-provider other)
+                (make-instance 'codex-subscription-provider :configuration (application-configuration other)))
+          (test-call-with-function-replacements
+           (list (list 'agent-run-user-turn
+                       (lambda (agent content &rest keys)
+                         (declare (ignore agent content))
+                         (agent-observer-status (getf keys :observer) ':turn-completed
+                                                '(:provider-record-sequence 77))
+                         (values primary '(:provider-record-sequence 999))))
+                 (list 'application--note-goal-turn
+                       (lambda (owner value)
+                         (funcall note other value)
+                         (funcall note owner value)))
+                 (list 'application--maybe-refresh-conversation-title
+                       (lambda (owner) (declare (ignore owner)) nil)))
+           (lambda () (application--run-turn application "Observed extension input.")))
+          (test-assert (and (getf goal :previous-question-p)
+                            (eql (getf goal :last-response-sequence) 77))
+                       "the final observer supplies the owning application's trusted sequence")
+          (test-assert (and (null (getf (application-goal other) :previous-question-p))
+                            (null (getf (application-goal other) :last-response-sequence)))
+                       "nested accounting for another application cannot inherit the turn metadata")))
+       (setf (application-goal application) nil)
+       (test-call-with-function-replacements
+        (list (list 'agent-run-user-turn
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (setf (application-goal application) goal)
+                      (decision-test-result *application-goal-complete-marker*)))
+              (list 'application--maybe-refresh-conversation-title
+                    (lambda (owner) (declare (ignore owner)) nil)))
+        (lambda () (application--run-turn application "Create a goal during the turn.")))
+       (test-assert (eq (getf goal :status) ':active)
+                    "a captured absent goal cannot become a later goal at accounting time"))))
+  nil)
+
 (-> test-expanded-native-owner-finalization-errors () null)
 (defun test-expanded-native-owner-finalization-errors ()
   "Keep goal, title and terminal presentation failures outside the inference refusal catch."

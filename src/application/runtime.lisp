@@ -4522,12 +4522,22 @@ model's calls in a turn."
        :identifier notice)))
   nil)
 
+(defvar *application-goal-turn-context* nil
+  "The accounting call's application, captured goal, and final observer sequence.")
+
 (-> application--note-goal-turn
     (application provider-result &key (:sequence (option (integer 0))) (:goal (option list))) null)
-(defun application--note-goal-turn (application result &key sequence (goal (application-goal application)))
+(defun application--note-goal-turn (application result
+                                    &key (sequence (when (eq application (first *application-goal-turn-context*))
+                                                     (third *application-goal-turn-context*)))
+                                    (goal (if (eq application (first *application-goal-turn-context*))
+                                              (second *application-goal-turn-context*)
+                                              (application-goal application))))
   "Apply completion, explicit waiting, then a durable two-question continuation guard."
-  (let ((text       (application--turn-final-text result))
-        (generation (and goal (provider--connection-owner-generation goal)))
+  ;; Defaults consume this call's metadata; nested accounting starts independently.
+  (let ((*application-goal-turn-context* nil)
+        (text                            (application--turn-final-text result))
+        (generation                      (and goal (provider--connection-owner-generation goal)))
         (state-sequence nil) (repeated-p nil) (waiting-p nil)
         (classify-p nil) (complete-p nil) (mission-complete-p nil))
     (when (and goal text
@@ -4695,8 +4705,8 @@ refusal, as a secondary value."
                   (:no-error (&optional result &rest secondary-values)
                     (declare (ignore secondary-values))
                     (setf turn-result result)
-                    (application--note-goal-turn application result
-                                 :sequence final-sequence :goal turn-goal)
+                    (let ((*application-goal-turn-context* (list application turn-goal final-sequence)))
+                     (application--note-goal-turn application result))
                     (unless (or continuation-p operation-request)
                       (application--maybe-refresh-conversation-title application)))))
            (terminal-ui-set-compacting ui nil)

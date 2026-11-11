@@ -2032,6 +2032,7 @@
   test-expanded-native-idle-owner-matrix
   test-expanded-native-image-owner-and-reuse
   test-expanded-native-owner-return-values
+    test-expanded-native-owner-goal-metadata
   test-expanded-native-idle-cancellation-refusal
   test-expanded-native-owner-finalization-errors
   test-expanded-native-scheduled-controller)
