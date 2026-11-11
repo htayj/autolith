@@ -95,13 +95,14 @@
          (name     (subseq text 0 space))
          (argument (and space (string-left-trim '(#\Space #\Tab) (subseq text (1+ space))))))
     (cond
-      ((member name '("" "status" "run" "verify" "resume") :test #'string-equal)
+      ((member name '("" "status" "run" "verify" "resume" "draft-clear" "review-draft" "collect-draft-review") :test #'string-equal)
        (when (and argument (plusp (length argument)))
          (mission--reject ':invalid "This mission action takes no arguments."))
        (list (if (equal name "") ':status
-                 (find name '(:status :run :verify :resume) :test #'string-equal :key #'symbol-name))))
-      ((string-equal name "start")
-       (list ':start (mission--read-data (or argument ""))))
+                 (find name '(:status :run :verify :resume :draft-clear :review-draft :collect-draft-review) :test #'string-equal :key #'symbol-name))))
+      ((member name '("start" "draft" "draft-replace") :test #'string-equal)
+       (list (find name '(:start :draft :draft-replace) :test #'string-equal :key #'symbol-name)
+             (mission--read-data (or argument ""))))
       ((string-equal name "cancel")
        (if argument (list ':cancel argument) (list ':cancel)))
       ((member name '("accept" "invalidate") :test #'string-equal)
@@ -134,9 +135,9 @@
 (-> application-mission-command (application &optional t &rest t) null)
 (defun application-mission-command (application &optional (action ':status) &rest arguments)
   "Apply a native mission action, preserving specifications and literal evidence."
-  (unless (and (member action '(:status :start :draft :draft-replace :draft-clear :run :verify :resume :cancel :accept :invalidate))
+  (unless (and (member action '(:status :start :draft :draft-replace :draft-clear :review-draft :collect-draft-review :run :verify :resume :cancel :accept :invalidate))
                (case action
-                 ((:status :draft-clear :run :verify :resume)
+                 ((:status :draft-clear :review-draft :collect-draft-review :run :verify :resume)
                   (null arguments))
                  ((:start :draft :draft-replace)
                   (and (= (length arguments) 1)
@@ -149,9 +150,14 @@
     (mission--reject ':invalid "Invalid mission action or arguments."))
   (case action
     (:status
-     (application-present application (format nil "~S" (application-goal application))))
+     (application-present application (format nil "~S" (list :working (application-goal application) :candidate (application-mission-draft application)))))
     ((:draft :draft-replace)
      (application-mission-draft-edit application (first arguments) :replace-p (eq action :draft-replace)))
+    (:review-draft
+     (let ((job (application-mission-draft-review application)))
+       (when job (application-present application (format nil "Candidate native review job ~A. Collect its result separately." (job-identifier job))))))
+    (:collect-draft-review
+     (application-present application (format nil "~S" (application-mission-draft-review-collect application))))
     (:draft-clear
      (application-mission-draft-clear application))
     (:start

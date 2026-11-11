@@ -2113,7 +2113,8 @@
   test-goal-disposition-independent-context)
 
 (define-test-suite mission-specification
-  test-mission-specification-validation)
+  test-mission-specification-validation
+  test-mission-specification-retention)
 
 (define-test-suite mission-draft
   test-mission-draft-coexistence)
@@ -2133,3 +2134,7 @@
  test-mission-draft-ticket-accounting
  test-mission-draft-review-transactions
  test-mission-draft-session-rollback)
+
+(define-test-suite mission-draft-interface
+ test-mission-draft-native-command
+ test-mission-draft-restore-identities)

@@ -115,6 +115,23 @@ animation.
 
 * Goals and verified missions
 
+Use =(mission :draft SPECIFICATION)= to create or edit a separate candidate.
+Use =(mission :draft-replace SPECIFICATION)= for a fresh candidate identity and
+=(mission :draft-clear)= to clear it. Edits advance the specification revision
+and retain paid review accounting.
+
+Run =(mission :review-draft)= to request the configured reviewer through a
+native task, then =(mission :collect-draft-review)= to collect its explicit
+verdict and per-gate specification coverage. Read both slots with
+=(mission :status)=. The equivalent slash actions are =/mission draft DATA=,
+=/mission draft-replace DATA=, =/mission draft-clear=, =/mission review-draft=
+and =/mission collect-draft-review=.
+
+The reviewer receives an independent context and a private role definition
+without tools or descendants. Candidate reviews use the candidate's finite
+turn and token budgets. Review verdicts assess the specification; execute the
+acceptance gates to establish completion.
+
 Use =(goal "OBJECTIVE")= for lightweight autonomous work. Inspect it with
 =(goal)= or =(goal :status)=. Control it with =(goal :pause)=, =(goal :resume)=,
 or =(goal :clear)=. Edit it in place with =(goal :update "NEW-OBJECTIVE")=.
