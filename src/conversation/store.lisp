@@ -2070,6 +2070,36 @@ original condition. Absent and uncertain outcomes retain typed evidence."
   (let ((*conversation-candidate-origin-append* conversation))
    (conversation-append-record conversation record)))
 
+(-> conversation-append-context-decision (conversation list) list)
+(defun conversation-append-context-decision (conversation properties)
+  "Validate and append payload-free historical admission evidence."
+  (unless (and
+           (candidate-ledger--fields-p
+            properties '(:version :attempt :candidate :stage :estimate :mode :receipt-failure
+                         :non-text-p :window :reserve :soft-threshold :decision))
+           (eql (getf properties :version) 1)
+           (candidate-ledger--uuid-p (getf properties :attempt))
+           (typep (getf properties :candidate) '(integer 1))
+           (typep (getf properties :estimate) '(integer 0))
+           (member (getf properties :mode)
+                   '(:receipt-history :receipt-prefix :retained-usage :character/image))
+           (member (getf properties :receipt-failure)
+                   '(nil :no-owner :no-anchor :unsupported-layout :identity-changed :prefix-changed
+                     :unattested-provenance :history-changed :unknown))
+           (typep (getf properties :non-text-p) 'boolean)
+           (typep (getf properties :window) '(integer 1))
+           (typep (getf properties :reserve) '(integer 1))
+           (typep (getf properties :soft-threshold) '(or null (integer 1)))
+           (if (eq (getf properties :stage) :soft)
+               (member (getf properties :decision) '(:continue :compact))
+               (and (eq (getf properties :stage) :hard)
+                    (member (getf properties :decision) '(:admit :refuse)))))
+    (error 'conversation-invariant-error
+           :message  "Invalid context decision observation."
+           :pathname (conversation-pathname conversation)
+           :sequence (conversation-next-sequence conversation)))
+  (conversation-append-record conversation (cons :context-decision (copy-list properties))))
+
 (defgeneric conversation-append-record (conversation record)
   (:documentation "Append portable RECORD to CONVERSATION and return the sequenced form."))
 

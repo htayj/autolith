@@ -703,10 +703,11 @@ retries stay auditable next to the request they belong to."
     (agent provider-result
      &key (:request-number integer)
           (:call-plans list)
-          (:input-measurement list))
+          (:input-measurement list)
+          (:context-observation list))
     (values null list))
 (defun agent--persist-provider-result
-    (agent result &key request-number call-plans input-measurement)
+    (agent result &key request-number call-plans input-measurement context-observation)
   "Append RESULT items in wire order; return NIL and the durable metadata record."
   (let ((conversation (agent-conversation agent)) (record nil))
     (with-recursive-lock-held ((conversation-append-lock conversation))
@@ -743,6 +744,11 @@ retries stay auditable next to the request they belong to."
                                                     (provider-usage-normalize
                                                      (provider-result-usage result)))
                                  :request-identity (conversation-request-identity conversation))
+                           (when (and (getf context-observation :active-p)
+                                      (eq conversation (getf context-observation :owner))
+                                      (getf context-observation :hard))
+                             (list :context-attempt   (getf context-observation :attempt)
+                                   :context-candidate (getf context-observation :hard)))
                            (let ((receipt (provider-input-measurement-ticket-receipt
                                            conversation input-measurement)))
                              (and receipt (list :input-measurement receipt)))
@@ -2032,7 +2038,7 @@ loop, so compaction ahead of the user message shares the turn's budget."
               :next-request-tool-rounds    tool-rounds)
            (incf request-number compaction-requests)
            (setf next-request-details details)))
-       (let* ((conversation      (agent-conversation agent))
+       (let* ((conversation        (agent-conversation agent))
               (tool-calls-p
                 (and tools-p
                      (eq (agent--request-tool-choice tools-p tool-restriction-p tool-rounds)
@@ -2050,9 +2056,10 @@ loop, so compaction ahead of the user message shares the turn's budget."
                   (t
                    (tool-registry-provider-schemas
                     (agent-tool-registry agent)))))
-              (cache-prefix      nil)
-              (context-request   nil)
-              (input-measurement nil)
+              (cache-prefix        nil)
+              (context-request     nil)
+              (input-measurement   nil)
+              (context-observation nil)
               (result
                 (loop
                   (agent--check-request-budget agent request-number)
@@ -2122,16 +2129,24 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                              (provider-operation-tools-p operation) tools-p
                                              (provider-operation-tool-restriction-p operation) tool-restriction-p
                                              (provider-operation-tool-allowlist operation) (copy-list tool-allowlist))
-                                       (provider-stream-turn
-                                        (agent-provider agent)
-                                        conversation
-                                        :tool-namespaces tool-namespaces
-                                        :event-callback
-                                        (agent--provider-event-callback
-                                         observer
-                                         :conversation   conversation
-                                         :request-number request-number)
-                                        :goal-context    goal-context))
+                                       (let ((*provider-context-observation*
+                                               (setf context-observation
+                                                     (list :provider (agent-provider agent)
+                                                           :owner conversation :attempt (make-identifier)
+                                                           :candidate 0 :hard nil :active-p nil
+                                                           :threshold
+                                                           (configuration-compaction-token-limit
+                                                            (agent-configuration agent))))))
+                                         (provider-stream-turn
+                                          (agent-provider agent)
+                                          conversation
+                                          :tool-namespaces tool-namespaces
+                                          :event-callback
+                                          (agent--provider-event-callback
+                                           observer
+                                           :conversation   conversation
+                                           :request-number request-number)
+                                          :goal-context    goal-context)))
                                      :owner operation-owner :operation operation :configuration (agent-configuration agent)))))
                             (setf input-measurement ticket)
                             measured-result)))
@@ -2166,7 +2181,7 @@ loop, so compaction ahead of the user message shares the turn's budget."
                              :failure
                              (agent--provider-error-metadata condition)))
                       (error condition)))))
-              (calls             (provider-result-tool-calls result))
+              (calls               (provider-result-tool-calls result))
               (completion-details
                 (list :request-number    request-number
                       :response-id       (provider-result-response-id result)
@@ -2208,7 +2223,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
                (getf (rest (nth-value 1
                             (agent--persist-provider-result
                              agent result :request-number request-number
-                             :call-plans call-plans :input-measurement input-measurement))) :seq))
+                              :call-plans call-plans :input-measurement input-measurement
+                              :context-observation        context-observation))) :seq))
            (provider-context-note-response context-request result)
            (agent--answer-tool-searches
             agent result tool-namespaces :request-number request-number)
