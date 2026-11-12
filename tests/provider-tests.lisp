@@ -2557,7 +2557,9 @@
 (defun provider-tests--response-deadline-form-p (form)
   "Return true when FORM establishes the hard provider response deadline."
   (and (consp form)
-       (eq (first form) 'provider-call-with-response-deadline)))
+       (not (null (member (first form)
+                          '(provider-call-with-response-deadline
+                            provider--call-opening))))))
 
 (-> provider-tests--audit-dexador-deadlines () (values integer list))
 (defun provider-tests--audit-dexador-deadlines ()
@@ -4099,7 +4101,7 @@ Transport is synthetic; retry delays are suppressed."
 
 (-> test-provider-recovery-long-ladder () null)
 (defun test-provider-recovery-long-ladder ()
-  "Survive more than six ordinary unstable openings without a total wait ceiling."
+  "Exercise extended retry counts with modeled waits inside a live monotonic window."
   (provider-recovery-tests--call-with-provider
    1
    (lambda (provider conversation)
@@ -4129,7 +4131,7 @@ Transport is synthetic; retry delays are suppressed."
        (test-assert (and (equal answer '(:healthy :second-value)) (= attempts 10))
                     "the tenth actual attempt preserves all returned values")
        (test-assert (and (= (length waits) 9) (> (reduce #'+ waits :initial-value 0) 300))
-                    "caller-owned recovery survives more than five minutes of modeled waits")
+                    "modeled delays exceed five minutes without advancing monotonic elapsed time")
        (test-assert (every (lambda (seconds) (<= seconds 300)) waits)
                     "every jittered wait respects the per-wait cap"))))
   nil)
@@ -4259,11 +4261,11 @@ Transport is synthetic; retry delays are suppressed."
                     "three generated failures stop the same wrapper despite intervening openings"))))
   nil)
 
-(-> test-provider-recovery-native-refusal-to-healthy () null)
-(defun test-provider-recovery-native-refusal-to-healthy ()
-  "Recover the production factory route after nine actual failed HTTP openings."
+(-> test-provider-recovery-native-timeout-to-healthy () null)
+(defun test-provider-recovery-native-timeout-to-healthy ()
+  "Recover native opening timeouts through the finite ladder, then open healthy HTTP."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket :type ':stream :protocol ':tcp))
-        (server nil) (accepted nil) (stream nil) (attempts 0) (waits nil))
+        (server nil) (accepted nil) (stream nil) (attempts 0) (waits nil) (failures nil))
     (unwind-protect
          (progn
            (sb-bsd-sockets:socket-bind socket #(127 0 0 1) 0)
@@ -4272,10 +4274,11 @@ Transport is synthetic; retry delays are suppressed."
              (provider-recovery-tests--call-with-provider
               port
               (lambda (provider conversation)
-                (let ((*bounded-retry-sleep-function*
+                (let ((*provider-maximum-transient-retries* 2)
+                      (*bounded-retry-sleep-function*
                         (lambda (seconds)
                           (push seconds waits)
-                          (when (= (length waits) 9)
+                          (when (= (length waits) 2)
                             (sb-bsd-sockets:socket-listen socket 1)
                             (setf server
                                   (sb-thread:make-thread
@@ -4306,7 +4309,7 @@ Transport is synthetic; retry delays are suppressed."
                                (incf attempts)
                                (multiple-value-bind (response status headers)
                                    (provider-call-with-response-deadline
-                                    (if (< attempts 10) 0.1 2)
+                                    (if (< attempts 3) 0.1 2)
                                     (lambda ()
                                       (provider--open-response-stream
                                        provider (json-object "model" "owned-connection-model" "messages" #())
@@ -4315,13 +4318,21 @@ Transport is synthetic; retry delays are suppressed."
                                  (declare (ignore headers))
                                  (when (streamp response) (close response))
                                  status))
-                             #'identity))
+                             (lambda (event)
+                               (when (typep event 'provider-attempt-failed-event)
+                                 (push (provider-attempt-failed-event-condition event) failures)))))
                     (provider-error (condition) (setf failure condition)))
                   (format t "~&NATIVE recovery attempts=~D waits=~D accepted=~S status=~S failure=~S~%"
                           attempts (length waits) (not (null accepted)) status (type-of failure))
-                  (test-assert (and (null failure) (= attempts 10) (= (length waits) 9)
+                  (test-assert (and (null failure) (= attempts 3) (= (length waits) 2)
                                     accepted (eql status 200))
-                               "the tenth native opening succeeds without restarting the charged invocation"))))))
+                               "the third native opening succeeds within the finite transient count")
+                  (test-assert (and (= (length failures) 2)
+                                    (every (lambda (condition)
+                                             (and (typep condition 'provider-opening-instability)
+                                                  (eq (provider-opening-instability-category condition) ':opening-timeout)))
+                                           failures))
+                               "the native non-listening fixture reports local opening timeouts"))))))
       (when stream (close stream :abort t))
       (when accepted (sb-bsd-sockets:socket-close accepted))
       (sb-bsd-sockets:socket-close socket)
@@ -4507,30 +4518,66 @@ Transport is synthetic; retry delays are suppressed."
 
 (-> test-provider-recovery-repeated-opening-timeout () null)
 (defun test-provider-recovery-repeated-opening-timeout ()
-  "A per-opening timeout can repeat without expiring a live owner."
+  "A stalled request exhausts finite opening retries while its same-route peer succeeds."
   (provider-recovery-tests--call-with-provider
    1
    (lambda (provider conversation)
-     (declare (ignore conversation))
-     (let ((attempts                           0)
-           (*provider-opening-timeout-seconds* 0.005)
-           (*bounded-retry-sleep-function*     (lambda (seconds) (declare (ignore seconds)))))
-       (test-assert
-        (equal '(17 23)
-               (multiple-value-list
-                (provider--call-with-bounded-retries
-                 provider
-                 (lambda (refresh callback)
-                   (declare (ignore refresh callback))
-                   (incf attempts)
-                   (provider--call-with-transport-normalization
-                    (lambda ()
-                      (provider--call-opening
-                       (lambda () (if (< attempts 8) (sleep 0.02) (values 17 23)))))
-                    :terminal-errors-p t))
-                 #'identity)))
-        "successful values survive repeated independent opening expiry")
-       (test-assert (= attempts 8) "local timeouts are not a hidden finite ladder"))))
+     (let ((attempts 0) (healthy 0) (events nil) (outcome nil)
+           (request-a                            (json-object "request" "A"))
+           (request-b                            (json-object "request" "B"))
+           (*provider-opening-timeout-seconds*   0.005)
+           (*provider-maximum-transient-retries* 2))
+       (test-call-with-function-replacements
+        (list
+         (list 'provider-open-response-stream
+               (lambda (selected request &key credentials conversation)
+                 (declare (ignore credentials conversation))
+                 (test-assert (eq selected provider) "both requests use the identical route")
+                 (if (eq request request-a)
+                     (progn
+                       (incf attempts)
+                       (when (> attempts 5)
+                         (error 'provider-owner-ended :message "Local regression guard."))
+                       (sleep 0.02))
+                     (progn
+                       (incf healthy)
+                       (make-string-input-stream ""))))))
+        (lambda ()
+          (let ((*bounded-retry-sleep-function*
+                  (lambda (seconds)
+                    (declare (ignore seconds))
+                    (provider--call-with-bounded-retries
+                     provider
+                     (lambda (refresh callback)
+                       (declare (ignore refresh callback))
+                       (with-open-stream (stream (provider--open-response-stream
+                                                  provider request-b :conversation conversation))
+                         (test-assert (null (read-char stream nil nil))
+                                      "the independent peer opens successfully")))
+                     #'identity))))
+            (setf outcome
+                  (handler-case
+                      (provider--call-with-bounded-retries
+                       provider
+                       (lambda (refresh callback)
+                         (declare (ignore refresh callback))
+                         (provider--open-response-stream provider request-a
+                                                         :conversation conversation))
+                       (lambda (event) (push event events)))
+                    (provider-error (condition) condition))))))
+       (test-assert (and (typep outcome 'provider-opening-instability)
+                         (eq (provider-opening-instability-category outcome) ':opening-timeout))
+                    "the real opening deadline survives both normalization boundaries")
+       (test-assert (= attempts 3) "opening failures consume the finite retry count")
+       (test-assert (notany (lambda (event)
+                              (and (typep event 'provider-attempt-failed-event)
+                                   (provider-attempt-failed-event-output-received-p event)))
+                            events)
+                    "all stalled opening attempts finish without generation output")
+       (test-assert (= healthy 2) "a healthy same-route request succeeds between each retry")
+       (test-assert (= 1 (count-if (lambda (event)
+                                    (typep event 'provider-retries-exhausted-event)) events))
+                    "finite exhaustion is reported rather than the test guard"))))
   nil)
 
 (-> provider-recovery-tests--deadline-quantum-controls () null)
@@ -5105,4 +5152,370 @@ Transport is synthetic; retry delays are suppressed."
              (unless (eq entry :goal) (mission-detach application))
              (remhash application *mission-schedule-services*)
              (terminal-ui-stop (application-ui application))))))))
+  nil)
+
+
+;;;; -- Pre-generation Request Window --
+
+(-> test-provider-recovery-window-waits () null)
+(defun test-provider-recovery-window-waits ()
+  "Both retry ladders stop within a shared window under a one-hour caller."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (dolist (mode '(:connection :finite :injected))
+       (let* ((state                              (make-provider-connection-recovery))
+              (start                              (get-internal-real-time))
+              (attempts 0) (events nil)
+              (*provider-recovery-window-seconds* 3/100)
+              (*bounded-retry-sleep-function*
+                (if (eq mode ':injected)
+                    (lambda (seconds) (sleep (+ seconds 0.01)))
+                    #'sleep)))
+         (setf (provider-connection-recovery-deadline state)
+               (+ 3600 (/ start internal-time-units-per-second)))
+         (let ((failure
+                 (handler-case
+                     (provider--call-with-bounded-retries
+                      provider
+                      (lambda (refresh callback)
+                        (declare (ignore refresh callback))
+                        (incf attempts)
+                        (if (eq mode ':finite)
+                            (error 'provider-retryable-error :message "Semantic transient.")
+                            (error 'provider-opening-instability :category ':connection
+                                   :message                                "Transport failure.")))
+                      (lambda (event) (push event events)) :recovery state)
+                   (provider-error (condition) condition))))
+           (test-assert (typep failure 'provider-recovery-expired)
+                        "a long caller does not authorize unbounded recovery")
+           (test-assert (not (typep failure 'provider-retryable-error))
+                        "window exhaustion cannot reenter an automatic ladder")
+           (test-assert (= attempts 1) "the clipped wait expires before any second dispatch")
+           (test-assert (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 1)
+                        "real waits and injected sleeps terminate promptly")
+           (test-assert (not (member state *provider-connection-episodes*))
+                        "expiry releases the exact episode")
+           (test-assert (notany (lambda (event) (typep event 'provider-retries-exhausted-event)) events)
+                        "time exhaustion is distinct from count exhaustion")
+           (let* ((wait  (find-if (lambda (event)
+                                   (if (eq mode ':finite)
+                                       (typep event 'provider-retry-event)
+                                       (and (typep event 'provider-connection-event)
+                                            (eq (getf (provider-connection-event-details event) :phase) ':waiting))))
+                                events))
+                  (delay (typecase wait
+                           (provider-retry-event
+                            (provider-retry-event-delay wait))
+                           (provider-connection-event
+                            (getf (provider-connection-event-details wait) :delay)))))
+             (test-assert (and (realp delay) (< 0 delay) (<= delay 3/100))
+                          "both retry observers report the clipped actual wait")))))
+     (test-call-with-function-replacements
+      (list (list 'credential-manager-refreshable-p
+                  (lambda (manager) (declare (ignore manager)) t)))
+      (lambda ()
+        (let* ((state                          (make-provider-connection-recovery))
+               (alternate                      (openai-compatible-provider-create
+                                                (provider-configuration provider)
+                                                :name "owned-connection-recovery-fixture" :family ':openai))
+               (attempts 0) (deadlines nil) (routes nil) (refreshes nil)
+               (*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
+          (setf (provider-connection-recovery-route-count state) 2
+                (provider-connection-recovery-route-threshold state) 1)
+          (test-assert
+           (equal '(recovered values)
+                  (multiple-value-list
+                   (provider--call-with-bounded-retries
+                    provider
+                    (lambda (refresh callback)
+                      (declare (ignore callback))
+                      (push refresh refreshes)
+                      (push (provider-connection-recovery-route-index state) routes)
+                      (push (provider-connection-recovery-recovery-deadline state) deadlines)
+                      (sleep 1/100)
+                      (ecase (incf attempts)
+                        (1
+                         (error 'provider-opening-instability :category ':connection :message "Connect."))
+                        (2
+                         (error 'provider-unauthorized :status 401 :message "Refresh."))
+                        (3
+                         (error 'provider-retryable-error :message "Semantic transient."))
+                        (4
+                         (values 'recovered 'values))))
+                    #'identity :recovery state
+                    :select-provider     (lambda ()
+                                          (if (zerop (provider-connection-recovery-route-index state))
+                                              provider alternate)))))
+           "route change, authentication refresh and finite reentry preserve return values")
+          (test-assert (and (= attempts 4) (equal (reverse routes) '(0 1 1 1))
+                            (equal (reverse refreshes) '(nil nil t nil))
+                            (numberp (first deadlines)) (apply #'= deadlines))
+                       "every retry scope retains the exact original monotonic window"))
+        (let ((state (make-provider-connection-recovery)) (attempts 0))
+          (test-assert
+           (handler-case
+               (provider--call-with-bounded-retries
+                provider
+                (lambda (refresh callback)
+                  (declare (ignore refresh callback))
+                  (incf attempts)
+                  (setf (provider-connection-recovery-recovery-deadline state) 0)
+                  (error 'provider-unauthorized :status 401 :message "Refresh after expiry."))
+                #'identity :recovery state)
+             (provider-recovery-expired () (= attempts 1)))
+           "authentication refresh cannot dispatch after recovery expiry"))))
+     (test-assert
+      (equal '(fresh values)
+             (multiple-value-list
+              (provider--call-with-bounded-retries
+               provider (lambda (refresh callback) (declare (ignore refresh callback))
+                          (values 'fresh 'values)) #'identity)))
+      "a genuinely new logical request receives its own window")))
+  nil)
+
+(-> test-provider-recovery-window-opening () null)
+(defun test-provider-recovery-window-opening ()
+  "An opening consumes remaining recovery time, with caller cancellation taking precedence."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (dolist (mode '(:window :owner :cancel))
+       (let* ((state                              (make-provider-connection-recovery))
+              (now                                (/ (get-internal-real-time) internal-time-units-per-second))
+              (attempts                           0)
+              (*provider-opening-timeout-seconds* 1)
+              (*provider-recovery-window-seconds* 1/25))
+         (setf (provider-connection-recovery-deadline state) (+ now (if (eq mode ':owner) 1/100 3600)))
+         (test-call-with-function-replacements
+          (list (list 'provider-open-response-stream
+                      (lambda (selected request &key credentials conversation)
+                        (declare (ignore selected request credentials conversation))
+                        (incf attempts)
+                        (when (eq mode ':cancel) (provider--end-connection-episode state))
+                        (sleep 0.1))))
+          (lambda ()
+            (let ((failure
+                    (handler-case
+                        (provider--call-with-bounded-retries
+                         provider
+                         (lambda (refresh callback)
+                           (declare (ignore refresh callback))
+                           (provider--open-response-stream provider (json-object) :conversation conversation))
+                         #'identity :recovery state)
+                      (provider-error (condition) condition))))
+              (test-assert (typep failure (if (eq mode ':window) 'provider-recovery-expired 'provider-owner-ended))
+                           "opening expiry preserves window, shorter caller and cancellation distinctions")
+              (test-assert (= attempts 1) "no opening follows terminal expiry"))))))
+     (let ((state (make-provider-connection-recovery)) (attempts 0))
+       (setf (provider-connection-recovery-recovery-deadline state) -1)
+       (test-assert
+        (handler-case
+            (provider--call-with-bounded-retries
+             provider (lambda (refresh callback) (declare (ignore refresh callback)) (incf attempts))
+             #'identity :recovery state)
+          (provider-recovery-expired () t))
+        "an already elapsed window is checked before dispatch")
+       (test-assert (zerop attempts) "expiry never grants one last attempt"))))
+  nil)
+
+(-> test-provider-recovery-window-resume () null)
+(defun test-provider-recovery-window-resume ()
+  "Suspension preserves the window and terminal exhaustion cannot create resumable work."
+  (route-tests--call-with-runtime
+   (lambda (provider conversation configuration)
+     (declare (ignore provider))
+     (let* ((operation                        (make-provider-operation :conversation conversation :goal conversation :epoch 0))
+            (owner                            (make-provider-operation-owner :operation operation :active-p t))
+            (state                            (make-provider-connection-recovery))
+            (restored                         (make-provider-connection-recovery))
+            (deadline                         (+ 60 (/ (get-internal-real-time) internal-time-units-per-second)))
+            (*provider-suspended-connections* (make-hash-table :test 'eq))
+            (*provider-connection-operation*  operation))
+       (setf (provider-operation-owner-scope operation) owner
+             (provider-connection-recovery-owner state) conversation
+             (provider-connection-recovery-owner restored) conversation
+             (provider-connection-recovery-attempt state) 3
+             (provider-connection-recovery-route-index state) 1
+             (provider-connection-recovery-recovery-deadline state) deadline)
+       (unwind-protect
+            (progn
+              (provider--remember-suspension conversation state configuration)
+              (test-assert (provider-operation-resumable-p operation conversation configuration)
+                           "live original window permits explicit resume")
+              (provider--restore-suspension restored conversation configuration)
+              (test-assert (= deadline (provider-connection-recovery-recovery-deadline restored))
+                           "resume restores rather than renews the original monotonic window")
+              (test-assert (and (= 3 (provider-connection-recovery-attempt restored))
+                                (= 1 (provider-connection-recovery-route-index restored)))
+                           "route and attempt history accompany the same window")
+              (setf (provider-connection-recovery-recovery-deadline restored) -1)
+              (provider--remember-suspension conversation restored configuration)
+              (test-assert (not (provider-operation-resumable-p operation conversation configuration))
+                           "an expired window is never eligible for resume")
+              (test-assert
+               (handler-case (provider--restore-suspension state conversation configuration)
+                 (provider-recovery-expired () t))
+               "even a direct restoration rejects expiry")
+              (remhash operation *provider-suspended-connections*)
+              (let ((*provider-connection-capture* nil))
+                (test-assert
+                 (handler-case
+                     (provider-call-with-suspension
+                      conversation
+                      (lambda ()
+                        (setf (second *provider-connection-capture*) state
+                              (third *provider-connection-capture*) configuration)
+                        (error 'provider-recovery-expired :attempt 3 :message "Window elapsed."))
+                      :suspended-p (constantly t))
+                   (provider-recovery-expired () t))
+                 "a broad slice predicate cannot convert terminal exhaustion to a suspension"))
+              (test-assert (zerop (hash-table-count *provider-suspended-connections*))
+                           "terminal window exhaustion retains no resumable metadata"))
+         (provider-operation-dispose operation)))))
+  nil)
+
+(-> test-provider-recovery-condition-generation () null)
+(defun test-provider-recovery-condition-generation ()
+  "Condition-only generation ends the recovery window, not caller or streaming safety."
+  (provider-recovery-tests--call-with-provider
+   1
+   (lambda (provider conversation)
+     (declare (ignore conversation))
+     (dolist (mode '(:elapsed :sleep :success :no-generation :owner))
+       (let* ((state (make-provider-connection-recovery))
+              (attempts 0) (waits 0) (failure nil) (answer nil)
+              (*bounded-retry-sleep-function*
+                (lambda (seconds)
+                  (declare (ignore seconds))
+                  (incf waits)
+                  (setf (provider-connection-recovery-recovery-deadline state) 0))))
+         (handler-case
+             (setf answer
+                   (multiple-value-list
+                    (provider--call-with-bounded-retries
+                     provider
+                     (lambda (refresh callback)
+                       (declare (ignore refresh callback))
+                       (incf attempts)
+                       (when (member mode '(:elapsed :no-generation :owner))
+                         (setf (provider-connection-recovery-recovery-deadline state) 0))
+                       (when (eq mode ':owner)
+                         (setf (provider-connection-recovery-deadline state) 0))
+                       (if (and (eq mode ':success) (= attempts 2))
+                           (values :healthy :second-value)
+                           (error 'cl-llm-provider-api::provider-truncated-response
+                                  :message              "Silent generated failure."
+                                  :reason               "max_output_tokens"
+                                  :generation-started-p (not (eq mode ':no-generation)))))
+                     #'identity :recovery state)))
+           (provider-error (condition) (setf failure condition)))
+         (case mode
+           ((:elapsed :sleep)
+            (test-assert (and (typep failure 'provider-stream-abandoned)
+                              (= attempts 3)
+                              (= (provider-stream-abandoned-attempts failure) 3))
+                         "silent generated failures retain the finite streaming budget after window expiry"))
+           (:success
+            (test-assert (and (null failure) (= attempts 2) (= waits 1)
+                              (equal answer '(:healthy :second-value)))
+                         "a generated retry can succeed with multiple values after its finite sleep"))
+           (:no-generation
+            (test-assert (and (typep failure 'provider-recovery-expired) (= attempts 1))
+                         "a condition without generation evidence still expires the recovery window"))
+           (:owner
+            (test-assert (and (typep failure 'provider-owner-ended) (= attempts 1))
+                         "condition-only generation never overrides caller expiry")))
+         (test-assert (eq (provider-connection-recovery-generation-started-p state)
+                          (not (eq mode ':no-generation)))
+                      "the failed-attempt observer latches only genuine generation evidence")))))
+  nil)
+
+(-> test-provider-recovery-native-compaction-window () null)
+(defun test-provider-recovery-native-compaction-window ()
+  "Clip the actual native POST operation and settle its supervised attempt."
+  (dolist (mode '(:window :owner :cancel :late-window :success :long-success))
+    (expanded-native-test--fixture
+     (lambda (application provider)
+       (let* ((source                             (application-conversation application))
+              (context                            (mission-request-view-context source))
+              (view                               (conversation-compaction-view (conversation-compaction-capture source)))
+              (goal                               (application-goal application))
+              (start                              (/ (get-internal-real-time) internal-time-units-per-second))
+              (expires                            (+ start (if (eq mode ':owner) 1/100 3600)))
+              (original                           (symbol-function 'provider-call-with-response-deadline))
+              (posts 0) (limits nil) (episode nil) (failure nil) (answer nil)
+              (*provider-opening-timeout-seconds* 1/100)
+              (*provider-recovery-window-seconds* (if (eq mode ':long-success) 120 1/25))
+              (*provider-connection-owner-check*
+                (lambda () (- expires (/ (get-internal-real-time) internal-time-units-per-second)))))
+         (setf (getf goal :unknown-usage-policy) ':record)
+         (test-call-with-function-replacements
+          (list (list 'credential-manager-credentials
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (provider-tests--credentials (application-configuration application))))
+                (list 'provider-call-with-response-deadline
+                      (lambda (seconds function)
+                        (push seconds limits)
+                        (if (eq mode ':late-window)
+                            (funcall function)
+                            (funcall original seconds function))))
+                (list 'dexador:post
+                      (lambda (&rest arguments)
+                        (declare (ignore arguments))
+                        (incf posts)
+                        (setf episode *provider-connection-episode*)
+                        (when (eq mode ':cancel)
+                          (provider--end-connection-episode episode))
+                        (unless (member mode '(:success :long-success)) (sleep 1/5))
+                        (values (json-encode
+                                 (json-object "output" (vector (json-object "type" "compaction"
+                                                                           "encrypted_content" "opaque"))
+                                              "usage" (json-object "input_tokens" 1 "output_tokens" 2)))
+                                200 nil))))
+          (lambda ()
+            (handler-case
+                (setf answer
+                      (multiple-value-list
+                       (mission-call-with-native-compaction-view
+                        context view
+                        (lambda ()
+                          (provider-native-compact-conversation
+                           provider view :tool-namespaces #() :event-callback #'identity)))))
+              (serious-condition (condition)
+                (setf failure (if (typep condition 'mission-error)
+                                 (mission-error-cause condition) condition))))))
+         (test-assert (= posts 1) "native expiry or completion dispatches exactly once")
+         (test-assert (and episode (not (member episode *provider-connection-episodes*)))
+                      "native unwind removes its exact recovery episode")
+         (test-assert (and (zerop (getf goal :requests-outstanding))
+                           (zerop (getf goal :tokens-reserved)))
+                      "native timeout and success settle all attempt reservations")
+         (if (member mode '(:success :long-success))
+             (progn
+               (test-assert (and (null failure) (first answer) (second answer))
+                            "native completion preserves its output and usage values")
+               (test-assert (= (getf goal :tokens-used) 3)
+                            "native success contributes measured usage"))
+             (progn
+               (test-assert (typep failure (if (member mode '(:window :late-window))
+                                              'provider-recovery-expired 'provider-owner-ended))
+                            "native deadlines classify recovery expiry after caller and cancellation checks")
+               (test-assert (not (typep failure 'provider-retryable-error))
+                            "native lifetime expiry cannot enter another retry")
+               (unless (eq mode ':late-window)
+                 (test-assert (< (- (/ (get-internal-real-time) internal-time-units-per-second) start) 3/20)
+                              "the actual native POST is interrupted before its fake response"))
+               (test-assert (= (getf goal :unknown-usage) 1)
+                            "a dispatched native timeout retains unknown usage")))
+         (test-assert (some (lambda (limit)
+                             (and (realp limit)
+                                  (if (eq mode ':long-success)
+                                      (< 30 limit 121)
+                                      (< 0 limit 1/20))))
+                           limits)
+                      "native operation uses the request/caller minimum, not a fresh 30-second limit")))
+     :owned-p t :large-p nil))
   nil)

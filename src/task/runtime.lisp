@@ -495,6 +495,33 @@ under the progress lock before releasing it to other threads."
           when (typep value '(integer 0 9223372036854775807))
             append (list key value))))
 
+(-> task-progress--provider-wait-note (task-job keyword list) null)
+(defun task-progress--provider-wait-note (job status details)
+  "Queue a structural wait note at most once per minute per child job.
+Reserve under the progress lock; note delivery and output occur outside it."
+  (let ((attempt    (getf details :attempt))
+        (delay      (getf details :delay))
+        (parent     (task-job-parent-agent job))
+        (progress   (task-job-progress job))
+        (now        (get-internal-real-time))
+        (reserved-p nil))
+    (when (and parent
+               (or (eq status ':provider-retrying)
+                   (and (eq status ':provider-connection) (eq (getf details :phase) ':waiting)))
+               (typep attempt '(integer 0 1000000000))
+               (typep delay '(real 0 3600)))
+      (with-lock-held ((task-progress-lock progress))
+        (let ((previous (task-progress-provider-wait-note-at progress)))
+          (when (or (null previous) (>= (- now previous) (* 60 internal-time-units-per-second)))
+            (setf (task-progress-provider-wait-note-at progress) now
+                  reserved-p t))))
+      (when reserved-p
+        (let ((note (format nil "Waiting for provider, attempt ~D; retry in ~,2Fs." attempt delay)))
+          (task-progress-append-output progress (format nil "~%[provider] ~A~%" note))
+          (task-note-post (conversation-identifier (agent-conversation parent))
+                          (job-identifier job) note)))))
+  nil)
+
 (-> task-progress-note-status (task-job keyword list) null)
 (defun task-progress-note-status (job status details)
   "Update JOB's normalized progress from one child observer STATUS event."
@@ -549,6 +576,7 @@ under the progress lock before releasing it to other threads."
       (task-continuity-note-activity job status details))
     (task-orchestrator-emit (task-job-orchestrator job) :task-subagent-progress
                             event)
+    (task-progress--provider-wait-note job status details)
     ;; Every observed child event is also a cancellation point, so a child whose
     ;; controller gave up stops at its next provider or tool boundary even when
     ;; an interrupt could not be delivered to it.

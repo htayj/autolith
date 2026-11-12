@@ -62,13 +62,19 @@
   test-provider-recovery-long-ladder
   test-provider-recovery-service-and-semantic-controls
   test-provider-recovery-cumulative-generation
-  test-provider-recovery-native-refusal-to-healthy)
+  test-provider-recovery-native-timeout-to-healthy)
 
 (define-test-suite provider-recovery-lifetime
   test-provider-recovery-owner-deadline
   test-provider-recovery-dns-codes
   test-provider-recovery-owned-waiter
-  test-provider-recovery-repeated-opening-timeout)
+  test-provider-recovery-repeated-opening-timeout
+  test-provider-recovery-window-waits
+  test-provider-recovery-window-opening
+  test-provider-recovery-condition-generation
+  test-provider-recovery-native-compaction-window
+  test-provider-recovery-window-resume
+  test-provider-status-parent-wait-notes)
 
 (define-test-suite context-admission
   test-context-boundary-prepare-change

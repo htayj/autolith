@@ -605,19 +605,24 @@ The pooled connection is shared with the streaming requests so a compaction
 reaches the backend holding the conversation's cached prefix."
   (declare (type oauth-credentials credentials)
            (type conversation conversation))
-  (provider-call-with-response-deadline
-   300
+  ;; Native compaction returns a complete response, not an opened stream.
+  ;; Keep its operation limit, clipped by the request window and caller lifetime.
+  (provider--call-opening
    (lambda ()
-     (dexador:post
-      (provider--native-compaction-endpoint provider)
-      :headers             (provider--codex-request-headers
-                            provider credentials conversation :accept "application/json")
-      :content             (json-encode-utf8 request)
-      :force-string        t
-      :keep-alive          t
-      :use-connection-pool t
-      :connect-timeout     30
-      :read-timeout        300))))
+     (multiple-value-prog1
+         (dexador:post
+          (provider--native-compaction-endpoint provider)
+          :headers             (provider--codex-request-headers
+                                provider credentials conversation :accept "application/json")
+          :content             (json-encode-utf8 request)
+          :force-string        t
+          :keep-alive          t
+          :use-connection-pool t
+          :connect-timeout     30
+          :read-timeout        300)
+       (when *provider-connection-episode*
+         (provider--connection-remaining *provider-connection-episode*))))
+   300))
 
 
 ;;;; -- Usage Limit Failures --
@@ -1051,8 +1056,21 @@ original condition or weakening the streaming safety limit."
                  (setf (provider-connection-recovery-generation-started-p recovery) t))
                (when (typep event 'provider-attempt-failed-event)
                  (setf last-failure event)
+                 (let ((condition (provider-attempt-failed-event-condition event)))
+                   (when (and (typep condition 'provider-retryable-error)
+                              (cl-llm-provider-api::provider-retryable-error-generation-started-p condition))
+                     (setf (provider-connection-recovery-generation-started-p recovery) t)))
                  (when (provider-attempt-failed-event-retryable-p event)
                    (incf retryable-failures)))
+               (when (typep event 'provider-retry-event)
+                 (let ((remaining (provider--connection-remaining recovery)))
+                   (when (and remaining (< remaining (provider-retry-event-delay event)))
+                     (setf event
+                           (make-instance 'provider-retry-event
+                                          :attempt (provider-retry-event-attempt event)
+                                          :maximum-attempts
+                                          (cl-llm-provider-api:provider-retry-event-maximum-attempts event)
+                                          :delay   remaining)))))
                (handler-case (funcall event-callback event)
                  (error (condition)
                    (error 'provider-observer-failure :cause condition))))
@@ -1062,7 +1080,7 @@ original condition or weakening the streaming safety limit."
                 (let* ((selected      (funcall select-provider))
                        (manager       (provider-credential-manager selected))
                        (refreshable-p (credential-manager-refreshable-p manager)))
-                 (provider--check-connection-owner recovery)
+                 (provider--connection-remaining recovery)
                  (setf (provider-connection-recovery-endpoint recovery)
                        (provider--connection-display-endpoint selected))
                  (let ((index (provider-connection-recovery-route-index recovery)))
@@ -1073,7 +1091,7 @@ original condition or weakening the streaming safety limit."
                  (provider--connection-status recovery :attempting)
                  (call-with-credential-refresh
                   (lambda (force-refresh)
-                   (provider--check-connection-owner recovery)
+                   (provider--connection-remaining recovery)
                    (provider--call-with-transport-normalization
                     (lambda ()
                       (funcall attempt-function force-refresh event-callback))))
@@ -1098,6 +1116,7 @@ original condition or weakening the streaming safety limit."
                     (call-with-streaming-retries
                      #'attempt-with-authentication #'observe
                      :maximum-retries maximum-retries
+                     :sleep-function  (lambda (seconds) (provider--connection-wait recovery seconds))
                      :call-with-attempt
                      (lambda (attempt)
                        (provider--call-with-connection-recovery recovery attempt)))))))

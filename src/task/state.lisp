@@ -159,6 +159,9 @@
    (provider-connections
     :initform nil :accessor task-progress-provider-connections :type list
     :documentation "Active safe recovery statuses, keyed by exact episode within this job.")
+   (provider-wait-note-at
+    :initform nil :accessor task-progress-provider-wait-note-at :type (option integer)
+    :documentation "Last monotonic wait-note reservation across all this job's requests.")
    (current-tool
     :initform      nil
     :accessor      task-progress-current-tool

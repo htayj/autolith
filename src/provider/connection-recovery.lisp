@@ -5,6 +5,9 @@
 (defparameter *provider-opening-timeout-seconds* 30
   "Independent bound for opening one provider response, in seconds.")
 
+(defparameter *provider-recovery-window-seconds* 120
+  "Maximum automatic pre-generation retry lifetime per logical provider request.")
+
 (defvar *provider-connection-episode* nil
   "The current dynamically owned provider episode, or NIL outside dispatch.")
 
@@ -112,6 +115,11 @@ including when PUBLISH enqueued it before signalling or being interrupted."
   ()
   (:documentation "The request owner ended; this condition is never instability."))
 
+(define-condition provider-recovery-expired (provider-error)
+  ((attempt :initarg :attempt :reader provider-recovery-expired-attempt
+            :documentation "Number of attempts in this logical request."))
+  (:documentation "The pre-generation recovery window elapsed; never automatically retry."))
+
 (-> provider--caller-deadline () (or null real))
 (defun provider--caller-deadline ()
   "Capture the enclosing SBCL deadline before a transport adapter can normalize it."
@@ -172,7 +180,7 @@ including when PUBLISH enqueued it before signalling or being interrupted."
             (getf details :attempt) (getf details :phase)
             (when retry-at
               (multiple-value-bind (seconds minutes hours) (decode-universal-time retry-at)
-                (format nil "in ~Ds at ~2,'0D:~2,'0D:~2,'0D"
+                (format nil "in ~,2Fs at ~2,'0D:~2,'0D:~2,'0D"
                         (getf details :delay) hours minutes seconds))))))
 
 (defstruct (provider-connection-recovery
@@ -190,6 +198,7 @@ including when PUBLISH enqueued it before signalling or being interrupted."
   (route-threshold 3 :type (integer 1))
   (route-failures 0 :type integer)
   (deadline (provider--caller-deadline))
+  (recovery-deadline nil :type (or null real))
   (owner *provider-connection-owner*)
   (owner-generation (provider--connection-owner-generation *provider-connection-owner*))
   (owner-check *provider-connection-owner-check*)
@@ -223,6 +232,27 @@ including when PUBLISH enqueued it before signalling or being interrupted."
            remaining)
           (t
            absolute-remaining))))
+
+(-> provider--connection-remaining (provider-connection-recovery &optional real) (or null real))
+(defun provider--connection-remaining (state &optional (tolerance 0))
+  "Check caller ownership first, then the original pre-generation window.
+TOLERANCE covers SBCL's one-clock-unit early deadline notification only."
+  (let* ((owner     (provider--check-connection-owner state))
+         (deadline  (and (not (provider-connection-recovery-generation-started-p state))
+                         (provider-connection-recovery-recovery-deadline state)))
+         (remaining (and deadline
+                         (- deadline (/ (get-internal-real-time)
+                                        internal-time-units-per-second)))))
+    (when (and remaining (<= remaining tolerance))
+      (error 'provider-recovery-expired
+             :attempt (provider-connection-recovery-attempt state)
+             :message "The provider pre-generation recovery window elapsed."))
+    (cond ((and owner remaining)
+           (min owner remaining))
+          (owner
+           owner)
+          (t
+           remaining))))
 
 (-> provider--end-connection-episode (provider-connection-recovery) null)
 (defun provider--end-connection-episode (state)
@@ -271,21 +301,21 @@ including when PUBLISH enqueued it before signalling or being interrupted."
 
 (-> provider--connection-wait (provider-connection-recovery real) null)
 (defun provider--connection-wait (state seconds)
-  "Wait on request-owned synchronization, respecting caller expiry and cancellation."
-  (let* ((remaining (provider--check-connection-owner state))
+  "Wait on request-owned synchronization, respecting recovery and caller expiry and cancellation."
+  (let* ((remaining (provider--connection-remaining state))
          (duration  (if remaining (min remaining seconds) seconds))
          (until     (+ (get-internal-real-time) (* duration internal-time-units-per-second))))
     ;; Preserve the existing injected test clock hook. Production uses its own waiter.
     (if (not (eq *bounded-retry-sleep-function* #'sleep))
         (funcall *bounded-retry-sleep-function* duration)
         (loop
-          (provider--check-connection-owner state)
+          (provider--connection-remaining state)
           (let ((left (/ (- until (get-internal-real-time)) internal-time-units-per-second)))
             (unless (plusp left) (return))
             (with-lock-held ((provider-connection-recovery-lock state))
               (unless (provider-connection-recovery-ended-p state)
                 (provider--wait-on-connection-condition state left))))))
-    (provider--check-connection-owner state))
+    (provider--connection-remaining state))
   nil)
 
 (-> provider--raw-opening-category (condition) (or null keyword))
@@ -311,11 +341,11 @@ including when PUBLISH enqueued it before signalling or being interrupted."
     (t
      nil)))
 
-(-> provider--call-opening (function) *)
-(defun provider--call-opening (function)
-  "Bound and classify the actual opening operation before transport normalization."
+(-> provider--call-opening (function &optional real) *)
+(defun provider--call-opening (function &optional (timeout *provider-opening-timeout-seconds*))
+  "Bound and classify transport opening, or a complete native operation with TIMEOUT."
   (when *provider-connection-episode*
-    (provider--check-connection-owner *provider-connection-episode*))
+    (provider--connection-remaining *provider-connection-episode*))
   (handler-bind
       ((sb-sys:deadline-timeout
          (lambda (condition)
@@ -325,6 +355,9 @@ including when PUBLISH enqueued it before signalling or being interrupted."
                ;; SBCL can signal one internal clock unit before the decoded stop.
                (when (and remaining (<= remaining (/ 1 internal-time-units-per-second)))
                  (error 'provider-owner-ended :message "The provider caller deadline elapsed."))))
+           (when *provider-connection-episode*
+              (provider--connection-remaining *provider-connection-episode*
+                                              (/ 1 internal-time-units-per-second)))
            (error 'provider-opening-instability :category ':opening-timeout
                   :message                                "The provider opening reached its independent timeout.")))
        (error
@@ -338,12 +371,18 @@ including when PUBLISH enqueued it before signalling or being interrupted."
                                       sb-bsd-sockets:name-service-error))
                 (error 'provider-opening-rejected
                        :message "The provider address or connection configuration could not be resolved.")))))))
-    (provider-call-with-response-deadline *provider-opening-timeout-seconds* function)))
+    (let ((remaining (and *provider-connection-episode*
+                          (provider--connection-remaining *provider-connection-episode*))))
+      (provider-call-with-response-deadline
+       (if remaining (min remaining timeout) timeout)
+       function))))
 
 (-> provider--connection-instability-p (condition) t)
 (defun provider--connection-instability-p (condition)
   "Separate transport/service instability from semantic and credential retries."
   (and (typep condition 'provider-retryable-error)
+       (not (and (typep condition 'provider-opening-instability)
+                 (eq (provider-opening-instability-category condition) ':opening-timeout)))
        (or (and (typep condition 'provider-transport-error)
                 (not (typep condition 'response-stream-limit-error)))
            (let ((status (provider-error-status condition)))
@@ -357,7 +396,7 @@ including when PUBLISH enqueued it before signalling or being interrupted."
   (let ((base (min 300 (* 5 (ash 1 (min 6 (max 0 index)))))))
     (min 300 (max 1 (round (* base (+ 0.8d0 (random 0.4d0 random-state))))))))
 
-(-> provider--connection-status (provider-connection-recovery keyword &key (:delay (or null integer))) null)
+(-> provider--connection-status (provider-connection-recovery keyword &key (:delay (or null real))) null)
 (defun provider--connection-status (state phase &key delay)
   "Publish detached safe state through the request's ordinary observer, outside all locks."
   (let ((callback (provider-connection-recovery-event-callback state)))
@@ -373,7 +412,7 @@ including when PUBLISH enqueued it before signalling or being interrupted."
                                                                     (provider-connection-recovery-route-index state))
                                                                 (provider-connection-recovery-route-index state))
                                              :delay         delay
-                                             :next-retry-at (and delay (+ (get-universal-time) delay)))))))
+                                             :next-retry-at (and delay (+ (get-universal-time) (ceiling delay))))))))
   nil)
 
 (-> provider--call-with-connection-status (provider-connection-recovery function) *)
@@ -399,13 +438,17 @@ including when PUBLISH enqueued it before signalling or being interrupted."
   "Repeat the SAME imported streaming attempt wrapper for eligible opening failures.
 Its cumulative generation safety checks therefore apply to every attempt. Once
 model generation is observed, return failures to the existing bounded ladder."
+  (unless (provider-connection-recovery-recovery-deadline state)
+    (setf (provider-connection-recovery-recovery-deadline state)
+          (+ (/ (get-internal-real-time) internal-time-units-per-second)
+             *provider-recovery-window-seconds*)))
   (loop
-    (provider--check-connection-owner state)
+    (provider--connection-remaining state)
     (incf (provider-connection-recovery-attempt state))
     (handler-case
         (return (funcall attempt-function))
       (provider-retryable-error (condition)
-        (provider--check-connection-owner state)
+        (provider--connection-remaining state)
         (unless (and (provider--connection-instability-p condition)
                      (not (provider-connection-recovery-generation-started-p state))
                      (not (cl-llm-provider-api::provider-retryable-error-generation-started-p condition)))
@@ -417,8 +460,10 @@ model generation is observed, return failures to the existing bounded ladder."
                 (provider-connection-recovery-route-index state)
                 (mod (1+ (provider-connection-recovery-route-index state))
                      (provider-connection-recovery-route-count state))))
-        (let ((delay (provider--connection-retry-delay
-                      (provider-connection-recovery-backoff-index state))))
+        (let* ((remaining (provider--connection-remaining state))
+               (proposed  (provider--connection-retry-delay
+                           (provider-connection-recovery-backoff-index state)))
+               (delay     (if remaining (min proposed remaining) proposed)))
           (setf (provider-connection-recovery-backoff-index state)
                 (min 6 (1+ (provider-connection-recovery-backoff-index state))))
           (provider--connection-status state :waiting :delay delay)
@@ -443,21 +488,22 @@ model generation is observed, return failures to the existing bounded ladder."
              (plusp (provider-connection-recovery-attempt state))
              (not (provider-connection-recovery-generation-started-p state)))
     (let ((snapshot
-            (list :conversation  conversation
-                  :owner         (provider-connection-recovery-owner state)
-                  :epoch         (provider-connection-recovery-owner-generation state)
-                  :deadline      (let ((earlier (provider-connection-recovery-deadline state)))
-                                   (cond ((and earlier deadline)
-                                          (min earlier deadline))
-                                         (earlier
-                                          earlier)
-                                         (t
-                                          deadline)))
-                  :configuration (provider--suspension-configuration configuration)
-                  :attempt       (provider-connection-recovery-attempt state)
-                  :backoff       (provider-connection-recovery-backoff-index state)
-                  :route         (provider-connection-recovery-route-index state)
-                  :failures      (provider-connection-recovery-route-failures state))))
+            (list :conversation      conversation
+                  :owner             (provider-connection-recovery-owner state)
+                  :epoch             (provider-connection-recovery-owner-generation state)
+                  :deadline          (let ((earlier (provider-connection-recovery-deadline state)))
+                                      (cond ((and earlier deadline)
+                                             (min earlier deadline))
+                                            (earlier
+                                             earlier)
+                                            (t
+                                             deadline)))
+                  :recovery-deadline (provider-connection-recovery-recovery-deadline state)
+                  :configuration     (provider--suspension-configuration configuration)
+                  :attempt           (provider-connection-recovery-attempt state)
+                  :backoff           (provider-connection-recovery-backoff-index state)
+                  :route             (provider-connection-recovery-route-index state)
+                  :failures          (provider-connection-recovery-route-failures state))))
       (with-lock-held (*provider-connection-episodes-lock*)
           (when (and (= (getf snapshot :epoch)
                         (gethash (getf snapshot :owner) *provider-connection-owner-generations* 0))
@@ -487,6 +533,9 @@ model generation is observed, return failures to the existing bounded ladder."
              (= (provider-operation-epoch operation) (getf pending :epoch)
                 (gethash (getf pending :owner) *provider-connection-owner-generations* 0))
              (equal declaration (getf pending :configuration))
+             (or (null (getf pending :recovery-deadline))
+                 (> (getf pending :recovery-deadline)
+                    (/ (get-internal-real-time) internal-time-units-per-second)))
              (or (null (getf pending :deadline))
                  (> (getf pending :deadline) (/ (get-internal-real-time) internal-time-units-per-second)))
              t)))))
@@ -534,11 +583,12 @@ model generation is observed, return failures to the existing bounded ladder."
             (setf (provider-connection-recovery-deadline state)
                   (if (provider-connection-recovery-deadline state)
                       (min deadline (provider-connection-recovery-deadline state)) deadline))))
-        (setf (provider-connection-recovery-attempt state) (getf snapshot :attempt)
+        (setf (provider-connection-recovery-recovery-deadline state) (getf snapshot :recovery-deadline)
+              (provider-connection-recovery-attempt state) (getf snapshot :attempt)
               (provider-connection-recovery-backoff-index state) (getf snapshot :backoff)
               (provider-connection-recovery-route-index state) (getf snapshot :route)
               (provider-connection-recovery-route-failures state) (getf snapshot :failures))
-        (provider--check-connection-owner state))))
+        (provider--connection-remaining state))))
   nil)
 
 (-> provider-call-with-suspension
@@ -558,7 +608,8 @@ model generation is observed, return failures to the existing bounded ladder."
                    operation)))))
     (handler-case (funcall function)
       (error (condition)
-        (when (and (funcall suspended-p condition) (second *provider-connection-capture*))
+        (when (and (not (typep condition 'provider-recovery-expired))
+                   (funcall suspended-p condition) (second *provider-connection-capture*))
           (provider--remember-suspension
            conversation (second *provider-connection-capture*) (third *provider-connection-capture*)
            :deadline deadline))
