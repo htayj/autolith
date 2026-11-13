@@ -2625,35 +2625,76 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                           (lambda (agent) (declare (ignore agent))
                             (prog1 pending (setf pending nil)))))
               (lambda () (prepared-scripted--run-observed agent "hello"))))
-           (test-assert
-            (= (length
-                (first
-                 (native-scripted-provider-native-input-snapshots provider)))
-               3)
-            "native compaction receives the full durable projection")
-           (test-assert
-            (= (first (reverse (scripted-provider-input-counts provider))) 1)
-            "portable summarization starts from the native checkpoint only")
-           (test-assert
-            (find :native-compaction
-                  (rest (conversation--read-records
-                         (conversation-pathname conversation)))
-                  :key #'first)
-            "native compaction persists its opaque checkpoint")
-           (test-assert
-            (native-compaction-item-p
-             (first (conversation-input-items conversation)))
-            "the active provider reuses the opaque checkpoint")
-           (test-assert
-             (= (length (conversation-input-items-for-family conversation ':codex)) 2)
-             "the active provider receives the opaque checkpoint and new answer")
-           (test-assert
-             (= (length (conversation-input-items-for-family conversation ':grok)) 2)
-             "another provider receives the portable handoff and new answer")
-           (test-assert
-            (equal (agent-tests--request-numbers conversation)
-                   '((1 nil) (1 :native) (2 :summary) (3 nil)))
-            "both compaction requests are metered ahead of the user request"))
+           (let* ((native-input
+                    (first (native-scripted-provider-native-input-snapshots provider)))
+                  (retained    (list (user-message-item "earlier context" nil)
+                                     (user-message-item "hello" nil)))
+                  (checkpoint  (json-object "type" "compaction"
+                                            "encrypted_content" "native-checkpoint"))
+                  (window      (append retained (list checkpoint)))
+                  (snapshots   (reverse (scripted-provider-input-snapshots provider)))
+                  (requests    (reverse (context-measured-test-requests provider)))
+                  (ordinary    (coerce (json-get (second requests) "input") 'list))
+                  (codex-input (conversation-input-items-for-family conversation ':codex))
+                  (grok-input  (conversation-input-items-for-family conversation ':grok))
+                  (handoff     (conversation-summary-item
+                                (json-get (aref (json-get summary-item "content") 0) "text"))))
+             (test-assert
+              (and (= 5 (length native-input))
+                   (string= "message" (json-get (first native-input) "type"))
+                   (string= "developer" (json-get (first native-input) "role"))
+                   (plusp (length (json-get (first native-input) "content")))
+                   (equalp (subseq native-input 1 4)
+                           (list (first retained) earlier-item (second retained)))
+                   (equalp (first (last native-input))
+                           (json-object "type" "compaction_trigger")))
+              "native compaction wraps the exact durable projection, without request-local context")
+             (test-assert
+              (equalp (first snapshots) window)
+              "portable summarization receives the retained users and exact native checkpoint only")
+             (test-assert
+              (find :native-compaction
+                    (rest (conversation--read-records
+                           (conversation-pathname conversation)))
+                    :key #'first)
+              "native compaction persists its opaque checkpoint")
+             (test-assert
+              (and (= 1 (count-if #'native-compaction-item-p
+                                  (conversation-input-items conversation)))
+                   (equalp (find-if #'native-compaction-item-p
+                                    (conversation-input-items conversation))
+                           checkpoint))
+              "the active provider reuses the unique exact opaque checkpoint")
+             (test-assert
+              (equalp codex-input (append window (list answer-item)))
+              "the active provider receives retained users, checkpoint and new answer without portable handoff")
+             (test-assert
+              (equalp grok-input (append retained (list handoff answer-item)))
+              "another provider receives retained users, exact portable handoff and new answer")
+             (test-assert
+              (and (notany #'native-compaction-item-p grok-input)
+                   (not (search "encrypted_content" (json-encode grok-input))))
+              "the other-family projection contains no private native artifact or encrypted content")
+             (test-assert
+              (and (= 2 (length requests))
+                   (equal (reverse (scripted-provider-compaction-flags provider)) '(t nil))
+                   (= 1 (length (native-scripted-provider-native-input-snapshots provider)))
+                   (null (scripted-provider-results provider)))
+              "one native stream, one summary and one ordinary stream consume the scripted responses")
+             (test-assert
+              (and (= 4 (length ordinary))
+                   (equalp (subseq ordinary 0 3) window)
+                   (string= "developer" (json-get (fourth ordinary) "role"))
+                   (search "Retain the current continuation."
+                           (json-encode (fourth ordinary))))
+              "the admitted ordinary wire request reuses the exact checkpoint before producing the answer")
+             (test-assert
+              (equalp (second snapshots) window)
+              "ordinary durable history excludes the fresh request-local contribution")
+             (test-assert
+              (equal (agent-tests--request-numbers conversation)
+                     '((1 nil) (1 :native) (2 :summary) (3 nil)))
+              "both compaction requests are metered ahead of the user request")))
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
   nil)
 

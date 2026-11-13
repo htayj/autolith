@@ -619,6 +619,14 @@
 
 ;;;; -- Unsupported Native Dispatch Accounting --
 
+(-> recovery-test--native-stream (&key (:input integer) (:output integer)) stream)
+(defun recovery-test--native-stream (&key (input 1) (output 1))
+  "Return a fresh completed native V2 response through the real SSE decoder."
+  (make-string-input-stream
+   (native-compaction-tests--source
+    (list (json-object "type" "compaction" "encrypted_content" "synthetic"))
+    :usage (json-object "input_tokens" input "output_tokens" output))))
+
 (defclass unsupported-native-test-provider (scripted-provider codex-subscription-provider)
   ((status :initarg :status :reader unsupported-native-test-status
            :documentation "Synthetic native HTTP status or transport failure.")
@@ -648,6 +656,14 @@
    (make-instance 'codex-subscription-provider :configuration (provider-configuration provider))
    conversation tool-namespaces :goal-context goal-context :compaction-p compaction-p))
 
+(defmethod provider-request-object
+    ((provider unsupported-native-test-provider) (request cl-llm-provider-api:wire-request)
+     (tool-namespaces vector) &key goal-context compaction-p)
+  "Encode native wire requests with the real Codex encoder."
+  (provider-request-object
+   (make-instance 'codex-subscription-provider :configuration (provider-configuration provider))
+   request tool-namespaces :goal-context goal-context :compaction-p compaction-p))
+
 (defmethod provider-open-native-compaction
     ((provider unsupported-native-test-provider) (request hash-table) &key credentials conversation)
   "Refuse only at the final native dispatch boundary, without network traffic."
@@ -664,12 +680,9 @@
      (error 'provider-transport-error :message "Inert native transport failure."
             :status nil :code nil :request-id nil :response-id nil :response nil))
     (200
-     (values (json-encode
-              (json-object "output" (json-array (json-object "type" "compaction" "encrypted_content" "fixture"))
-                           "usage" (json-object "input_tokens" 2 "output_tokens" 3)))
-             200 nil))
+     (values (recovery-test--native-stream :input 2 :output 3) 200 nil))
     (t
-     (values "Not found" (unsupported-native-test-status provider) nil))))
+     (values (make-string-input-stream "Not found") (unsupported-native-test-status provider) nil))))
 
 (defmethod provider-attempt-native-compaction :around
     ((provider unsupported-native-test-provider) (conversation conversation)
@@ -1265,6 +1278,7 @@
     (application &key status signaled-p function failure (expected-posts 1))
   "Invoke FUNCTION with a true Dexador condition or its returned-status control at POST."
   (let ((calls         0)
+        (delivered     0)
         (configuration (application-configuration application)))
     (test-call-with-function-replacements
      (list (list 'credential-manager-credentials
@@ -1273,16 +1287,19 @@
                    (provider-tests--credentials configuration)))
            (list 'dexador:post
                  (lambda (endpoint &rest arguments)
-                   (declare (ignore arguments))
+                   (test-assert (getf arguments :want-stream) "Native V2 requests a readable SSE body.")
                    (incf calls)
-                   (test-assert (search "/responses/compact" endpoint) "The actual native POST boundary is reached.")
+                   (test-assert (equal endpoint (config :provider-endpoint configuration))
+                                "Native V2 uses the configured Responses endpoint.")
+                   (incf delivered)
                    (when failure (error failure))
                    (if signaled-p
                        (error 'http-request-failed :status status :body "Native endpoint unavailable."
                                                   :headers nil :uri endpoint :method ':post)
-                       (values "Native endpoint unavailable." status nil)))))
+                       (values (make-string-input-stream "Native endpoint unavailable.") status nil)))))
      function)
     (test-assert (= expected-posts calls) "Only admitted native requests reach the actual POST boundary.")
+    (test-assert (= expected-posts delivered) "The intended synthetic HTTP or transport outcome was delivered.")
     (format t "~&NATIVE-HTTP status=~D signaled=~S POST=~D~%" status signaled-p calls))
   nil)
 
@@ -1294,15 +1311,16 @@
       (expanded-native-test--fixture
        (lambda (application provider)
          (let ((*provider-maximum-transient-retries* 0)
-               (failure                              nil))
+               (failure                              nil)
+               (transport-failure                    (when (zerop status)
+                                                       (make-condition 'end-of-file :stream (make-string-input-stream "")))))
            (test-call-with-function-replacements
             (list (list 'credential-manager-refreshable-p
                         (lambda (manager) (declare (ignore manager)) nil)))
             (lambda ()
               (expanded-native-test--transport
                application :status status :signaled-p t
-               :failure (when (zerop status)
-                          (make-condition 'end-of-file :stream (make-string-input-stream "")))
+               :failure transport-failure
                :function
                (lambda ()
                  (handler-case (application-compact application)
@@ -1310,17 +1328,22 @@
            (format t "~&NATIVE-NEGATIVE status=~D owned=~S failure=~S~%" status owned-p (type-of failure))
            (test-assert failure "An unrelated native failure must propagate to its existing owner.")
            (let ((cause (if (typep failure 'mission-error) (mission-error-cause failure) failure)))
-             (if (zerop status)
-                 (test-assert (typep cause 'end-of-file) "Raw native EOF retains its terminal cause.")
-                 (progn
-                   (format t "~&NATIVE-TERMINAL-CAUSE status=~D owned=~S type=~S~%" status owned-p (type-of cause))
-                   (test-assert (typep cause (if (= status 401)
-                                                '(or provider-unauthorized provider--authentication-failure)
-                                                'provider-error))
-                                "The normalized terminal condition is preserved.")
-                   (test-assert (= status (provider-error-status cause)) "The normalized HTTP status is preserved.")
-                   (test-assert (not (typep cause 'provider-retryable-error))
-                                "Plain semantic HTTP rejection is not persistent instability."))))
+             (format t "~&NATIVE-NEGATIVE-CAUSE status=~D owned=~S cause=~S~%" status owned-p (type-of cause))
+             (cond
+               ((zerop status)
+                (test-assert (eq cause transport-failure)
+                             "The exact injected opening EOF survives owner wrapping."))
+               ((= status 401)
+                (let ((expected (if owned-p 'provider-unauthorized 'provider--authentication-failure)))
+                  (test-assert (typep cause expected) "HTTP 401 retains its owner-specific authentication type.")
+                  (when (typep cause expected)
+                    (test-assert (= status (provider-error-status cause)) "The authentication status survives owner wrapping."))))
+               (t
+                (test-assert (typep cause 'provider-error) "Semantic HTTP rejection retains its provider condition.")
+                (when (typep cause 'provider-error)
+                  (test-assert (= status (provider-error-status cause)) "The intended HTTP status survives owner wrapping."))
+                (test-assert (not (typep cause 'provider-retryable-error))
+                             "Plain semantic HTTP rejection is not persistent instability."))))
            (test-assert (not (typep failure 'provider-context-budget-error))
                         "An unrelated native failure is not a local context refusal.")
            (test-assert (null (expanded-native-input-snapshots provider))
@@ -1905,12 +1928,9 @@
                     (lambda (endpoint &rest arguments)
                       (declare (ignore arguments))
                       (incf posts)
-                      (test-assert (search "/responses/compact" endpoint) "Native success uses the real native POST.")
-                      (values (json-encode
-                               (json-object "id" "native-fixture" "output"
-                                            (json-array (json-object "type" "compaction" "encrypted_content" "synthetic"))
-                                            "usage" (json-object "input_tokens" 1 "output_tokens" 1)))
-                              200 nil))))
+                     (test-assert (equal endpoint (config :provider-endpoint configuration))
+                                  "Native V2 uses the configured Responses endpoint.")
+                     (values (recovery-test--native-stream) 200 nil))))
         (lambda ()
           (let ((window (provider-native-compact-conversation provider conversation
                                                              :tool-namespaces #() :event-callback #'identity)))
@@ -1972,7 +1992,8 @@
            (list 'dexador:post
                  (lambda (endpoint &rest arguments)
                    (declare (ignore arguments))
-                   (test-assert (search "/responses/compact" endpoint) "The actual native POST is used.")
+                   (test-assert (equal endpoint (config :provider-endpoint configuration))
+                                "Native V2 uses the configured Responses endpoint.")
                    (incf posts)
                    (push (list :native-post status signaled-p) events)
                    (cond
@@ -1980,14 +2001,9 @@
                       (error 'http-request-failed :status status :body "Native endpoint unavailable."
                                                  :headers nil :uri endpoint :method ':post))
                      ((= status 200)
-                      (values (json-encode
-                               (json-object "id" "native-control" "output"
-                                            (json-array (json-object "type" "compaction"
-                                                                     "encrypted_content" "synthetic"))
-                                            "usage" (json-object "input_tokens" 1 "output_tokens" 1)))
-                              200 nil))
+                      (values (recovery-test--native-stream) 200 nil))
                      (t
-                      (values "Native endpoint unavailable." status nil)))))
+                      (values (make-string-input-stream "Native endpoint unavailable.") status nil)))))
            (list 'agent--note-compaction-request
                  (lambda (agent observer &rest arguments)
                    (multiple-value-prog1 (apply note-original agent observer arguments)
@@ -2281,18 +2297,17 @@
                       (lambda (endpoint &rest arguments)
                         (declare (ignore arguments))
                         (incf posts)
-                        (test-assert (search "/responses/compact" endpoint) "A real admitted native POST reaches only inert I/O.")
+                        (test-assert (equal endpoint (config :provider-endpoint configuration))
+                                     "Native V2 uses the configured Responses endpoint.")
                         (push (list :native-post status signaled-p) events)
                         (cond
                           (signaled-p
                                (error 'http-request-failed :status status :body "Native endpoint unavailable."
                                                           :headers nil :uri endpoint :method ':post))
                           ((= status 200)
-                           (values (json-encode (json-object "id" "native-control" "output"
-                                                            (json-array (json-object "type" "compaction" "encrypted_content" "synthetic"))
-                                                            "usage" (json-object "input_tokens" 1 "output_tokens" 1))) 200 nil))
+                           (values (recovery-test--native-stream) 200 nil))
                           (t
-                           (values "Native endpoint unavailable." status nil)))))
+                           (values (make-string-input-stream "Native endpoint unavailable.") status nil)))))
                 (list 'application--run-turn
                       (lambda (&rest arguments)
                         (let ((results (multiple-value-list (apply application-turn-original arguments))))
@@ -2765,7 +2780,7 @@
                                   (if signaled-p
                                       (error 'http-request-failed :status reply-status :body reply-body
                                                                  :headers reply-headers :uri endpoint :method ':post)
-                                      (values reply-body reply-status reply-headers))))))
+                                      (values (make-string-input-stream reply-body) reply-status reply-headers))))))
                   (lambda ()
                     (handler-case
                         (handler-bind ((serious-condition
@@ -2830,7 +2845,7 @@
                       (lambda (&rest arguments)
                         (declare (ignore arguments))
                         (incf posts)
-                        (values "Transient pressure." (nth (mod (1- posts) 3) '(429 500 503)) nil))))
+                        (values (make-string-input-stream "Transient pressure.") (nth (mod (1- posts) 3) '(429 500 503)) nil))))
           (lambda ()
             (unwind-protect
                  (progn
@@ -2862,8 +2877,8 @@
                    (test-assert (and episode (provider-connection-recovery-ended-p episode)) "The exact episode ends.")
                    (test-assert (null *provider-connection-episodes*) "Terminal cleanup removes the owned episode.")
                    (test-assert (null (expanded-native-input-snapshots provider)) "Owner termination does not trigger portable fallback.")
-                   (format t "~&NATIVE-LIFETIME mode=~S POST=~D real-waits=~D type=~S joined=~S~%"
-                           mode posts waits (type-of failure) (not (sb-thread:thread-alive-p worker))))
+                   (format t "~&NATIVE-LIFETIME mode=~S POST=~D real-waits=~D type=~S joined=~S failure=~A~%"
+                           mode posts waits (type-of failure) (not (sb-thread:thread-alive-p worker)) failure))
               (when (and worker (sb-thread:thread-alive-p worker))
                 (provider-cancel-connection-owner owner)
                 (when episode (provider--end-connection-episode episode))
@@ -3055,7 +3070,7 @@
                           (lambda (endpoint &rest arguments)
                             (declare (ignore endpoint arguments))
                             (incf posts)
-                            (values body status nil))))
+                            (values (make-string-input-stream body) status nil))))
               (lambda ()
                 (handler-case
                     (handler-bind ((provider-context-budget-error (lambda (condition) (push condition refusals))))
@@ -3114,7 +3129,7 @@
                           (let ((status (if (= posts 1) 503 401)))
                             (if signaled-p
                                 (error 'http-request-failed :status status :body body :headers nil :uri endpoint)
-                                (values body status nil))))))
+                                (values (make-string-input-stream body) status nil))))))
             (lambda ()
               (handler-case
                   (provider-native-compact-conversation provider (application-conversation application)

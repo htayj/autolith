@@ -1791,21 +1791,26 @@ the durable cutoff before native or portable requests and retain arrivals at
 publication. Return issued request count and optional next-request details."
   (agent--check-request-budget agent request-number)
   (agent--prepare-provider-request agent)
-  (let* ((conversation                 (agent-conversation agent))
-         (compaction                   (conversation-compaction-capture conversation))
-         (captured-view                (conversation-compaction-view compaction))
-         (request-context              (mission-request-view-context conversation))
+  (let* ((conversation                  (agent-conversation agent))
+         (compaction                    (conversation-compaction-capture conversation))
+         (captured-view                 (conversation-compaction-view compaction))
+         (request-context               (mission-request-view-context conversation))
          (recovery
            (make-compaction-recovery
             (lambda (details)
               (conversation-append-provider-metadata
                conversation (list :compaction-recovery details))
               (agent-observer-status observer :compaction-recovery details))))
-         (unfinished-work              nil)
-         (*request-context-hurry-up-p* (agent-hurry-up-p agent))
-         (issued                       0)
-         (native-usage                 nil)
-         (native-request-accounted-p   nil))
+         (unfinished-work               nil)
+         (*request-context-hurry-up-p*  (agent-hurry-up-p agent))
+         (issued                        0)
+         (native-usage                  nil)
+         (native-response-id            nil)
+         (native-request-accounted-p    nil)
+         (*provider-native-automatic-p* next-request-status-details)
+         (*provider-native-phase*       (if next-request-status-details
+                                           (if (plusp next-request-tool-rounds) "mid_turn" "before_turn")
+                                           "standalone_turn")))
     ;; Announce compaction before reading job storage, which can take a while.
     (agent-observer-status
      observer
@@ -1839,13 +1844,17 @@ publication. Return issued request count and optional next-request details."
                              (if (typep event 'native-compaction-completed-event)
                                  (progn
                                    (setf native-request-accounted-p t
-                                         native-usage (native-compaction-completed-event-usage event))
+                                         native-usage (native-compaction-completed-event-usage event)
+                                         native-response-id (native-compaction-completed-event-response-id event))
                                    (incf issued)
                                    (agent--note-compaction-request
                                     agent observer :request-number (+ request-number issued)
                                     :kind ':native :usage native-usage
                                     :response-id                   (native-compaction-completed-event-response-id event)))
-                                 (agent-observer-status observer :provider-progress nil))))))))
+                                 (if (typep event 'native-compaction-recovery-event)
+                                     (agent-observer-status observer :native-compaction-recovery
+                                                            (native-compaction-recovery-event-condition event))
+                                     (agent-observer-status observer :provider-progress nil)))))))))
                     :preflight (lambda (candidate)
                                 (provider-check-request-context
                                  provider (provider-native-compaction-request-object provider candidate native-tools)))
@@ -1866,123 +1875,148 @@ publication. Return issued request count and optional next-request details."
                    captured-view family :include-ephemeral-p nil))
               family))
            (summary-results                   nil)
-           (summary                           nil))
-        ;; Native providers that cannot emit the completion event still return
-        ;; usage as their second value.  Account that fallback exactly once.
-        (when (and (not native-request-accounted-p) (or native-window native-usage))
-          (incf issued)
-          (agent--note-compaction-request
-           agent observer
-           :request-number (+ request-number issued)
-           :kind           ':native
-           :usage          native-usage))
-      (loop for attempt from 1 to *agent-compaction-maximum-summary-requests*
-            for result =
-                (let ((*telemetry-request-role* ':compaction))
-                  (multiple-value-bind (result candidate)
-                      (compaction-recovery-call
-                       recovery provider summary-conversation :dispatch
+           (summary                           nil)
+           (summary-attempts                  0))
+      (block compacted
+        (tagbody
+         portable-recovery
+          ;; Native providers that cannot emit the completion event still return
+          ;; usage as their second value.  Account that fallback exactly once.
+          (when (and (not native-request-accounted-p) (or native-window native-usage))
+            (setf native-request-accounted-p t)
+            (incf issued)
+            (agent--note-compaction-request
+             agent observer
+             :request-number (+ request-number issued)
+             :kind           ':native
+             :usage          native-usage))
+          (loop while (< summary-attempts *agent-compaction-maximum-summary-requests*)
+                for attempt = (incf summary-attempts)
+                for result =
+                    (let ((*telemetry-request-role* ':compaction))
+                      (multiple-value-bind (result candidate)
+                          (compaction-recovery-call
+                           recovery provider summary-conversation :dispatch
+                           (lambda (candidate)
+                             (agent--check-request-budget agent (+ request-number issued))
+                             (mission-call-with-request-view
+                              request-context candidate
+                              (lambda ()
+                                (provider-stream-turn
+                                 provider candidate :tool-namespaces #()
+                                 :event-callback
+                                 (lambda (event)
+                                   (declare (ignore event))
+                                   (agent-observer-status observer :provider-progress nil))
+                                 :compaction-p                       t))))
+                           :preflight (lambda (candidate)
+                                       (provider-check-request-context
+                                        provider (provider-request-object provider candidate #() :compaction-p t))))
+                        (setf summary-conversation candidate)
+                        result))
+                do (incf issued)
+                   (push result summary-results)
+                   ;; Every completed paid request is accounted for before its
+                   ;; response is interpreted or a later retry is attempted.
+                   (agent--note-compaction-request
+                    agent observer
+                    :request-number (+ request-number issued)
+                    :kind           ':summary
+                    :usage          (provider-result-usage result)
+                    :response-id    (provider-result-response-id result))
+                   (let ((problem (agent--compaction-summary-problem result)))
+                     ;; The last request publishes any text answer: a loosely
+                     ;; shaped handoff beats an agent that cannot continue.
+                     (when (or (null problem)
+                               (and (= attempt *agent-compaction-maximum-summary-requests*)
+                                    (agent--compaction-text-answer-p result)))
+                       (setf summary (provider-result-assistant-text result))
+                       (return))
+                     (unless (and (< attempt *agent-compaction-maximum-summary-requests*)
+                                  (agent--compaction-follow-up-p result))
+                       (error 'provider-protocol-error
+                              :message     (format nil "Compaction produced no usable summary handoff: ~A."
+                                                   problem)
+                              :status      nil
+                              :code        nil
+                              :request-id  nil
+                              :response-id (provider-result-response-id result)
+                              :response    nil))
+                     (agent--advance-compaction-summary-view
+                      summary-conversation result problem)))
+          (let* ((next-output-tokens
+                   (if next-request-status-details
+                       (let ((value
+                               (agent-observer-status
+                                observer :provider-request-started
+                                (list :request-number (+ request-number issued 1)
+                                      :tool-rounds    next-request-tool-rounds))))
+                         (and (integerp value) (plusp value) value))
+                       *provider-maximum-output-tokens*))
+                 (next-request-details
+                   (and next-request-status-details
+                        (list :announced-p           t
+                              :maximum-output-tokens next-output-tokens))))
+            (with-recursive-lock-held ((conversation-append-lock conversation))
+              (setf unfinished-work (task-unfinished-work-snapshot agent))
+              (if native-window
+                  (handler-case
+                      (conversation-append-native-compaction
+                       conversation native-window
+                       :family          (provider-family provider)
+                       :summary         summary
+                       :compaction      (compaction-recovery-publication recovery compaction)
+                       :recovery        (compaction-recovery-audit recovery :completed)
+                       :unfinished-work unfinished-work
+                       :validate-projection
                        (lambda (candidate)
-                         (agent--check-request-budget agent (+ request-number issued))
-                         (mission-call-with-request-view
-                          request-context candidate
-                          (lambda ()
-                            (provider-stream-turn
-                             provider candidate :tool-namespaces #()
-                             :event-callback
-                             (lambda (event)
-                               (declare (ignore event))
-                               (agent-observer-status observer :provider-progress nil))
-                             :compaction-p                       t))))
-                       :preflight (lambda (candidate)
-                                   (provider-check-request-context
-                                    provider (provider-request-object provider candidate #() :compaction-p t))))
-                    (setf summary-conversation candidate)
-                    result))
-            do (incf issued)
-               (push result summary-results)
-               ;; Every completed paid request is accounted for before its
-               ;; response is interpreted or a later retry is attempted.
-               (agent--note-compaction-request
-                agent observer
-                :request-number (+ request-number issued)
-                :kind           ':summary
-                :usage          (provider-result-usage result)
-                :response-id    (provider-result-response-id result))
-               (let ((problem (agent--compaction-summary-problem result)))
-                 ;; The last request publishes any text answer: a loosely
-                 ;; shaped handoff beats an agent that cannot continue.
-                 (when (or (null problem)
-                           (and (= attempt *agent-compaction-maximum-summary-requests*)
-                                (agent--compaction-text-answer-p result)))
-                   (setf summary (provider-result-assistant-text result))
-                   (return))
-                 (unless (and (< attempt *agent-compaction-maximum-summary-requests*)
-                              (agent--compaction-follow-up-p result))
-                   (error 'provider-protocol-error
-                          :message     (format nil "Compaction produced no usable summary handoff: ~A."
-                                               problem)
-                          :status      nil
-                          :code        nil
-                          :request-id  nil
-                          :response-id (provider-result-response-id result)
-                          :response    nil))
-                 (agent--advance-compaction-summary-view
-                  summary-conversation result problem)))
-      (let* ((next-output-tokens
-               (if next-request-status-details
-                   (let ((value
-                           (agent-observer-status
-                            observer :provider-request-started
-                            (list :request-number (+ request-number issued 1)
-                                  :tool-rounds    next-request-tool-rounds))))
-                     (and (integerp value) (plusp value) value))
-                   *provider-maximum-output-tokens*))
-             (next-request-details
-               (and next-request-status-details
-                    (list :announced-p           t
-                          :maximum-output-tokens next-output-tokens))))
-        (with-recursive-lock-held ((conversation-append-lock conversation))
-          (setf unfinished-work (task-unfinished-work-snapshot agent))
-          (if native-window
-              (conversation-append-native-compaction
-               conversation native-window
-               :family          (provider-family provider)
-               :summary         summary
-               :compaction      (compaction-recovery-publication recovery compaction)
-               :recovery        (compaction-recovery-audit recovery :completed)
-               :unfinished-work unfinished-work
-               :validate-projection
-               (lambda (candidate)
-                 (agent--validate-compaction-projection
-                  agent candidate
-                  :goal-context          goal-context
-                  :tools-p               tools-p
-                   :tool-rounds          next-request-tool-rounds
-                  :maximum-output-tokens next-output-tokens
-                  :tool-restriction-p    tool-restriction-p
-                  :tool-allowlist        tool-allowlist)))
-              (conversation-append-summary
-               conversation summary :compaction (compaction-recovery-publication recovery compaction)
-               :recovery                        (compaction-recovery-audit recovery :completed)
-               :unfinished-work                 unfinished-work
-               :validate-projection
-               (lambda (candidate)
-                 (agent--validate-compaction-projection
-                  agent candidate
-                  :goal-context          goal-context
-                  :tools-p               tools-p
-                   :tool-rounds          next-request-tool-rounds
-                  :maximum-output-tokens next-output-tokens
-                  :tool-restriction-p    tool-restriction-p
-                  :tool-allowlist        tool-allowlist)))))
-        (agent-observer-status
-         observer
-         :compaction-completed
-         (list :summary-characters (length summary)
-               :native-p           (not (null native-window))
-               :provider-requests  issued))
-        (values issued next-request-details)))))
+                         (agent--validate-compaction-projection
+                          agent candidate
+                          :goal-context          goal-context
+                          :tools-p               tools-p
+                          :tool-rounds           next-request-tool-rounds
+                          :maximum-output-tokens next-output-tokens
+                          :tool-restriction-p    tool-restriction-p
+                          :tool-allowlist        tool-allowlist)))
+                    (provider-context-budget-error (condition)
+                      ;; The atomic publisher has not appended a checkpoint.
+                    ;; A portable handoff shares, rather than renews, the summary budget.
+                     (when (>= summary-attempts *agent-compaction-maximum-summary-requests*)
+                       (error condition))
+                     (agent-observer-status observer :native-compaction-recovery
+                                            (make-condition 'provider-native-unusable :message (princ-to-string condition)
+                                                            :usage native-usage :response-id native-response-id))
+                     (let ((*provider-compaction-recovery-permit* (compaction-recovery-permit recovery)))
+                       (provider-handoff-unsupported-native-permit provider))
+                     (setf native-window nil
+                           compaction (conversation-compaction-portable-capture compaction)
+                           captured-view (conversation-compaction-view compaction)
+                           summary-conversation
+                           (conversation-compaction-summary-view
+                            captured-view (conversation-input-items-for-family captured-view family :include-ephemeral-p nil) family)
+                           summary nil)
+                     (go portable-recovery)))
+                  (conversation-append-summary
+                   conversation summary :compaction (compaction-recovery-publication recovery compaction)
+                   :recovery                        (compaction-recovery-audit recovery :completed)
+                   :unfinished-work                 unfinished-work
+                   :validate-projection
+                   (lambda (candidate)
+                     (agent--validate-compaction-projection
+                      agent candidate
+                      :goal-context          goal-context
+                      :tools-p               tools-p
+                      :tool-rounds           next-request-tool-rounds
+                      :maximum-output-tokens next-output-tokens
+                      :tool-restriction-p    tool-restriction-p
+                      :tool-allowlist        tool-allowlist)))))
+            (agent-observer-status
+             observer
+             :compaction-completed
+             (list :summary-characters (length summary)
+                   :native-p           (not (null native-window))
+                   :provider-requests  issued))
+            (return-from compacted (values issued next-request-details))))))))
 
 (-> agent--run-provider-loop
     (agent agent-observer &key (:goal-context (option string))

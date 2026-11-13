@@ -299,11 +299,16 @@ TOLERANCE covers SBCL's one-clock-unit early deadline notification only."
       (sb-thread:grab-mutex lock)))
   nil)
 
+(defparameter *provider-connection-wait-limit-function* nil
+  "Optional operation check returning a remaining wait budget, outside wait locks.")
+
 (-> provider--connection-wait (provider-connection-recovery real) null)
 (defun provider--connection-wait (state seconds)
   "Wait on request-owned synchronization, respecting recovery and caller expiry and cancellation."
   (let* ((remaining (provider--connection-remaining state))
-         (duration  (if remaining (min remaining seconds) seconds))
+         (operation (and *provider-connection-wait-limit-function*
+                         (funcall *provider-connection-wait-limit-function*)))
+         (duration  (min seconds (or remaining seconds) (or operation seconds)))
          (until     (+ (get-internal-real-time) (* duration internal-time-units-per-second))))
     ;; Preserve the existing injected test clock hook. Production uses its own waiter.
     (if (not (eq *bounded-retry-sleep-function* #'sleep))
@@ -315,7 +320,9 @@ TOLERANCE covers SBCL's one-clock-unit early deadline notification only."
             (with-lock-held ((provider-connection-recovery-lock state))
               (unless (provider-connection-recovery-ended-p state)
                 (provider--wait-on-connection-condition state left))))))
-    (provider--connection-remaining state))
+    (provider--connection-remaining state)
+    (when *provider-connection-wait-limit-function*
+      (funcall *provider-connection-wait-limit-function*)))
   nil)
 
 (-> provider--raw-opening-category (condition) (or null keyword))

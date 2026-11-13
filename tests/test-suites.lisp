@@ -164,7 +164,11 @@
 
 (define-test-suite native-compaction-window
   test-native-compaction-window-validation
-  test-native-compaction-window-replay)
+  test-native-compaction-window-replay
+  test-native-compaction-v2-retention
+  test-native-compaction-v2-fallback
+  test-native-compaction-v2-deadlines
+  test-native-compaction-v2-publication)
 
 (define-test-suite compaction-tail
   test-compaction-tail-bounds-recent-user-and-expands-groups

@@ -325,6 +325,7 @@
                 #:copilot-protocol-endpoint
                 #:copilot-stream-headers
                 #:copilot-vision-request-p
+                #:generation-progress-event
                 #:*provider-maximum-streaming-retries*
                 #:*provider-maximum-transient-retries*
                 #:*sse-inactivity-seconds*

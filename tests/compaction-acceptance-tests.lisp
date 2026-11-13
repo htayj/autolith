@@ -22,6 +22,15 @@
     (push (json-get request "tool_choice") (compaction-admission-test-encoded-choices provider))
     (values request delivery)))
 
+(defmethod provider-request-object
+    ((provider compaction-admission-test-provider) (request cl-llm-provider-api:wire-request)
+     (tool-namespaces vector) &key goal-context compaction-p)
+  "Encode detached native inputs without the scripted conversation-only method."
+  (declare (ignore goal-context compaction-p))
+  (provider-request-object
+   (make-instance 'codex-subscription-provider :configuration (provider-configuration provider))
+   request tool-namespaces))
+
 (defmethod provider-native-compact-conversation
     ((provider compaction-admission-test-provider) (conversation conversation)
      &key tool-namespaces event-callback)
@@ -597,7 +606,7 @@ the strict shape, and whether the only allowed request publishes it."
                       (test-assert (typep failure 'provider-context-budget-error) "a local refusal retains its type")
                       (test-assert (eq ':active (getf ledger :status)) "a local compaction refusal has known zero usage"))
                      ((eq mode :native-refuse)
-                      (test-assert (null failure) "exhausted native admission falls back to the admitted portable summary")
+                      (test-assert (null failure) (format nil "exhausted native admission recovers: ~A" failure))
                       (test-assert (eq ':active (getf ledger :status)) "known-zero native refusals do not invent token usage"))
                      (t
                       (test-assert (null failure) "owned compaction succeeds")
@@ -761,10 +770,18 @@ the strict shape, and whether the only allowed request publishes it."
   (test-assert (null *provider-input-measurement-context*) "native I/O cannot publish ordinary measurements")
   (push (coerce (json-get request "input") 'list)
         (native-scripted-provider-native-input-snapshots provider))
-  (values (json-encode (json-object "id" "prepared-native"
-                                   "output" (vector (pop (native-scripted-provider-native-items provider)))
-                                   "usage" (json-object "input_tokens" 1 "output_tokens" 1)))
-          200 nil))
+  (let ((item (pop (native-scripted-provider-native-items provider))))
+    (values (make-string-input-stream
+             (concatenate
+              'string
+              (test-sse-event-string
+               (json-object "type" "response.output_item.done" "item" item))
+              (test-sse-event-string
+               (json-object "type" "response.completed"
+                            "response" (json-object "id" "prepared-native" "status" "completed"
+                                                    "output" (vector item)
+                                                    "usage" (json-object "input_tokens" 1 "output_tokens" 1))))))
+            200 nil)))
 
 (-> prepared-scripted--with-credentials (function) t)
 (defun prepared-scripted--with-credentials (function)
