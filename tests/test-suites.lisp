@@ -1447,6 +1447,10 @@
   test-run-job-streaming-cli-blocked-exit)
 
 (define-test-suite task-scheduler
+  test-task-readable-character-measurement
+  test-task-readable-character-structure
+  test-task-summary-character-compaction
+  test-task-summary-allocation-exposure
   test-task-default-detachment
   test-task-running-cancellation
   test-task-runtime-deadline

@@ -504,7 +504,7 @@ CACHE, when supplied, belongs to one caller snapshot, including negative reads."
              (list :in-artifact :field field :characters (length value))
              (list :omitted :field field :characters (length value)))))
     (t
-     (let ((characters (length (task--write-readable-sexp value))))
+     (let ((characters (task--readable-sexp-characters value)))
        (if (<= characters preview-limit)
            value
            (if artifact-available-p

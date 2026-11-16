@@ -281,42 +281,122 @@
       (error 'task-error :tool-name "task.run"
              :message               (cl-llm-provider-api:provider-api-error-message condition)))))
 
-(-> task--character-strings (t) t)
-(defun task--character-strings (value)
-  "Copy string leaves in a bounded acyclic cons tree into fresh character strings.
-
-Fresh strings avoid implementation array syntax and shared-string reader labels.
-Repeated subtrees are copied independently; cyclic conses signal TASK-ERROR."
+(-> task--check-readable-tree (t) boolean)
+(defun task--check-readable-tree (value)
+  "Validate the bounded cons ancestry before printing any task result leaves."
   (let ((active (make-hash-table :test #'eq))
         (nodes  0))
     (labels ((reject ()
                "Reject data outside the portable task result's structural bounds."
                (error 'task-error :tool-name "task.run"
-                      :message               "Task result data is cyclic or exceeds its structural bounds."))
+                      :message "Task result data is cyclic or exceeds its structural bounds."))
 
              (walk (item depth)
-               "Copy ITEM while tracking only the active cons ancestry."
+               "Check ITEM while tracking only the active cons ancestry."
                (when (or (> depth 128) (> (incf nodes) 262144))
                  (reject))
-               (typecase item
-                 (string
-                  (make-array (length item) :element-type 'character :initial-contents item))
-                 (cons
-                  (let ((tails nil))
-                    (unwind-protect
-                         (loop for tail = item then (rest tail)
-                               while (consp tail)
-                               do (when (or (gethash tail active) (> (incf nodes) 262144))
-                                    (reject))
-                                  (setf (gethash tail active) t)
-                                  (push tail tails)
-                               collect (walk (first tail) (1+ depth)) into items
-                               finally (return (nconc items (walk tail depth))))
-                      (dolist (tail tails)
-                        (remhash tail active)))))
-                 (t
-                  item))))
-      (walk value 0))))
+               (when (consp item)
+                 (let ((tails nil))
+                   (unwind-protect
+                        (loop for tail = item then (rest tail)
+                              while (consp tail)
+                              do (when (or (gethash tail active) (> (incf nodes) 262144))
+                                   (reject))
+                                 (setf (gethash tail active) t)
+                                 (push tail tails)
+                                 (walk (first tail) (1+ depth))
+                              finally (walk tail depth))
+                     (dolist (tail tails)
+                       (remhash tail active)))))))
+      (walk value 0)))
+  t)
+
+(-> task--character-strings (t) t)
+(defun task--character-strings (value)
+  "Copy bounded acyclic cons data into fresh conses and CHARACTER string leaves.
+
+Fresh strings avoid implementation array syntax and shared-string reader labels.
+Repeated subtrees are copied independently; cyclic conses signal TASK-ERROR."
+  (task--check-readable-tree value)
+  (labels ((copy-item (item)
+             "Copy already validated ITEM without retaining shared conses or strings."
+             (typecase item
+               (string
+                (make-array (length item) :element-type 'character :initial-contents item))
+               (cons
+                (loop for tail = item then (rest tail)
+                      while (consp tail)
+                      collect (copy-item (first tail)) into items
+                      finally (return (nconc items (copy-item tail)))))
+               (t
+                item))))
+    (copy-item value)))
+
+(defclass task-sexp-character-count-stream
+    (trivial-gray-streams:fundamental-character-output-stream)
+  ((characters :initform 0 :accessor task-sexp-character-count-stream-characters
+               :documentation "Number of characters written without retaining output.")
+   (column :initform 0 :accessor task-sexp-character-count-stream-column
+           :documentation "Character position since the last newline."))
+  (:documentation "Non-retaining character sink for readable task result measurement."))
+
+(defmethod trivial-gray-streams:stream-write-char
+    ((stream task-sexp-character-count-stream) character)
+  "Count one emitted character and track its line position."
+  (incf (task-sexp-character-count-stream-characters stream))
+  (if (char= character #\Newline)
+      (setf (task-sexp-character-count-stream-column stream) 0)
+      (incf (task-sexp-character-count-stream-column stream)))
+  character)
+
+(defmethod trivial-gray-streams:stream-write-string
+    ((stream task-sexp-character-count-stream) string &optional (start 0) end)
+  "Count the requested range without copying or retaining STRING."
+  (loop for index from start below (or end (length string))
+        do (write-char (char string index) stream))
+  string)
+
+(defmethod trivial-gray-streams:stream-line-column
+    ((stream task-sexp-character-count-stream))
+  "Report line position for ordinary line-sensitive atom printers."
+  (task-sexp-character-count-stream-column stream))
+
+(-> task--readable-sexp-characters (t) integer)
+(defun task--readable-sexp-characters (value)
+  "Count the exact non-pretty readable form without copying direct string leaves.
+
+Validate all cons structure first. Other atoms use the actual readable printer,
+whose own internal allocation is outside this string/tree measurement contract."
+  (task--check-readable-tree value)
+  (with-standard-io-syntax
+    (let ((stream (make-instance 'task-sexp-character-count-stream)))
+      (labels ((count-item (item)
+                 "Count normalized strings and cons syntax, delegating other atoms."
+                 (typecase item
+                   (string
+                    (write-char #\" stream)
+                    (loop for character across item
+                          do (when (or (char= character #\")
+                                       (char= character #\\))
+                               (write-char #\\ stream))
+                             (write-char character stream))
+                    (write-char #\" stream))
+                   (cons
+                    (write-char #\( stream)
+                    (loop for tail = item then (rest tail)
+                          for first-p = t then nil
+                          while (consp tail)
+                          do (unless first-p (write-char #\Space stream))
+                             (count-item (first tail))
+                          finally (unless (null tail)
+                                    (write-string " . " stream)
+                                    (count-item tail)))
+                    (write-char #\) stream))
+                   (t
+                    (write item :stream stream :readably t :escape t
+                                :circle nil :pretty nil)))))
+        (count-item value))
+      (task-sexp-character-count-stream-characters stream))))
 
 (-> task--write-readable-sexp (t &key (:pretty-p boolean)) string)
 (defun task--write-readable-sexp (value &key pretty-p)

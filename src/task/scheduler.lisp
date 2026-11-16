@@ -64,13 +64,11 @@
                       :characters-field ':label-characters))
     (when (getf retained :structured-output-present-p)
       (let* ((value      (getf retained :structured-output))
-             (serialized (task--write-readable-sexp value)))
-        (when (> (length serialized)
-                 *task-retained-structured-output-limit*)
+             (characters (task--readable-sexp-characters value)))
+        (when (> characters *task-retained-structured-output-limit*)
           (setf (getf retained :structured-output) nil
                 (getf retained :structured-output-storage) storage
-                (getf retained :structured-output-characters)
-                (length serialized)))))
+                (getf retained :structured-output-characters) characters))))
     (setf (getf retained :usage)
           (task-progress--usage-summary (getf retained :usage)))
     retained))
@@ -108,7 +106,7 @@
 (-> task--compact-native-value (t integer) t)
 (defun task--compact-native-value (value limit)
   "Return native VALUE or a descriptor when its readable form exceeds LIMIT."
-  (let ((characters (length (task--write-readable-sexp value))))
+  (let ((characters (task--readable-sexp-characters value)))
     (if (<= characters limit)
         value
         (list :omitted :characters characters))))

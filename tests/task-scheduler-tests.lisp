@@ -2,6 +2,265 @@
 
 ;;;; -- Scheduler Boundary Tests --
 
+(defstruct task-tests-line-sensitive-printer
+  "Readable fixture using the stream's actual line-sensitive operations."
+  control)
+
+(defmethod print-object ((value task-tests-line-sensitive-printer) stream)
+  "Exercise fresh lines, character output and partial/empty string ranges."
+  (fresh-line stream)
+  (write-string "xx#S(yy" stream :start 2 :end 5)
+  (write-string "unused" stream :start 3 :end 3)
+  (write-char #\Space stream)
+  (terpri stream)
+  (fresh-line stream)
+  (let ((lines (format nil "xx~%yy")))
+    (write-string lines stream :start 2 :end 3))
+  (fresh-line stream)
+  (when (task-tests-line-sensitive-printer-control value)
+    (write-string "#|" stream)
+    (write-char (task-tests-line-sensitive-printer-control value) stream)
+    (fresh-line stream)
+    (write-string "|#" stream))
+  (let ((name "xxAUTOLITH::TASK-TESTS-LINE-SENSITIVE-PRINTERyy"))
+    (write-string name stream :start 2 :end (- (length name) 2)))
+  (write-string "" stream :start 0 :end 0)
+  (write-string " :CONTROL " stream)
+  (write (task-tests-line-sensitive-printer-control value) :stream stream :readably t)
+  (write-char #\) stream))
+
+(-> test-task-readable-character-measurement () null)
+(defun test-task-readable-character-measurement ()
+  "Compare exact character measurement with the actual readable serializer."
+  (let* ((shared (list "shared" :leaf))
+         (unicode (coerce (list (code-char #x3bb) (code-char #x1f642)) 'string))
+         (base (make-array 3 :element-type 'base-char :initial-contents "abc"))
+         (adjustable (make-array 6 :element-type 'character :adjustable t
+                                  :fill-pointer 3 :initial-contents "abcdef"))
+         (displaced (make-array 2 :element-type 'character
+                                 :displaced-to adjustable :displaced-index-offset 1)))
+    (dolist (value (list nil t 123 -456 2/3 1.25d0 :keyword 'cl:car
+                        '|symbol with spaces| #\Space #\Newline "" "quote\"slash\\"
+                        (string #\Newline) unicode base adjustable displaced
+                        (list shared shared) (cons shared :tail) '(quote x)
+                        '(function car) '(quote) '(quote x y)
+                        (make-array 2 :initial-contents '(1 2))))
+      (let* ((serialized (task--write-readable-sexp value))
+             (characters (task--readable-sexp-characters value)))
+        (test-assert (= characters (length serialized)) "Actual printer character parity")
+        (let ((*read-eval* nil)
+              (*package* (find-package :cl-user)))
+          (with-input-from-string (input serialized)
+            (test-assert (equalp value (read input)) "Portable readable round trip")
+            (test-assert (eq :eof (read input nil :eof)) "Exactly one readable form")))))
+    (test-assert (= 4 (task--readable-sexp-characters unicode))
+                 "Unicode is measured in characters")
+    (let ((value (list shared shared)))
+      (test-assert
+       (equalp value (let ((*read-eval* nil))
+                       (read-from-string (task--write-readable-sexp value :pretty-p t))))
+       "Durable pretty serialization accepts shared trees")))
+  (dolist (control (list nil #\Newline #\Tab #\Return #\Page #\Backspace))
+    (let ((atom (make-task-tests-line-sensitive-printer :control control)))
+      (dolist (value (list atom (list atom) (cons 1 atom)
+                          (list (format nil "a~%b\"\\") atom)
+                          (cons (string #\Newline) atom)))
+        (let ((characters (length (task--write-readable-sexp value))))
+          (test-assert (= characters (task--readable-sexp-characters value))
+                       "Line-sensitive actual printer parity")
+          (test-assert (eq value (task--compact-native-value value characters))
+                       "Line-sensitive exact limit preserves identity")
+          (test-assert
+           (equal (list :omitted :characters characters)
+                  (task--compact-native-value value (1- characters)))
+           "Line-sensitive one-over omission has the exact count")))))
+  (dolist (control (list #\Newline #\Tab #\Return #\Page #\Backspace))
+    (let ((sink (make-instance 'task-sexp-character-count-stream))
+          (original (make-string-output-stream)))
+      (dolist (stream (list original sink))
+        (write-string "ignored" stream :start 7 :end 7)
+        (write-char control stream)
+        (format stream "~10T")
+        (write-string (format nil "xx~%yy") stream :start 2 :end 3)
+        (fresh-line stream)
+        (write-string "xy" stream :start 0 :end 1))
+      (test-assert (= (length (get-output-stream-string original))
+                      (task-sexp-character-count-stream-characters sink))
+                   "Control characters and tabulation match the string stream")))
+  (let ((*read-eval* nil)
+        (*package* (find-package :cl-user)))
+    (dolist (control (list nil #\Newline #\Tab #\Return #\Page #\Backspace))
+      (with-input-from-string
+          (input (task--write-readable-sexp
+                  (make-task-tests-line-sensitive-printer :control control)))
+        (test-assert (equalp (make-task-tests-line-sensitive-printer :control control)
+                             (read input))
+                     "Line-sensitive fixture round-trips its control state")
+        (test-assert (eq :eof (read input nil :eof))
+                     "Line-sensitive fixture emits exactly one form"))))
+  nil)
+
+(defparameter *task-tests-readable-printer-calls* 0
+  "Number of test atom printer invocations for validation precedence checks.")
+
+(defclass task-tests-readable-printer-probe () ()
+  (:documentation "Unreadable atom used to observe structural validation precedence."))
+
+(defmethod print-object ((object task-tests-readable-printer-probe) stream)
+  "Record printer entry and reject this unreadable test atom."
+  (declare (ignore stream))
+  (incf *task-tests-readable-printer-calls*)
+  (error 'print-not-readable :object object))
+
+(-> task-tests--readable-error (function t) (option symbol))
+(defun task-tests--readable-error (function value)
+  "Return the error class from FUNCTION on VALUE, or NIL on success."
+  (handler-case (progn (funcall function value) nil)
+    (error (condition) (type-of condition))))
+
+(-> test-task-readable-character-structure () null)
+(defun test-task-readable-character-structure ()
+  "Preserve cons limits, shared ancestry cleanup and validation before printing."
+  (let ((car-cycle (list nil))
+        (cdr-cycle (list nil))
+        (probe (make-instance 'task-tests-readable-printer-probe)))
+    (setf (first car-cycle) car-cycle
+          (rest cdr-cycle) cdr-cycle)
+    (dolist (function (list #'task--write-readable-sexp #'task--readable-sexp-characters))
+      (dolist (value (list car-cycle cdr-cycle
+                          (loop repeat 129 for value = nil then (list value)
+                                finally (return (list value)))
+                          (let ((tree (make-list 131070)))
+                            (setf (first tree) (list nil))
+                            tree)))
+        (test-assert (eq 'task-error (task-tests--readable-error function value))
+                     "Structural overflow signals TASK-ERROR"))
+      (let* ((shared (list :shared))
+             (value (list shared shared)))
+        (test-assert (null (task-tests--readable-error function value))
+                     "Shared ancestry is cleaned between siblings"))
+      (test-assert
+       (null (task-tests--readable-error
+              function (loop repeat 128 for value = nil then (list value)
+                             finally (return (list value)))))
+       "Depth 128 is accepted")
+      (test-assert (null (task-tests--readable-error function (make-list 131071)))
+                   "Exactly 262144 visited nodes are accepted")
+      (let ((*task-tests-readable-printer-calls* 0))
+        (test-assert (eq 'print-not-readable (task-tests--readable-error function probe))
+                     "Other atoms use the actual printer")
+        (test-assert (= 1 *task-tests-readable-printer-calls*) "Actual printer was invoked"))
+      (let ((*task-tests-readable-printer-calls* 0))
+        (test-assert
+         (eq 'task-error
+             (task-tests--readable-error
+              function (list (make-string 4096 :initial-element #\x) probe cdr-cycle)))
+         "Invalid tail takes precedence after oversized prefix")
+        (test-assert (zerop *task-tests-readable-printer-calls*)
+                     "Full structural validation precedes atom printing"))
+      (test-assert (null (task-tests--readable-error function '(:valid "after error")))
+                   "A failed traversal does not contaminate the next call")))
+  nil)
+
+(-> task-tests--summary-character-transports () null)
+(defun task-tests--summary-character-transports ()
+  "Exercise native compaction and real artifact/retained field transports."
+  (let ((small (list "0123456789abcdef")))
+    (test-assert (= 20 (length (task--write-readable-sexp small))) "Small fixture readable length")
+    (test-assert (eq small (task--compact-native-value small 2048)) "Small identity"))
+  (dolist (limit '(0 256 1000 2000 2048))
+    (let* ((value (make-string (max 0 (- limit 2)) :initial-element #\x))
+           (characters (length (task--write-readable-sexp value))))
+      (test-assert (eq value (task--compact-native-value value characters)) "Exact native limit identity")
+      (test-assert (equal (list :omitted :characters characters)
+                          (task--compact-native-value value (1- characters)))
+                   "One over native limit has exact descriptor")
+      (test-assert (eq :omitted (first (task--compact-native-value value 0))) "Zero limit omits")))
+  (test-assert (null (task--compact-native-value nil 3)) "NIL accepted at exact readable limit")
+  (test-assert (equal '(:omitted :characters 3) (task--compact-native-value nil 2))
+               "NIL omission counts its readable form")
+  (dolist (artifact-p '(nil t))
+    (dolist (characters '(19 20 21))
+      (let* ((value (list (make-string (- characters 4) :initial-element #\x)))
+             (tag (if artifact-p :in-artifact :omitted))
+             (expected (if (<= characters 20) value
+                           (list tag :field :structured-output :characters characters))))
+        (test-assert (equal expected (task--artifact-field value :structured-output
+                                                        :preview-limit 20
+                                                        :artifact-available-p artifact-p))
+                     "Structured artifact field exact boundary")
+        (test-assert (equal expected (task--retained-result-field
+                                     (list :structured-output value) :structured-output
+                                     :preview-limit 20 :artifact-available-p artifact-p))
+                     "Inline retained transport boundary")))
+    (let ((result (list :structured-output-present-p t :structured-output nil
+                        :structured-output-storage (if artifact-p :artifact :omitted)
+                        :structured-output-characters 2001)))
+      (dolist (available-p '(nil t))
+        (let ((descriptor (task--retained-result-field result :structured-output
+                                                      :preview-limit 20
+                                                      :artifact-available-p available-p)))
+          (test-assert (eq (if (and artifact-p available-p) :in-artifact :omitted)
+                           (first descriptor)) "Retained artifact availability")
+          (test-assert (= 2001 (getf (rest descriptor) :characters)) "Terminal count transport")))))
+  (let ((text "abcdef"))
+    (test-assert (eq text (task--artifact-field text :output :preview-limit 6)) "Plain string identity")
+    (test-assert (equal '(:omitted :field :output :characters 6)
+                        (task--artifact-field text :output :preview-limit 5)) "Plain string counts no quotes")
+    (test-assert (equal '(:tail "def" :omitted (:field :progress-output :characters 3))
+                        (task--artifact-field text :progress-output :preview-limit 3)) "Newest progress tail")
+    (test-assert (null (task--artifact-field nil :structured-output :preview-limit 0)) "Absent field"))
+  nil)
+
+(-> test-task-summary-character-compaction () null)
+(defun test-task-summary-character-compaction ()
+  "Exercise native and terminal compaction with real field and usage transports."
+  (task-tests--summary-character-transports)
+  (dolist (artifact-p '(nil t))
+    (dolist (present-p '(nil t))
+      (dolist (value (list nil (list "small")
+                          (make-string 1998 :initial-element #\x)
+                          (make-string 1999 :initial-element #\x)))
+        (let* ((characters (length (task--write-readable-sexp value)))
+               (result (task-job--compact-result
+                        (list :structured-output-present-p present-p :structured-output value)
+                        :artifact-available-p artifact-p))
+               (omitted-p (and present-p (> characters *task-retained-structured-output-limit*))))
+          (test-assert (eq present-p (getf result :structured-output-present-p)) "Terminal presence")
+          (test-assert (eq (if omitted-p nil value) (getf result :structured-output)) "Terminal identity or clearing")
+          (test-assert (eq (if omitted-p (if artifact-p :artifact :omitted) nil)
+                           (getf result :structured-output-storage)) "Terminal storage")
+          (test-assert (eql (if omitted-p characters nil)
+                            (getf result :structured-output-characters)) "Exact terminal count")))))
+  nil)
+
+(-> test-task-summary-allocation-exposure () null)
+(defun test-task-summary-allocation-exposure ()
+  "Verify exact aggregate measurement bypasses normalization and full serialization."
+  (let* ((value (loop repeat 64 collect (make-string 4096 :initial-element #\x)))
+         (characters (length (task--write-readable-sexp value)))
+         (normalizer (symbol-function 'task--character-strings))
+         (serializer (symbol-function 'task--write-readable-sexp))
+         (normalizations 0)
+         (serializations 0))
+    (test-assert (= 262337 characters) "Aggregate actual readable length")
+    (test-call-with-function-replacements
+     (list (list 'task--character-strings
+                 (lambda (item) (incf normalizations) (funcall normalizer item)))
+           (list 'task--write-readable-sexp
+                 (lambda (item &key pretty-p)
+                   (incf serializations) (funcall serializer item :pretty-p pretty-p))))
+     (lambda ()
+       (test-assert (= characters (task--readable-sexp-characters value)) "Exact aggregate counter")
+       (test-assert (equal (list :omitted :characters characters)
+                           (task--compact-native-value value 2048)) "Aggregate omission count")
+       (test-assert (= characters
+                       (getf (rest (task--artifact-field value :structured-output :preview-limit 20))
+                             :characters)) "Aggregate artifact count")
+       (test-assert (zerop normalizations) "Measuring paths bypass normalization")
+       (test-assert (zerop serializations) "Measuring paths bypass full-string serialization"))))
+  nil)
+
 (-> task-tests--release-blocking-tool (task-test-blocking-tool) null)
 (defun task-tests--release-blocking-tool (tool)
   "Permit TOOL to return normally when a cancellation test is unwinding."
