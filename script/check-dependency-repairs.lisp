@@ -2,6 +2,12 @@
 (require :asdf)
 (in-package #:cl-user)
 
+;; Exercise the production entrypoint cold, before preloading selector helpers.
+;; Any unresolved source reference must fail this owning dependency check.
+(handler-bind ((warning #'error))
+  (load (merge-pathnames "production-dependencies.lisp"
+                         (uiop:pathname-directory-pathname *load-truename*))))
+
 (defparameter *dependency-repair-arguments* (uiop:command-line-arguments))
 (unless (= 5 (length *dependency-repair-arguments*))
   (error "Expected MANIFEST SOURCE-ROOT DERIVED-ROOT LOGS FRESH-CACHE-ROOT."))
@@ -10,8 +16,6 @@
 (defparameter *dependency-repair-derived* (pathname (third *dependency-repair-arguments*)))
 (defparameter *dependency-repair-logs* (pathname (fourth *dependency-repair-arguments*)))
 (defparameter *dependency-repair-cache* (pathname (fifth *dependency-repair-arguments*)))
-(load (merge-pathnames "dependency-setup.lisp"
-                       (uiop:pathname-directory-pathname *load-truename*)))
 (asdf:initialize-source-registry
  `(:source-registry (:tree ,*dependency-repair-sources*) :ignore-inherited-configuration))
 (if (uiop:getenv "AUTOLITH_DEPENDENCY_SELECTION")
