@@ -1791,6 +1791,10 @@
   test-mission-inference-reservation-recovery)
 
 (define-test-suite mission-exhaustion
+  test-mission-exhaustion-coverage-identities
+  test-mission-exhaustion-coverage-proof
+  test-mission-exhaustion-coverage-bounds
+  test-mission-exhaustion-coverage-inputs
   test-mission-exhaustion-failure-provenance
   test-mission-exhaustion-supervisor-cause
   test-mission-exhaustion-categorical-diagnostic

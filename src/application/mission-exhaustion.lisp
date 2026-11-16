@@ -90,6 +90,108 @@
         :turns (getf goal :turns-used) :tokens (getf goal :tokens-used)
         :at             (get-universal-time)))
 
+(-> mission-exhaustion--coverage-record (list keyword) list)
+(defun mission-exhaustion--coverage-record (item kind)
+  "Select descriptive fields by reference, for measurement before bounded copying."
+  (ecase kind
+    (:criteria
+     (list :id (getf item :id) :description (getf item :description)
+           :gates (getf item :gates)
+           :manual-evidence-present-p (not (null (getf item :evidence)))))
+    (:gates
+     (list :id (getf item :id) :recorded-status (getf item :status)
+           :attempts (getf item :attempts) :attempt-limit (getf item :attempt-limit)
+           :requires-tool (getf item :requires-tool)
+           :requires-criterion (getf item :requires-criterion)))))
+
+(-> mission-exhaustion--coverage (list) list)
+(defun mission-exhaustion--coverage (goal)
+  "Detach whole descriptive records within the existing evidence character bound.
+
+Measure source leaves without copying them or producing a measuring string. A
+complete envelope fits exactly; otherwise reserve an incomplete envelope before
+selecting records. Recorded states and manual evidence presence are not fresh
+proof. This traversal does not introduce an atomic goal capture boundary."
+  (let* ((criteria (getf goal :criteria))
+         (gates (getf goal :gates))
+         (criterion-count (length criteria))
+         (gate-count (length gates))
+         (limit *mission-evidence-limit*))
+    (labels ((envelope (&key complete (omitted-criteria 0) (omitted-gates 0) selected-criteria selected-gates)
+               "Describe selected records and omissions without implying current proof."
+               (list :descriptive-only t :recorded-state-only t :complete-p complete
+                     :redacted-p nil :omitted-criteria omitted-criteria :omitted-gates omitted-gates
+                     :criteria selected-criteria :gates selected-gates))
+
+             (record-size (record)
+               "Use the real readable character counter only on bounded structure."
+               (if (or (loop for value in (rest record) by #'cddr
+                             thereis (and (stringp value) (> (length value) limit)))
+                       (> (length (getf record :gates)) limit))
+                   (1+ limit)
+                   (task--readable-sexp-characters record)))
+
+             (records-size (items kind)
+               "Measure without retaining a projection of the supplied goal tree."
+               (if items
+                   (+ (length items) -2
+                      (loop for item in items
+                            sum (record-size (mission-exhaustion--coverage-record item kind))))
+                   0)))
+      (let* ((empty (envelope :omitted-criteria criterion-count :omitted-gates gate-count))
+             (reserved (task--readable-sexp-characters empty))
+             (complete-size (+ (task--readable-sexp-characters (envelope :complete t))
+                               (records-size criteria :criteria) (records-size gates :gates))))
+        (when (and (> reserved limit) (> complete-size limit))
+          (mission--reject :evaluator-coverage "Coverage omission envelope exceeds the evidence bound."))
+        (if (<= complete-size limit)
+            (task--character-strings
+             (envelope :complete t
+                       :selected-criteria (mapcar (lambda (item) (mission-exhaustion--coverage-record item :criteria)) criteria)
+                       :selected-gates (mapcar (lambda (item) (mission-exhaustion--coverage-record item :gates)) gates)))
+            (let ((remaining (- limit reserved))
+                  (selected-criteria nil)
+                  (selected-gates nil)
+                  (omitted-criteria criterion-count)
+                  (omitted-gates gate-count))
+              (dolist (kind '(:criteria :gates))
+                (dolist (item (getf goal kind))
+                  (let* ((record (mission-exhaustion--coverage-record item kind))
+                         (cost (+ 2 (record-size record))))
+                    (when (<= cost remaining)
+                      (decf remaining cost)
+                      (ecase kind
+                        (:criteria
+                         (push record selected-criteria)
+                         (decf omitted-criteria))
+                        (:gates
+                         (push record selected-gates)
+                         (decf omitted-gates)))))))
+              (setf selected-criteria (nreverse selected-criteria)
+                    selected-gates (nreverse selected-gates))
+              (task--character-strings
+               (envelope :omitted-criteria omitted-criteria :omitted-gates omitted-gates
+                         :selected-criteria selected-criteria :selected-gates selected-gates))))))))
+
+(-> mission-exhaustion--coverage-text (list) string)
+(defun mission-exhaustion--coverage-text (goal)
+  "Redact bounded coverage, discarding records if their representation changes."
+  (let* ((coverage (mission-exhaustion--coverage goal))
+         (text (task--write-readable-sexp coverage))
+         (safe (mission-exhaustion--text text)))
+    (if (and (string= text safe) (<= (length safe) *mission-evidence-limit*))
+        safe
+        (let* ((omitted (list :descriptive-only t :recorded-state-only t :complete-p nil
+                              :redacted-p t :omitted-criteria (length (getf goal :criteria))
+                              :omitted-gates (length (getf goal :gates)) :criteria nil :gates nil))
+               (fallback (task--write-readable-sexp omitted)))
+          (when (> (length fallback) *mission-evidence-limit*)
+            (mission--reject :evaluator-coverage "Redacted coverage envelope exceeds the evidence bound."))
+          (let ((redacted (mission-exhaustion--text fallback)))
+            (unless (and (string= fallback redacted) (<= (length redacted) *mission-evidence-limit*))
+              (mission--reject :evaluator-redaction "Local redaction changed the coverage omission envelope."))
+            redacted)))))
+
 (-> mission-exhaustion--inputs (mission-context) list)
 (defun mission-exhaustion--inputs (context)
   "Return labelled, redacted declared evidence and numeric supervision state.
@@ -112,7 +214,8 @@ are deliberately excluded. Refusals and timeouts alone are not harness defects."
                  '(:turns-used :tokens-used :tokens-reserved :requests-outstanding))
        (list (list :id "E5" :kind :harness-malfunction
                    :text "Expected nonnegative harness accounting counters; observed a negative counter in E4.")))
-     (list (list :id "E1" :kind :project :text (mission-exhaustion--text (getf goal :objective)))
+     (list (list :id "COVERAGE" :kind :project :text (mission-exhaustion--coverage-text goal))
+           (list :id "E1" :kind :project :text (mission-exhaustion--text (getf goal :objective)))
           (list :id "E2" :kind :project
                 :text (mission-exhaustion--text
                        (mapcar (lambda (criterion)
