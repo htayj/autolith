@@ -921,6 +921,10 @@
   test-precompaction-bounds-oversized-output)
 
 (define-test-suite conversation
+  test-conversation-tool-details-boundaries
+  test-conversation-tool-details-aggregate
+  test-conversation-tool-details-structure
+  test-conversation-tool-details-stream
   test-conversation-image-input
   test-conversation-inherited-reference
   test-conversation-ephemeral-tool-projection

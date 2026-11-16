@@ -2,6 +2,99 @@
 
 ;;;; -- Subsystem Tests --
 
+(-> test-conversation-tool-details-boundaries () null)
+(defun test-conversation-tool-details-boundaries ()
+  "Test readable UTF-8 byte boundaries and preserve accepted metadata identity."
+  (let ((small (list :status ':ok :count 3 :values (list nil t 1/3))))
+    (test-assert (eq small (conversation--bounded-tool-details small))
+                 "small portable metadata is retained without a copy"))
+  (dolist (value (list (make-string 65534 :element-type 'base-char :initial-element #\a)
+                       (coerce (list (code-char #xe9) (code-char #x4e2d)
+                                     (code-char #x1f600) #\" #\\ #\Newline)
+                               'string)
+                       (list :escaped "a\"b\\c" :number 1.25d0)))
+    (let* ((text (with-standard-io-syntax
+                   (let ((*print-circle* nil) (*print-readably* t))
+                     (write-to-string value))))
+           (size (length (utf8-string-to-octets text))))
+      (let ((*conversation-tool-details-maximum-octets* size))
+        (test-assert (eq value (conversation--bounded-tool-details value))
+                     "the exact serialized byte budget is accepted"))
+      (let* ((*conversation-tool-details-maximum-octets* (1- size))
+             (omitted (conversation--bounded-tool-details value)))
+        (test-assert (eq (getf omitted :reason) ':metadata-size-limit)
+                     "one encoded byte over budget omits optional metadata"))
+      (with-standard-io-syntax
+        (let ((*read-eval* nil) (*package* (find-package '#:autolith)))
+          (with-input-from-string (stream text)
+            (test-assert (equal value (read stream)) "accepted metadata reads back")
+            (test-assert (eq (read stream nil ':eof) ':eof)
+                         "the readable metadata has exactly one form"))))))
+  nil)
+
+(-> test-conversation-tool-details-aggregate () null)
+(defun test-conversation-tool-details-aggregate ()
+  "Reject many individually legal strings before completing their serialization."
+  (let* ((details (loop for index below 128
+                        collect (make-string 4096 :element-type 'base-char
+                                                  :initial-element
+                                                  (code-char (+ 32 (mod index 90))))))
+         (omitted (conversation--bounded-tool-details details)))
+    (test-assert (eq (getf omitted :reason) ':metadata-size-limit)
+                 "aggregate overflow omits optional metadata")
+    (test-assert (getf omitted :octets-lower-bound-p)
+                 "early rejection reports an explicit lower bound")
+    (test-assert (<= (1+ *conversation-tool-details-maximum-octets*)
+                     (getf omitted :octets)
+                     (+ *conversation-tool-details-maximum-octets* 4))
+                 "emission stops at the first over-budget character"))
+  nil)
+
+(-> test-conversation-tool-details-structure () null)
+(defun test-conversation-tool-details-structure ()
+  "Reject cyclic, deep, node-excess and unsupported metadata without printing it."
+  (let ((cycle (list :cycle)))
+    (setf (rest cycle) cycle)
+    (dolist (value (list cycle
+                         (loop with value = nil repeat 66
+                               do (setf value (list value)) finally (return value))
+                         (loop repeat 5000 collect 1)
+                         (make-hash-table)))
+      (test-assert
+       (equal (conversation--bounded-tool-details value)
+              '(:omitted-p t :reason :metadata-not-portable))
+       "structural rejection uses a small payload-free descriptor")))
+  nil)
+
+(-> test-conversation-tool-details-stream () null)
+(defun test-conversation-tool-details-stream ()
+  "Test portable Gray stream ranges, return values and payload-free overflow."
+  (let ((stream (make-instance 'conversation-tool-details-stream :limit 4)))
+    (test-assert (char= (write-char #\a stream) #\a) "WRITE-CHAR returns its character")
+    (let ((text "xbcx"))
+      (test-assert (eq text (write-string text stream :start 1 :end 3))
+                   "WRITE-STRING returns its original string"))
+    (test-assert (= (conversation-tool-details-stream-octets stream) 3)
+                 "only the requested string range is counted")
+    (write-char #\d stream)
+    (test-assert
+     (handler-case
+         (progn (write-char (code-char #x1f600) stream) nil)
+       (conversation-tool-details-overflow (condition)
+         (and (= (conversation-tool-details-overflow-octets condition) 8)
+              (< (length (princ-to-string condition)) 120))))
+     "overflow carries only a scalar byte count and has a bounded report")
+    (close stream))
+  (let ((surrogate (code-char #xd800)))
+    (when surrogate
+      (test-assert
+       (handler-case
+           (progn (conversation--bounded-tool-details (string surrogate)) nil)
+         (utf8-conversion-failed ()
+           t))
+       "unencodable metadata still signals the UTF-8 conversion condition")))
+  nil)
+
 (-> test-conversation--write-tiny-png (pathname) pathname)
 (defun test-conversation--write-tiny-png (pathname)
   "Write the valid one-pixel test PNG to PATHNAME."

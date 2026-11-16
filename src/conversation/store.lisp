@@ -2876,6 +2876,65 @@ transcript show automatic INPUT as a short notice."
 (defparameter *conversation-tool-details-maximum-octets* (* 64 1024)
   "Maximum portable structured tool metadata retained in one durable result.")
 
+(define-condition conversation-tool-details-overflow (error)
+  ((octets
+    :initarg       :octets
+    :type          (integer 0)
+    :reader        conversation-tool-details-overflow-octets
+    :documentation "The emitted UTF-8 byte lower bound at rejection."))
+  (:documentation "Optional tool metadata exceeded its serialized byte budget.")
+  (:report (lambda (condition stream)
+             (format stream "Tool metadata exceeds its byte budget (~D bytes reached)."
+                     (conversation-tool-details-overflow-octets condition)))))
+
+(defclass conversation-tool-details-stream
+    (trivial-gray-streams:fundamental-character-output-stream)
+  ((limit
+    :initarg       :limit
+    :type          (integer 0)
+    :reader        conversation-tool-details-stream-limit
+    :documentation "The maximum permitted serialized UTF-8 byte count.")
+   (octets
+    :initform      0
+    :type          (integer 0)
+    :accessor      conversation-tool-details-stream-octets
+    :documentation "The emitted byte count; no output or payload is retained."))
+  (:documentation "A counting sink that interrupts oversized metadata printing."))
+
+(defmethod trivial-gray-streams:stream-write-char
+    ((stream conversation-tool-details-stream) character)
+  "Count CHARACTER's UTF-8 bytes and stop at the first over-budget character."
+  (let* ((code (char-code character))
+         (valid-p (not (or (<= #xd800 code #xdfff) (> code #x10ffff))))
+         (width (cond
+                  ((< code #x80)
+                   1)
+                  ((< code #x800)
+                   2)
+                  ((< code #x10000)
+                   3)
+                  (t
+                   4)))
+         (octets (incf (conversation-tool-details-stream-octets stream) width)))
+    ;; Match the UTF-8 encoder without retaining its payload-bearing cause.
+    (unless valid-p
+      (error 'utf8-conversion-failed :direction ':encode))
+    (when (> octets (conversation-tool-details-stream-limit stream))
+      (error 'conversation-tool-details-overflow :octets octets)))
+  character)
+
+(defmethod trivial-gray-streams:stream-write-string
+    ((stream conversation-tool-details-stream) string &optional (start 0) end)
+  "Count the requested STRING range without copying or retaining it."
+  (loop for index from start below (or end (length string))
+        do (trivial-gray-streams:stream-write-char stream (char string index)))
+  string)
+
+(defmethod trivial-gray-streams:stream-line-column
+    ((stream conversation-tool-details-stream))
+  "Return NIL because this non-pretty counting sink does not track columns."
+  nil)
+
 (-> conversation--bounded-tool-details (t) t)
 (defun conversation--bounded-tool-details (details)
   "Return portable bounded DETAILS or a truthful omission descriptor."
@@ -2891,13 +2950,16 @@ transcript show automatic INPUT as a short notice."
           (lambda (value)
             (or (null value) (eq value t) (keywordp value)
                 (stringp value) (numberp value)))))
-        (let* ((text   (with-standard-io-syntax
-                         (let ((*print-circle* nil) (*print-readably* t))
-                           (write-to-string details))))
-               (octets (length (utf8-string-to-octets text))))
-          (if (<= octets *conversation-tool-details-maximum-octets*)
-              details
-              (list :omitted-p t :reason ':metadata-size-limit :octets octets))))
+        (with-standard-io-syntax
+          (let ((*print-circle* nil) (*print-readably* t))
+            (write details :stream
+                   (make-instance 'conversation-tool-details-stream
+                                  :limit *conversation-tool-details-maximum-octets*))))
+        details)
+    (conversation-tool-details-overflow (condition)
+      (list :omitted-p t :reason ':metadata-size-limit
+            :octets (conversation-tool-details-overflow-octets condition)
+            :octets-lower-bound-p t))
     ((or sexp-config-error print-not-readable) ()
       (list :omitted-p t :reason ':metadata-not-portable))))
 
