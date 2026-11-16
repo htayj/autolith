@@ -149,6 +149,7 @@
          (preview       (or (getf result :response) (getf result :content)
                             (getf result :error) (getf result :output) result)))
     (append
+     (task-checkpoint-projection result :record record)
      (list :job-id             (getf record :job-id)
            :execution-id       (getf record :execution-id)
            :owner-conversation (getf record :completion-owner-conversation)
@@ -216,7 +217,9 @@
   (let* ((event    (getf message :payload))
          (snapshot (getf event :snapshot))
          (metadata (getf (getf snapshot :progress) :completion)))
-    (append (list :id (getf event :id) :outcome (getf event :outcome)) metadata)))
+    (let ((outcome (if (eq (getf metadata :administrative-status) ':suspended)
+                       ':review-required (getf event :outcome))))
+      (append (list :id (getf event :id) :outcome outcome) metadata))))
 
 (-> task-completion--messages (task-completion-service) list)
 (defun task-completion--messages (service)
@@ -278,7 +281,7 @@
                                ':completed)
                               (:failed
                                ':failed)
-                              (:aborted
+                              ((:aborted :suspended)
                                ':aborted)
                               (otherwise
                                ':unknown))))

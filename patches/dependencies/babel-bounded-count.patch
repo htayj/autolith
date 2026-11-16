@@ -1,0 +1,34 @@
+--- a/src/enc-iso-2022-jp.lisp
++++ b/src/enc-iso-2022-jp.lisp
+@@ -66,11 +66,12 @@
+ (define-code-point-counter :iso-2022-jp (getter type)
+   `(lambda (seq start end max)
+      (declare (type ,type seq)
+-              (fixnum start end))
++              (fixnum start end)
++              (integer max))
+      (let ((count 0)
+            (mode :ascii))
+        (loop with i = start
+-             while (< i end)
++             while (and (< i end) (or (not (plusp max)) (< count max)))
+              do (let ((byte (,getter seq i)))
+                   (cond
+                     ;; ESC sequence
+--- a/src/enc-ksc-5601.lisp
++++ b/src/enc-ksc-5601.lisp
+@@ -1289,9 +1289,11 @@
+      (loop for i fixnum from start below end
+            and di fixnum from d-start by 2
+            for code of-type code-point = (,getter src i)
+-           for ksc-5601 of-type code-point = (utf8-to-ksc-5601 code)
+-           unless ksc-5601
+-             do (handle-error)
++           for ksc-5601 of-type code-point
++             = (or (utf8-to-ksc-5601 code)
++                   ;; Map GETA MARK to a packed KSC unit, never a raw scalar.
++                   (encoding-error code :ksc_5601 src i
++                                   (utf8-to-ksc-5601 #x3013)))
+            do (,setter ksc-5601 dest di 2 :be)
+            finally (return (the fixnum (- di d-start))))))
+ 

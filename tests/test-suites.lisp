@@ -1474,6 +1474,11 @@
   test-executable-skill-workflow
   test-executable-skill-verification-contracts)
 
+(define-test-suite task-checkpoint-publication
+  test-task-checkpoint-publication
+  test-task-checkpoint-publication-refusals
+  test-task-checkpoint-publication-storage)
+
 (define-test-suite task-continuity
   test-child-overflow-continuity-capacity
   test-child-overflow-context-ownership
@@ -1773,6 +1778,10 @@
   test-mission-inference-reservation-recovery)
 
 (define-test-suite mission-exhaustion
+  test-mission-exhaustion-failure-provenance
+  test-mission-exhaustion-supervisor-cause
+  test-mission-exhaustion-categorical-diagnostic
+  test-mission-exhaustion-reviewer-exits
   test-mission-exhaustion-operation-boundary
   test-mission-exhaustion-extensions
   test-mission-exhaustion-fallbacks
@@ -1931,6 +1940,7 @@
   test-xdg-legacy-root-scan)
 
 (define-test-suite test-runner
+  test-runner-case-identifiers
   test-runner-selection
   test-runner-failure-reporting
   test-runner-temporary-cleanup
@@ -2156,3 +2166,41 @@
 (define-test-suite mission-draft-interface
  test-mission-draft-native-command
  test-mission-draft-restore-identities)
+
+(define-test-suite mission-lease
+  test-mission-lease-real-child-decline
+  test-mission-lease-ancestor-cap
+  test-mission-lease-operation-cap
+  test-mission-lease-actual-nested-ancestor-cap
+  test-mission-lease-own-inline-cancelled
+  test-mission-lease-own-inline-failed
+  test-mission-lease-own-inline-expired
+  test-mission-lease-delayed-guardian-timeout
+    test-mission-lease-failure-chronology
+  test-mission-lease-checkpoint-persistence-failure
+  test-mission-lease-deferred-controller-report
+  test-mission-lease-artifact-cancellation-fault
+  test-mission-lease-continuity-cancellation-fault
+  test-mission-lease-publication-cancellation-fault
+  test-mission-lease-combined-storage-cancellation-fault
+  test-task-ordinary-storage-failures
+  test-mission-accounting-evidence-roundtrip
+  test-task-continuity-prepublication-validation
+  test-task-continuity-validation-terminal-states
+  test-mission-lease-deferred-descendant
+  test-mission-lease-terminal-chronology
+  test-mission-lease-secondary-publication-faults
+  test-mission-lease-missing-terminal-fence
+  test-mission-lease-context-replacement)
+
+(define-test-suite mission-accounting-identity
+  test-mission-accounting-pending-cutover
+  test-mission-accounting-exact-handles
+  test-mission-accounting-append-failure
+  test-mission-accounting-bounded-child-reload
+  test-mission-accounting-independent-child-reload
+  test-mission-accounting-retired-retry-overlap
+  test-mission-child-trace-fault-evidence
+  test-mission-child-goal-fault-evidence
+  test-mission-child-notice-fault-evidence
+    test-mission-accounting-cutover-races)

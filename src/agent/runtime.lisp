@@ -127,6 +127,9 @@
   "The admitted child task-job continued by this thread, or NIL for new work.
 Every thread hop must carry the same identity; its loss refuses quarantined work.")
 
+(defparameter *execution-lease-receipt* nil
+  "Exact host execution ancestry carried through every tool-thread boundary.")
+
 (defparameter *agent-restricted-maximum-tool-rounds* 4
   "Maximum executed tool rounds within one restricted agent turn.")
 
@@ -1252,12 +1255,14 @@ worker results become explicit unknown outcomes so provider history stays valid.
   (let ((skill-logical-turn-state   *skill-logical-turn-state*)
         (worker-host-tool-policy    (copy-tree *worker-host-tool-policy*))
         (telemetry-run              *telemetry-run*)
-        (mission-admitted-operation *mission-admitted-operation*))
+        (mission-admitted-operation *mission-admitted-operation*)
+        (execution-lease-receipt    *execution-lease-receipt*))
     (lambda ()
       (let ((*skill-logical-turn-state*   skill-logical-turn-state)
             (*worker-host-tool-policy*    worker-host-tool-policy)
             (*telemetry-run*              telemetry-run)
-            (*mission-admitted-operation* mission-admitted-operation))
+            (*mission-admitted-operation* mission-admitted-operation)
+            (*execution-lease-receipt*    execution-lease-receipt))
         (funcall function)))))
 
 (-> agent--run-tool-wave

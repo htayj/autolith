@@ -481,7 +481,7 @@
                 ':user)
             "the final user init overrides a colliding site registration")
            (test-assert
-            (eq (directory-user-init-tests--definition) :loaded)
+            (eq (funcall 'directory-user-init-tests--definition) :loaded)
             "trusted directory init may redefine the live Lisp image")
            (test-mcp-configuration--write
             site-init
@@ -548,7 +548,7 @@
                           (getf registration :source))))
             "removing site init removes its stale registrations")
            (test-assert
-            (eq (directory-user-init-tests--definition) :loaded)
+            (eq (funcall 'directory-user-init-tests--definition) :loaded)
             "arbitrary directory init mutations remain sticky until reversed"))
       (setf *directory-user-init-test-log* nil)
       (context--registry-restore context-registrations)

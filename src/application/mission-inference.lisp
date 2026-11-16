@@ -2,6 +2,57 @@
 
 ;;;; -- Concurrent Mission Inference --
 
+(defvar *mission-accounting-controllers* (make-hash-table :test 'equal)
+  "Strong original-generation owners for unresolved ordinary reporting only.")
+
+(defvar *mission-accounting-controllers-lock* (make-lock "mission accounting controllers")
+  "Leaf lock: release before taking any context, request, lifecycle or persistence lock.")
+
+(-> mission-inference-controller-find (string) (option mission-context))
+(defun mission-inference-controller-find (generation)
+  "Find retained reporting data by original generation; grant no execution authority."
+  (with-lock-held (*mission-accounting-controllers-lock*)
+    (gethash generation *mission-accounting-controllers*)))
+
+(defclass mission-inference-request ()
+  ((context :initarg :context :reader mission-inference-request-context
+            :documentation "Exact original host context.")
+   (generation :initarg :generation :reader mission-inference-request-generation
+               :documentation "Original generation, never reconstructed at settlement.")
+   (identifier :initform (make-identifier) :reader mission-inference-request-identifier
+               :documentation "Exact request identity, independent of its reservation amount.")
+   (mission-id :initarg :mission-id :reader mission-inference-request-mission-id
+               :documentation "Original durable goal identifier.")
+   (conversation :initarg :conversation :reader mission-inference-request-conversation
+                 :documentation "Original audit destination, including after session replacement.")
+   (amount :initarg :amount :reader mission-inference-request-amount
+           :documentation "Original reserved output allocation.")
+   (allowance :initarg :allowance :reader mission-inference-request-allowance
+              :documentation "Exact allowance identity validated at callback.")
+   (child :initarg :child :reader mission-inference-request-child
+          :documentation "Original child used for missing-usage attribution.")
+   (state :initform ':pending :accessor mission-inference-request-state
+          :documentation "One-time arithmetic claim and independent append outcome.")
+   (reporting-owner :initform ':execution :accessor mission-inference-request-reporting-owner
+                    :documentation "Explicit handoff from executing request to original-generation controller.")
+   (persistence-phase :initform nil :accessor mission-inference-request-persistence-phase
+                      :documentation "Categorical reporting failure, separate from applied arithmetic.")
+   (append-uncertain-p :initform nil :accessor mission-inference-request-append-uncertain-p
+                       :documentation "A prior append signalled; retry cannot establish physical record uniqueness.")
+   (payload :initform nil :accessor mission-inference-request-payload
+            :documentation "Once-applied portable accounting evidence, retained on append failure."))
+  (:documentation "Host request handle captured before dispatch, with one original accounting route."))
+
+(-> mission-inference-request-handoff (mission-inference-request) null)
+(defun mission-inference-request-handoff (request)
+  "Retain the exact failed reporting owner before its executing wrapper unwinds.
+Caller holds the original request lock; the registry lock is a leaf lock."
+  (setf (mission-inference-request-reporting-owner request) ':original-generation-controller)
+  (let ((context (mission-inference-request-context request)))
+    (with-lock-held (*mission-accounting-controllers-lock*)
+      (setf (gethash (mission-context-accounting-generation context) *mission-accounting-controllers*) context)))
+  nil)
+
 (defclass mission-candidate-reservation ()
   ((child :initarg :child :reader mission-candidate-reservation-child
           :documentation "Exact admitted host child identity.")
@@ -25,22 +76,46 @@
           :documentation "One-time callback state; ambiguous callbacks retain ownership."))
   (:documentation "Opaque in-process reservation pairing; durable identity belongs to the operation ledger."))
 
-(-> mission-reservation-amount ((or integer mission-candidate-reservation)) integer)
+(-> mission-reservation-amount ((or integer mission-inference-request mission-candidate-reservation)) integer)
 (defun mission-reservation-amount (reservation)
-  "Return numeric provider allowance without discarding candidate settlement identity."
+  "Return numeric provider allowance without discarding original settlement identity."
   (etypecase reservation
     (integer
      reservation)
+    (mission-inference-request
+     (mission-inference-request-amount reservation))
     (mission-candidate-reservation
      (mission-candidate-reservation-amount reservation))))
 
 (-> mission--reserve-inference (mission-context &key (:allowance (option list)))
-    (or (integer 1) mission-candidate-reservation))
+    (or mission-inference-request mission-candidate-reservation))
 (defun mission--reserve-inference (context &key allowance)
-  "Pair candidate reservations with an exact ownership pin; working reservations are integers."
+  "Capture an exact original host request before dispatch; candidate pins keep their protocol."
   (let ((owner (mission-context-origin-owner context)))
     (unless owner
-      (return-from mission--reserve-inference (mission--reserve-inference-counters context :allowance allowance)))
+      (return-from mission--reserve-inference
+        (with-recursive-lock-held ((mission-context-request-lock context))
+          (with-recursive-lock-held ((mission-context-lock context))
+            (when (mission-context-accounting-snapshot context)
+              (mission--reject ':operation-authority "Original accounting generation is detached."))
+            (let ((request (make-instance 'mission-inference-request :context context :amount 0 :allowance allowance
+                                          :generation   (mission-context-accounting-generation context)
+                                          :mission-id   (getf (mission-context-goal context) :completion-id)
+                                          :conversation (or (mission-context-conversation context)
+                                                            (application-conversation (mission-context-application context)))
+                                          :child        (when (and (typep *mission-admitted-operation* 'task-job)
+                                                                   (eq context (task-job-mission-context *mission-admitted-operation*)))
+                                                          *mission-admitted-operation*))))
+              (when allowance
+                (setf (gethash allowance (mission-context-accounting-allowances context)) allowance))
+              ;; Allocate the host handle before committing a reservation. An ID
+              ;; allocation failure must never strand a persisted numeric hold.
+              (sb-sys:without-interrupts
+                (setf (slot-value request 'amount) (mission--reserve-inference-counters context :allowance allowance))
+                (setf (slot-value request 'mission-id) (getf (mission-context-goal context) :completion-id)
+                      (gethash (mission-inference-request-identifier request)
+                               (mission-context-accounting-requests context)) request))
+              request)))))
     (with-recursive-lock-held ((mission-context-request-lock context))
       ;; Ticket validation precedes identity allocation and ownership pin admission.
       (mission--admit context)
@@ -74,7 +149,7 @@
             (error condition)))))))
 
 (-> mission--settle-inference
-    (mission-context (or integer mission-candidate-reservation) (option integer)
+    (mission-context (or mission-inference-request mission-candidate-reservation) (option integer)
      &key (:allowance (option list)) (:failure t) (:originating-child (option task-job))) null)
 (defun mission--settle-inference (context reservation tokens &key allowance failure originating-child)
   "Settle only the exact originating candidate handle and retain ambiguous callback pins."
@@ -260,31 +335,137 @@
          (application-input-controller-condition-variable controller)))))
   nil)
 
-(-> mission--settle-inference-counters
-    (mission-context integer (option integer) &key (:allowance (option list)) (:failure t)
-     (:originating-child (option task-job))) null)
-(defun mission--settle-inference-counters (context reservation tokens &key allowance failure originating-child)
-  "Release RESERVATION once, charging measured usage or an exact child's allowance."
+(-> mission-inference-request-report (mission-context) list)
+(defun mission-inference-request-report (context)
+  "Read bounded original-generation reporting ownership without granting execution authority."
   (with-recursive-lock-held ((mission-context-request-lock context))
+    (let ((requests (loop for request being the hash-values of (mission-context-accounting-requests context)
+                          when (eq (mission-inference-request-reporting-owner request) ':original-generation-controller)
+                            collect request)))
+      (when requests
+        (list :owner      ':original-generation-controller
+              :generation (mission-context-accounting-generation context)
+              :unresolved-count (length requests) :truncated-p (> (length requests) 64)
+              :requests
+              (loop for request in requests repeat 64
+                    collect (list :request-id         (mission-inference-request-identifier request)
+                                  :state              (mission-inference-request-state request)
+                                  :phase              (mission-inference-request-persistence-phase request)
+                                  :append-uncertain-p (mission-inference-request-append-uncertain-p request)
+                                  :classification     (getf (rest (mission-inference-request-payload request)) :classification)
+                                  :known-tokens       (getf (rest (mission-inference-request-payload request)) :known-tokens)
+                                  :reservation-charge (getf (rest (mission-inference-request-payload request)) :reservation-charge))))))))
+
+(-> mission-inference-request-persist (mission-inference-request) null)
+(defun mission-inference-request-persist (request)
+  "Append only the first applied payload; never repeat arithmetic or terminal policy.
+
+An append error is uncertain even when the writer signalled after committing.
+Original-generation controller ownership survives execution/guardian retirement."
+  (let ((context (mission-inference-request-context request)))
+    (with-recursive-lock-held ((mission-context-request-lock context))
+      (when (and (mission-inference-request-payload request)
+                 (not (eq (mission-inference-request-state request) ':persisted)))
+        (setf (mission-inference-request-state request) ':unpersisted
+              (mission-inference-request-persistence-phase request) ':audit-append)
+        (handler-case
+            (conversation-append-record (mission-inference-request-conversation request)
+                                        (mission-inference-request-payload request))
+          (serious-condition (condition)
+            (setf (mission-inference-request-append-uncertain-p request) t)
+            (mission-inference-request-handoff request)
+            (error condition)))
+        (setf (mission-inference-request-state request) ':persisted
+              (mission-inference-request-reporting-owner request) nil
+              (mission-inference-request-persistence-phase request) nil)
+        (remhash (mission-inference-request-identifier request) (mission-context-accounting-requests context))
+        (unless (loop for retained being the hash-values of (mission-context-accounting-requests context)
+                      thereis (eq (mission-inference-request-reporting-owner retained) ':original-generation-controller))
+          (with-lock-held (*mission-accounting-controllers-lock*)
+            (remhash (mission-context-accounting-generation context) *mission-accounting-controllers*))))))
+  nil)
+
+(-> mission-inference-request-retry (mission-context string) (values boolean boolean))
+(defun mission-inference-request-retry (context identifier)
+  "Explicitly retry the controller-owned payload, returning completion and prior append uncertainty.
+No automatic retry, arithmetic, policy replay or execution dispatch occurs."
+  (with-recursive-lock-held ((mission-context-request-lock context))
+    (let ((request (gethash identifier (mission-context-accounting-requests context))))
+      (unless (and request (mission-inference-request-payload request))
+        (mission--reject ':accounting-identity "No retained applied request matches this original generation."))
+      (mission-inference-request-persist request)
+      (values t (mission-inference-request-append-uncertain-p request)))))
+
+(-> mission--settle-inference-counters
+    (mission-context mission-inference-request (option integer) &key (:allowance (option list)) (:failure t)
+     (:originating-child (option task-job))) null)
+(defun mission--settle-inference-counters (context request tokens &key allowance failure originating-child)
+  "Claim an exact original request once; stale callbacks cannot publish successor policy."
+  (unless (or (null tokens) (and (integerp tokens) (not (minusp tokens))))
+    (mission--reject ':accounting-usage "Known billable usage must be a nonnegative integer."))
+  (with-recursive-lock-held ((mission-context-request-lock context))
+    (unless (and (typep request 'mission-inference-request)
+                 (eq context (mission-inference-request-context request))
+                 (equal (mission-context-accounting-generation context)
+                        (mission-inference-request-generation request))
+                 (eq allowance (mission-inference-request-allowance request))
+                 (or (null originating-child)
+                     (eq originating-child (mission-inference-request-child request))))
+      (mission--reject ':accounting-identity "Settlement does not match its original host request."))
+    (unless (eq (mission-inference-request-state request) ':pending)
+      (return-from mission--settle-inference-counters nil))
     (with-recursive-lock-held ((mission-context-lock context))
-      (let* ((goal      (mission-context-goal context))
-             (child     (and originating-child
-                             (eq (task-job-mission-context originating-child) context)
-                             originating-child))
-             (bounded-p (and child (not (integerp tokens))
-                             (typep reservation '(integer 1)))))
-        (dolist (limit (remove nil (list goal allowance)))
+      (let* ((goal             (mission--accounting-goal context))
+             (reservation      (mission-inference-request-amount request))
+             (child            (mission-inference-request-child request))
+             (bounded-p        (and child (not (integerp tokens))))
+             (route            (and allowance (gethash allowance (mission-context-accounting-allowances context))))
+             (policy-condition nil))
+        (setf (mission-inference-request-state request) ':applied)
+        (dolist (limit (remove nil (list goal route)))
           (decf (getf limit :requests-outstanding))
           (decf (getf limit :tokens-reserved) reservation)
           (cond
             ((integerp tokens)
              (incf (getf limit :tokens-used) tokens))
             (bounded-p
-             (mission--ensure-reservations limit)
              (incf (getf limit :tokens-used) reservation)
              (incf (getf limit :reservation-charged-tokens) reservation))))
-        (mission--settlement-policy context reservation tokens :bounded-p bounded-p :child child
-                                    :failure failure))))
+        (unless (integerp tokens)
+          (unless bounded-p (incf (getf goal :unknown-usage)))
+          (when child
+            (mission--attribute-child-unknown context child :goal goal
+                                              :reservation        (when bounded-p reservation))))
+        (when (mission--registered-p context)
+          (handler-case
+              (mission--settlement-policy context reservation tokens :bounded-p (not (null bounded-p))
+                                          :child child :failure failure :attributed-p t)
+            (serious-condition (condition) (setf policy-condition condition))))
+        (setf (mission-inference-request-payload request)
+              (append
+               (list :mission-accounting-settlement
+                     :mission-id (mission-inference-request-mission-id request)
+                     :generation         (mission-inference-request-generation request)
+                     :request-id         (mission-inference-request-identifier request)
+                     :child-id           (when child (job-identifier child))
+                     :classification     (if (integerp tokens) ':known ':unknown)
+                     :known-tokens tokens :reservation reservation
+                     :reservation-charge (if bounded-p reservation 0)
+                     :failure-p          (not (null failure))
+                     :snapshot           (mission--accounting-values goal)
+                     :opening            (copy-tree (mission-context-accounting-opening context)))
+               (when route
+                 (list :allowance
+                       (list :id          (copy-tree (getf route :id))
+                             :turn-limit  (getf route :turn-limit)
+                             :token-limit (getf route :token-limit)
+                             :snapshot    (mission--accounting-values route))))))
+        (when policy-condition
+          (setf (mission-inference-request-state request) ':unpersisted
+                (mission-inference-request-persistence-phase request) ':settlement-policy)
+          (mission-inference-request-handoff request)
+          (error policy-condition))))
+    (mission-inference-request-persist request))
   (mission--wake-settlement context)
   nil)
 
@@ -300,71 +481,72 @@ A request refused before invoking FUNCTION or at its first local context-admissi
 boundary has known zero usage. After entry into an admitted provider request, an
 exact child's missing usage charges its finite admitted allocation once and retains
 child UNKNOWN audit; unproven uncertainty requires conservative quarantine."
-  (let* ((*mission-candidate-request-id* (make-identifier))
-         (originating-child
-          (and (typep *mission-admitted-operation* 'task-job)
-               (eq (task-job-mission-context *mission-admitted-operation*) context)
-               *mission-admitted-operation*))
-         (reservation                    nil)
-         (dispatched-p                   nil)
-         (admission-state                (list :pending))
-         (local-refusal-p                nil)
-         (settled-p                      nil)
-         (failure                        nil))
-    (unwind-protect
-         (progn
-           (mission-exhaustion--admitting
-            context (lambda ()
-                      (sb-sys:without-interrupts
-                        (setf reservation (mission--reserve-inference context :allowance allowance)))))
-           (handler-case
-                (let* ((*provider-mission-output-allowance* (mission-reservation-amount reservation))
-                       (results                             (mission--supervise
-                                                             context "Mission inference"
-                                                             (lambda ()
-                                                               (when (and (typep *mission-candidate-ticket* 'mission-draft-review-claim)
-                                                                          (not (mission-draft-review-current-p *mission-candidate-ticket*)))
-                                                                 (mission--reject :review-stale "Reviewer changed before provider entry."))
-                                                               (setf dispatched-p t)
-                                                               (let ((*provider-context-admission-state* admission-state))
-                                                                 ;; Capture origin before supervision serializes the condition.
-                                                                 (handler-bind
-                                                                     ((error
-                                                                        (lambda (condition)
-                                                                          (setf local-refusal-p
-                                                                                (eq condition (rest admission-state))))))
-                                                                   (multiple-value-list (funcall function)))))))
-                       (tokens                              (rlm-usage-billable-tokens
-                                                             (provider-usage-normalize (funcall usage-function results)))))
-                 (sb-sys:without-interrupts
-                   (setf settled-p t)
-                   (mission--settle-inference context reservation tokens
-                                              :allowance allowance :originating-child originating-child))
-                 (when (and allowance
-                            (or (null tokens)
-                                (> (getf allowance :tokens-used) (getf allowance :token-limit))))
-                   (mission--reject ':review-budget "Reviewer token allowance exhausted or usage unknown."))
-                 (values-list results))
-             (error (condition)
-               (setf failure condition)
-               (let ((refusal (rest admission-state)))
-                 ;; Preserve the supervisor failure for settlement and audit.
-                 (error (if (and local-refusal-p
-                                 (eq (first admission-state) :pending)
-                                 (typep refusal 'provider-context-budget-error)
-                                 (typep condition 'mission-error)
-                                 (eq (mission-error-reason condition) :failed))
-                            refusal
-                            condition))))))
-      (when (and reservation (not settled-p))
-        (sb-sys:without-interrupts
-          (setf settled-p t)
-          (mission--settle-inference
-           context reservation
-           (if (or (not dispatched-p)
-                   (and local-refusal-p (eq (first admission-state) :pending)))
-               0
-               nil)
-           :allowance         allowance
-           :originating-child originating-child
-           :failure           (or failure "Inference interrupted before usage settlement.")))))))
+  (execution-lease-accounting-call (lambda ()
+                                    (let* ((*mission-candidate-request-id* (make-identifier))
+                                           (originating-child
+                                            (and (typep *mission-admitted-operation* 'task-job)
+                                                 (eq (task-job-mission-context *mission-admitted-operation*) context)
+                                                 *mission-admitted-operation*))
+                                           (reservation                    nil)
+                                           (dispatched-p                   nil)
+                                           (admission-state                (list :pending))
+                                           (local-refusal-p                nil)
+                                           (settled-p                      nil)
+                                           (failure                        nil))
+                                      (unwind-protect
+                                           (progn
+                                             (mission-exhaustion--admitting
+                                              context (lambda ()
+                                                        (sb-sys:without-interrupts
+                                                          (setf reservation (mission--reserve-inference context :allowance allowance)))))
+                                             (handler-case
+                                                  (let* ((*provider-mission-output-allowance* (mission-reservation-amount reservation))
+                                                         (results                             (mission--supervise
+                                                                                               context "Mission inference"
+                                                                                               (lambda ()
+                                                                                                 (when (and (typep *mission-candidate-ticket* 'mission-draft-review-claim)
+                                                                                                            (not (mission-draft-review-current-p *mission-candidate-ticket*)))
+                                                                                                   (mission--reject :review-stale "Reviewer changed before provider entry."))
+                                                                                                 (setf dispatched-p t)
+                                                                                                 (let ((*provider-context-admission-state* admission-state))
+                                                                                                   ;; Capture origin before supervision serializes the condition.
+                                                                                                   (handler-bind
+                                                                                                       ((error
+                                                                                                          (lambda (condition)
+                                                                                                            (setf local-refusal-p
+                                                                                                                  (eq condition (rest admission-state))))))
+                                                                                                     (multiple-value-list (funcall function)))))))
+                                                         (tokens                              (rlm-usage-billable-tokens
+                                                                                               (provider-usage-normalize (funcall usage-function results)))))
+                                                   (sb-sys:without-interrupts
+                                                     (setf settled-p t)
+                                                     (mission--settle-inference context reservation tokens
+                                                                                :allowance allowance :originating-child originating-child))
+                                                   (when (and allowance
+                                                              (or (null tokens)
+                                                                  (> (getf allowance :tokens-used) (getf allowance :token-limit))))
+                                                     (mission--reject ':review-budget "Reviewer token allowance exhausted or usage unknown."))
+                                                   (values-list results))
+                                               (error (condition)
+                                                 (setf failure condition)
+                                                 (let ((refusal (rest admission-state)))
+                                                   ;; Preserve the supervisor failure for settlement and audit.
+                                                   (error (if (and local-refusal-p
+                                                                   (eq (first admission-state) :pending)
+                                                                   (typep refusal 'provider-context-budget-error)
+                                                                   (typep condition 'mission-error)
+                                                                   (eq (mission-error-reason condition) :failed))
+                                                              refusal
+                                                              condition))))))
+                                        (when (and reservation (not settled-p))
+                                          (sb-sys:without-interrupts
+                                            (setf settled-p t)
+                                            (mission--settle-inference
+                                             context reservation
+                                             (if (or (not dispatched-p)
+                                                     (and local-refusal-p (eq (first admission-state) :pending)))
+                                                 0
+                                                 nil)
+                                             :allowance         allowance
+                                             :originating-child originating-child
+                                             :failure           (or failure "Inference interrupted before usage settlement.")))))))))

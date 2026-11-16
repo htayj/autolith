@@ -562,7 +562,7 @@ continuation, allowing callers to hold a source lock through actual removal."
   (append
    (list (list :indicator ':status :required t
                :validate (lambda (value)
-                           (not (null (member value '(:success :failed :aborted))))))
+                           (not (null (member value '(:success :failed :aborted :suspended))))))
          (list :indicator ':request-count
                :validate  (lambda (value) (typep value '(integer 0))))
          (list :indicator ':duration-ms
@@ -583,10 +583,14 @@ continuation, allowing callers to hold a source lock through actual removal."
 (defun task--read-result-artifact
     (pathname &key (maximum-octets *task-result-maximum-octets*))
   "Read exactly one bounded, schema-checked durable child result."
-  (sexp-store:snapshot-read-record
-   pathname :grammar (task--result-grammar) :maximum-octets maximum-octets
-   :properties-p t :keyword-keys-p t :maximum-length 128
-   :fields (task--result-fields)))
+  (let ((result (sexp-store:snapshot-read-record
+                 pathname :grammar (task--result-grammar) :maximum-octets maximum-octets
+                 :properties-p t :keyword-keys-p t :maximum-length 128
+                 :fields (task--result-fields))))
+    (when (and (eq (getf result :status) ':suspended)
+               (not (task-review-required-result-p result)))
+      (error 'task-error :tool-name "job.get" :message "Invalid administrative checkpoint artifact."))
+    result))
 
 (-> task--write-result-artifact (task-job list) pathname)
 (defun task--write-result-artifact (job result)
@@ -781,18 +785,25 @@ continuation, allowing callers to hold a source lock through actual removal."
 
 (-> task-job-cancel-execution-descendants (task-job keyword) list)
 (defun task-job-cancel-execution-descendants (job reason)
-  "Cancel and join every live tool execution owned by JOB's task subtree."
-  (let ((executions
-          (job-pool-descendant-jobs
-           (task-orchestrator-execution-pool (task-job-orchestrator job))
-           (job-identifier job))))
+  "Cancel exact descendants and observe closure within their original mission caps."
+  (let* ((ledger (execution-lease-ledger-for (task-job-mission-context job)))
+         (reason (if ledger (execution-lease-cleanup-reason ledger job reason) reason))
+         (executions
+           (job-pool-descendant-jobs
+            (task-orchestrator-execution-pool (task-job-orchestrator job))
+            (job-identifier job))))
     (dolist (execution executions)
-      (job-cancel execution :reason reason :cascade-p t))
+      (if ledger
+          (execution-lease-cancel ledger execution
+                                  (execution-lease-cleanup-reason ledger execution reason))
+          (job-cancel execution :reason reason :cascade-p t)))
     (dolist (execution executions)
-      (job-await execution))
+      (if ledger
+          (execution-lease-await-closure ledger execution)
+          (job-await execution)))
     executions))
 
-(-> task-run-child (task-job) list)
+(-> task-run-child (task-job) (or list task-administrative-checkpoint))
 (defun task-run-child (job)
   "Create and run JOB's real in-process child session through terminal yield."
   (let* ((parent       (task-job-parent-agent job))
@@ -860,20 +871,23 @@ continuation, allowing callers to hold a source lock through actual removal."
     (mission-context-bind (task-job-mission-context job) conversation)
     (mission-review-bind-checkpoint (task-job-review-checkpoint job) conversation)
     (unwind-protect
-         (progn
-           (task-child-inherit-reference-history job conversation provider)
-           (let ((result
-                   (agent-run-user-turn
-                    child
-                    (getf (task-job-item job) :task)
-                    :observer     observer
-                    :goal-context (task-child-goal-context job configuration))))
-             (task--assemble-child-result
-              job :provider-result result
-                  :child           child
-                  :conversation    conversation
-                  :completion      completion)))
-      (task-job-cancel-execution-descendants job ':parent-finished)
+         (task-call-with-review-boundary
+          job conversation
+          (lambda ()
+           (progn
+            (task-child-inherit-reference-history job conversation provider)
+            (let ((result
+                    (agent-run-user-turn
+                     child
+                     (getf (task-job-item job) :task)
+                     :observer     observer
+                     :goal-context (task-child-goal-context job configuration))))
+              (task--assemble-child-result
+               job :provider-result result
+                   :child           child
+                   :conversation    conversation
+                   :completion      completion)))))
+      (task-job-cancel-execution-descendants job (or (job-cancellation-reason job) ':parent-finished))
       ; mallet:suppress no-ignore-errors -- best-effort release must not mask the child result
       (ignore-errors (task-completion-release child))
       ; mallet:suppress no-ignore-errors -- best-effort release must not mask the child result

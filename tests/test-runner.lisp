@@ -15,6 +15,23 @@
                      (test-selection-error-selector condition))))
   (:documentation "A test selection names no registered suite or case."))
 
+(-> test-call-with-case-identifiers (function) t)
+(defun test-call-with-case-identifiers (function)
+  "Call FUNCTION with an independent case's process-wide identifier namespaces.
+
+All allocations in the case, including worker threads, share the same mapping.
+Keep reservations and collision checks inside each namespace intact. Restore the
+production allocator on every exit; explicit allocator fixtures may override it."
+  (let ((allocator (symbol-function 'make-user-identifier))
+        (scope     (make-identifier)))
+    (test-call-with-function-replacements
+     (list (list 'make-user-identifier
+                 (lambda (&key (namespace "autolith") occupied-p)
+                   (funcall allocator
+                            :namespace  (format nil "test-case/~A/~A" scope namespace)
+                            :occupied-p occupied-p))))
+     function)))
+
 (defmacro define-test-suite (name &body cases)
   "Register NAME and CASES in FiveAM and the command-line catalog.
 
@@ -33,7 +50,7 @@ Reloading a suite replaces its registration without duplicating cases."
                                   (lambda (context) (declare (ignore context)) nil)))
                             (with-test-environment (("AUTOLITH_TELEMETRY" "off"))
                               (unwind-protect
-                                   (,name)
+                                     (test-call-with-case-identifiers #',name)
                                 (task-tests--close-orchestrators))))))
        (setf *test-suites*
              (append (remove ,label *test-suites* :key #'first :test #'string=)

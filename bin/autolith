@@ -203,6 +203,8 @@ run_recovery()
 
 active_image_valid()
 {
+  # Source-only image records cannot authenticate an explicit external selection.
+  [[ -z "${AUTOLITH_DEPENDENCY_SELECTION:-}" ]] || return 1
   [[ -f "$active_core" && -f "$active_manifest" ]] &&
      grep -Eq '^\(:SBCL-GENERATIONS-IMAGE-MANIFEST :VERSION 1([[:space:]]|$)' "$active_manifest" &&
      "$sbcl_command" --noinform --core "$active_core" \
@@ -288,7 +290,8 @@ offer_bootstrap()
 run_active()
 {
   export AUTOLITH_SOURCE_ROOT="$source_root"
-  if [[ "$from_source_requested" == true ]]; then
+  if [[ "$from_source_requested" == true ||
+        -n "${AUTOLITH_DEPENDENCY_SELECTION:-}" ]]; then
     run_active_source "$@"
   elif active_image_valid; then
     run_active_core "$@"

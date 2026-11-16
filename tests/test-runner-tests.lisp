@@ -2,6 +2,62 @@
 
 ;;;; -- Test Runner Behavior --
 
+(-> test-runner-case-identifiers () null)
+(defun test-runner-case-identifiers ()
+  "Keep capacity and cross-thread reservations local to each independent case."
+  (let ((production  (symbol-function 'make-user-identifier))
+        (allocations nil)
+        (scopes      nil))
+    (unwind-protect
+         (test-call-with-function-replacements
+          (list (list 'make-user-identifier
+                      (lambda (&key (namespace "autolith") occupied-p)
+                        (let ((identifier (identifier-generate
+                                           :timestamp 3994000000 :namespace namespace
+                                           :occupied-p occupied-p)))
+                          (push (cons namespace identifier) allocations)
+                          identifier))))
+          (lambda ()
+            (let ((fixed (symbol-function 'make-user-identifier)))
+              (dotimes (case-index 2)
+                (declare (ignorable case-index))
+                (test-call-with-case-identifiers
+                 (lambda ()
+                   (let ((identifiers (loop repeat 57 collect (make-user-identifier))))
+                     (push (first (first allocations)) scopes)
+                     (push (join-thread
+                            (make-thread #'make-user-identifier
+                                         :name "case identifier reservation"))
+                           identifiers)
+                     (test-assert (= 58 (length (remove-duplicates identifiers :test #'string=)))
+                                  "one case reserves every seed across its worker threads")
+                     (test-assert
+                      (handler-case (progn (make-user-identifier) nil)
+                        (identifier-space-exhausted () t))
+                      "case isolation does not increase per-second namespace capacity")
+                     (test-assert
+                      (handler-case
+                          (progn (make-user-identifier :namespace  "occupied"
+                                                       :occupied-p (constantly t)) nil)
+                        (identifier-space-exhausted () t))
+                      "the fixture preserves caller collision checks"))))
+                (test-assert (eq fixed (symbol-function 'make-user-identifier))
+                             "normal return restores the enclosing allocator"))
+              (test-assert (not (string= (first scopes) (second scopes)))
+                           "independent cases do not share reservations")
+              (test-assert
+               (eq :escaped (catch 'identifier-case-exit
+                              (test-call-with-case-identifiers
+                               (lambda () (throw 'identifier-case-exit :escaped)))))
+               "nonlocal case exit preserves the original result")
+              (test-assert (eq fixed (symbol-function 'make-user-identifier))
+                           "nonlocal exit restores the enclosing allocator"))))
+      (dolist (allocation allocations)
+        (idsmall:identifier-release (rest allocation) :namespace (first allocation))))
+    (test-assert (eq production (symbol-function 'make-user-identifier))
+                 "fixture teardown restores the production allocator"))
+  nil)
+
 (-> test-runner-selection () null)
 (defun test-runner-selection ()
   "Test exact suite/case selection, deduplication and invalid selectors."

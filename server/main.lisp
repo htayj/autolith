@@ -8,6 +8,8 @@
     ;; mallet:suppress error-without-custom-condition -- Autolith's conditions load later
     (error "The release server needs locked dependencies; run ./script/bootstrap."))
   (load project-setup)
+  (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+  (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources source-root)
   (asdf:load-asd (merge-pathnames "autolith.asd" source-root))
   (asdf:load-system :autolith/release-server)
   (uiop:symbol-call '#:autolith '#:release-server-main))

@@ -635,6 +635,7 @@ CACHE, when supplied, belongs to one caller snapshot, including negative reads."
                                               :artifact-available-p artifact-available-p)
                  :artifact               artifact))))
     (append
+     (task-checkpoint-projection result)
      (list :id                  (getf snapshot :job-id)
            :execution-id        (getf snapshot :execution-id)
            :type                :task
@@ -829,7 +830,7 @@ Only the current primary conversation's artifact root is searched."
                 :state        (case (getf result :status)
                                 (:success
                                  ':completed)
-                                (:aborted
+                                ((:aborted :suspended)
                                  ':aborted)
                                 (otherwise
                                  ':failed))

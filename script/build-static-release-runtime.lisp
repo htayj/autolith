@@ -28,6 +28,8 @@
                (unless (probe-file setup)
                  (fail "locked dependencies are absent."))
                (load setup)
+              (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+              (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources source-root)
                (asdf:load-asd (merge-pathnames "autolith.asd" source-root))
                (asdf:load-system :autolith)
                (let ((fff-library (uiop:getenv "AUTOLITH_FFF_LIBRARY")))

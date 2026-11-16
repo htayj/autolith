@@ -367,7 +367,9 @@
                                      (task-orchestrator-live-count
                                       orchestrator))))
                                2))
-                         "a deadline publishes one timeout result and releases scheduler accounting")))
+                         (format nil "Deadline terminal: condition=~S state=~S reason=~S status=~S"
+                                 run-condition (getf snapshot :state) (getf snapshot :cancellation-reason)
+                                 (getf (getf snapshot :result) :status)))))
                  (task-tests--release-blocking-tool blocking-tool)
                  (when runner
                    (join-thread runner))

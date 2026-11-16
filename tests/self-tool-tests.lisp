@@ -2172,7 +2172,7 @@
                         "post-publication failure retains its mutation state")
            (test-assert
             (and (fboundp 'test-self-published-definition)
-                 (= (test-self-published-definition) 23))
+                 (= (funcall 'test-self-published-definition) 23))
             "post-publication failure preserves the selected live definition")
            (test-assert
             (string= (gethash target *exploratory-definitions*)

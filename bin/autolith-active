@@ -27,6 +27,8 @@
                  (unless (probe-file quicklisp-setup)
                    (error "Autolith needs Quicklisp at ~A" quicklisp-setup))
                  (load quicklisp-setup)
+                 (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+                 (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources source-root)
                  (uiop:symbol-call '#:ql '#:quickload :cffi :silent t)
                  (let ((profile-library-directory
                         (merge-pathnames ".guix-profile/lib/" (user-homedir-pathname)))

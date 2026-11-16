@@ -531,6 +531,8 @@ that start fresh Autolith processes. Private XDG roots isolate user preferences.
     (unless (probe-file setup)
       (check--fail "Locked dependencies are missing; run ./script/bootstrap."))
     (load setup)
+    (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+    (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources source-root)
     (when build-sandbox
       (load (merge-pathnames "script/build-sandbox.lisp" source-root)))
     (uiop:symbol-call '#:ql '#:quickload :cffi :silent t)

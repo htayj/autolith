@@ -14,6 +14,7 @@
       (and (equal (getf notice :owner-conversation)
                   (conversation-identifier (application-conversation application)))
            (eq (getf notice :completion-policy) ':continue)
+           (not (eq (getf notice :outcome) ':review-required))
            (cond
              (mission-id
               (and (mission-goal-p goal)

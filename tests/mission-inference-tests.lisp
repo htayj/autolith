@@ -1027,10 +1027,10 @@
                    (*provider-maximum-output-tokens* 10))
                (cond
                  ((eq mode ':unproven)
-                  ;; A defensive legacy fixture, not native unlimited admission.
-                  (setf (getf goal :requests-outstanding) 1)
-                  (uiop:symbol-call
-                   :autolith :mission--settle-inference context 0 nil :originating-child child))
+                  ;; A real request without an admitted child retains ordinary
+                  ;; unbounded uncertainty. An integer cannot stand in for a host handle.
+                  (let ((*mission-admitted-operation* nil))
+                    (mission--account-inference context (lambda () (json-object)) #'first)))
                  (t
                   (dotimes (index (if (eq mode ':multiple) 2 1))
                     (declare (ignorable index))
@@ -1066,7 +1066,10 @@
                (test-assert (= (if (member mode '(:unproven :existing-unknown)) 1 0)
                                (getf goal :unknown-usage))
                             "existing and unproven UNKNOWN are not erased by bounded settlement")
-               (test-assert (= (if (eq mode ':multiple) 2 1) (mission-task-job-unknown-usage child))
+               (test-assert (= (case mode (:unproven
+                                           0) (:multiple
+                                               2) (otherwise
+                                                   1)) (mission-task-job-unknown-usage child))
                             "multiple requests accumulate only on their actual originating child")
                (when allowance
                  (test-assert (and (= 10 (getf allowance :tokens-used))
@@ -1079,7 +1082,9 @@
                  (test-assert (eq ':cancelled (getf goal :status))
                               "settlement never reactivates an explicit terminal state"))
                (let ((expected (case mode
-                                 ((:unproven :existing-unknown)
+                                 (:unproven
+                                  ':blocked)
+                                 (:existing-unknown
                                   ':mission-usage-quarantine)
                                  (:exact-limit
                                   ':exhausted)
@@ -1093,8 +1098,9 @@
                    (test-assert
                     (handler-case
                         (progn
-                          (mission--account-inference
-                           context (lambda () (incf calls) (json-object)) #'first :allowance allowance)
+                          (let ((*mission-admitted-operation* (unless (eq mode ':unproven) child)))
+                            (mission--account-inference
+                             context (lambda () (incf calls) (json-object)) #'first :allowance allowance))
                           nil)
                       (mission-error (condition)
                         (eq expected (mission-error-reason condition))))

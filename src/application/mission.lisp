@@ -4,6 +4,9 @@
 
 (defparameter *mission-candidate-request-id* nil "Exact candidate operation identity captured by the accounting owner.")
 
+(defparameter *mission-candidate-policy-audit* nil
+  "Optional original candidate audit failure after confirmed durable publication.")
+
 ;;;; -- Verified Session Goals --
 
 (defparameter *mission-operation-milliseconds* 900000
@@ -21,8 +24,30 @@
 (defvar *mission-contexts-lock* (make-lock "Mission identities")
   "Lock protecting mission context identity associations.")
 
+(defvar *mission-attach-lock* (make-lock "Mission replacement")
+  "Serialize registry cutovers without taking the registry lock before old state locks.")
+
+(defparameter *mission-accounting-keys*
+  '(:turns-used :tokens-used :tokens-reserved :requests-outstanding
+    :reservation-charged-tokens :unknown-usage :unknown-usage-by-child
+    :reservation-charges-by-child)
+  "Mutable accounting fields retained independently after generation replacement.")
+
 (defclass mission-context ()
-  ((application :initarg :application :reader mission-context-application
+  ((lease-ledger :initform nil :accessor mission-context-lease-ledger
+                 :documentation "Host-owned execution ancestry and original-cap guardian.")
+   (accounting-generation :initform (make-identifier) :reader mission-context-accounting-generation
+                          :documentation "Original request generation, shared with the execution ledger.")
+   (accounting-snapshot :initform nil :accessor mission-context-accounting-snapshot
+                        :documentation "Detached original accounting after displacement, never an operational goal.")
+   (accounting-allowances :initform (make-hash-table :test #'eq) :reader mission-context-accounting-allowances
+                          :documentation "Exact allowance identities and independently detached accounting routes.")
+   (accounting-requests :initform      (make-hash-table :test #'equal)
+                        :reader        mission-context-accounting-requests
+                        :documentation "Original-generation controller ownership of pending request and audit payloads.")
+   (accounting-opening :initform nil :accessor mission-context-accounting-opening
+                       :documentation "Conservative as-of-cutover snapshot with old pending attribution.")
+   (application :initarg :application :reader mission-context-application
                 :documentation "Application owning the durable goal.")
    (goal :initarg :goal :accessor mission-context-goal
          :documentation "Exact goal identity, including after replacement.")
@@ -38,6 +63,8 @@
                         :accessor      mission-context-transition-revision
                         :type          unsigned-byte
                         :documentation "Orders terminal notice publication against later transitions.")
+   (evaluation-observation :initform nil :accessor mission-context-evaluation-observation
+                           :documentation "Ephemeral reviewer identity and original cause, never persisted as an object.")
    (evaluation-lock :initform      (make-lock "Mission exhaustion evaluation")
                     :reader        mission-context-evaluation-lock
                     :documentation "Serializes independent exhaustion evaluations.")
@@ -112,15 +139,87 @@
       (nconc allowance (list key 0))))
   nil)
 
+(-> mission--accounting-values (list) list)
+(defun mission--accounting-values (goal)
+  "Copy only accounting values, including independently owned attribution maps."
+  (loop for key in *mission-accounting-keys*
+        append (list key (copy-tree (getf goal key)))))
+
+(-> mission--accounting-goal (mission-context) list)
+(defun mission--accounting-goal (context)
+  "Read the original generation's accounting route under its state lock."
+  (or (mission-context-accounting-snapshot context) (mission-context-goal context)))
+
+(-> mission--accounting-evidence-values (list) list)
+(defun mission--accounting-evidence-values (values)
+  "Copy accounting for durable evidence, encoding unknown-child counts as (ID COUNT).
+Native attribution alists retain dotted counts. Evidence readers consume proper
+lists; empty maps and the other accounting values keep their existing shape."
+  (let ((copy (copy-tree values)))
+    (when (getf copy :unknown-usage-by-child)
+      (setf (getf copy :unknown-usage-by-child)
+            (loop for (identifier . count) in (getf copy :unknown-usage-by-child)
+                  collect (list identifier count))))
+    copy))
+
+(-> mission--accounting-report (mission-context) list)
+(defun mission--accounting-report (context)
+  "Copy original accounting as proper-list durable evidence under its state lock."
+  (with-recursive-lock-held ((mission-context-lock context))
+    (let ((opening (copy-tree (mission-context-accounting-opening context))))
+      (when (getf opening :old-pending)
+        (setf (getf opening :old-pending)
+              (mission--accounting-evidence-values (getf opening :old-pending))))
+      (list :generation (mission-context-accounting-generation context)
+            :snapshot   (mission--accounting-evidence-values
+                         (mission--accounting-values (mission--accounting-goal context)))
+            :opening    opening))))
+
+(-> mission--registered-p (mission-context) boolean)
+(defun mission--registered-p (context)
+  "Check exact current identity, including terminal contexts, without granting execution."
+  (let ((application (mission-context-application context)))
+    (and (not (mission-context-accounting-snapshot context))
+         (eq (mission-context-goal context) (application-goal application))
+         (with-lock-held (*mission-contexts-lock*)
+           (eq context (gethash (or (mission-context-conversation context)
+                                   (application-conversation application))
+                               *mission-contexts*))))))
+
 (-> mission--attach (application) (option mission-context))
 (defun mission--attach (application)
-  "Register synchronization for APPLICATION's current durable mission."
+  "Detach original accounting before publishing a successor, then revoke old execution."
   (let ((goal (application-goal application)))
     (when (mission-goal-p goal)
-      (let ((context (make-instance 'mission-context :application application :goal goal)))
-        (with-lock-held (*mission-contexts-lock*)
-          (setf (gethash (application-configuration application) *mission-contexts*) context
-                (gethash (application-conversation application) *mission-contexts*) context))
+      (unless (getf goal :completion-id)
+        (nconc goal (list :completion-id (make-identifier))))
+      (let ((context  (make-instance 'mission-context :application application :goal goal
+                                    :conversation (application-conversation application)))
+            (previous nil))
+        (with-lock-held (*mission-attach-lock*)
+          (with-lock-held (*mission-contexts-lock*)
+            (setf previous (remove-duplicates
+                            (remove nil (list (gethash (application-configuration application) *mission-contexts*)
+                                              (gethash (application-conversation application) *mission-contexts*)))
+                            :test #'eq)))
+          (dolist (old previous)
+            (with-recursive-lock-held ((mission-context-request-lock old))
+              (with-recursive-lock-held ((mission-context-lock old))
+                (unless (or (mission-context-origin-owner old) (mission-context-accounting-snapshot old))
+                  (setf (mission-context-accounting-snapshot old)
+                        (mission--accounting-values (mission-context-goal old)))
+                  (maphash (lambda (identity route)
+                             (setf (gethash identity (mission-context-accounting-allowances old))
+                                   (copy-tree route)))
+                           (mission-context-accounting-allowances old)))
+                (when (eq goal (mission-context-goal old))
+                  (setf (mission-context-accounting-opening context)
+                        (list :kind ':as-of-cutover :generation (mission-context-accounting-generation old)
+                              :old-pending (mission--accounting-values goal)))))))
+          (with-lock-held (*mission-contexts-lock*)
+            (setf (gethash (application-configuration application) *mission-contexts*) context
+                  (gethash (application-conversation application) *mission-contexts*) context)))
+        (dolist (old previous) (execution-lease-revoke-context old ':replaced))
         context))))
 
 (-> mission--record (mission-context) null)
@@ -157,8 +256,16 @@
               (setf (first *mission-candidate-policy-audit*) condition)
               (error condition)))))
       ((eq goal (application-goal application))
-       (with-recursive-lock-held ((conversation-append-lock conversation))
-         (conversation-append-record conversation (cons :goal (copy-tree goal)))))))
+       ;; The same state lock spans this check and append, and replacement takes it
+       ;; before detaching. Never wait for a state lock while holding the registry.
+       (with-recursive-lock-held ((mission-context-lock context))
+         (when (mission--registered-p context)
+           (with-recursive-lock-held ((conversation-append-lock conversation))
+            (let ((snapshot (copy-tree goal)))
+              (when (mission-context-accounting-opening context)
+                (setf (getf snapshot :accounting-opening)
+                      (copy-tree (mission-context-accounting-opening context))))
+              (conversation-append-record conversation (cons :goal snapshot)))))))))
   nil)
 
 (-> mission--evidence (mission-context keyword t) null)
@@ -173,10 +280,10 @@
   nil)
 
 (-> mission--attribute-child-unknown
-    (mission-context task-job &key (:reservation (option (integer 1)))) null)
-(defun mission--attribute-child-unknown (context child &key reservation)
-  "Audit one logical UNKNOWN and optional reservation charge under the mission lock."
-  (let ((goal (mission-context-goal context)))
+    (mission-context task-job &key (:reservation (option (integer 1))) (:goal list)) null)
+(defun mission--attribute-child-unknown (context child &key reservation (goal (mission-context-goal context)))
+  "Audit one logical UNKNOWN and optional reservation charge under the original state lock."
+  (let ((goal goal))
     (dolist (key '(:unknown-usage-by-child :reservation-charges-by-child))
       (unless (nth-value 2 (get-properties goal (list key)))
         (nconc goal (list key nil))))
@@ -209,7 +316,7 @@
                      :reservation-charge-requests (getf charge :requests 0)))))
       (if context
           (with-recursive-lock-held ((mission-context-lock context))
-            (summary (mission-context-goal context)))
+            (summary (mission--accounting-goal context)))
           (summary nil)))))
 
 (-> mission-task-job-unknown-usage (task-job) unsigned-byte)
@@ -265,7 +372,11 @@
                 (remove-if (lambda (job)
                              (eq (gethash job (mission-context-threads context)) (current-thread)))
                            (copy-list (mission-context-jobs context))))))
-        (dolist (job jobs) (job-cancel job :reason status))))
+        (dolist (job jobs)
+          (let ((ledger (mission-context-lease-ledger context)))
+            (if ledger
+                (execution-lease-cancel ledger job status)
+                (job-cancel job :reason status))))))
     (with-recursive-lock-held ((mission-context-lock context))
       (let ((goal (mission-context-goal context)))
         (when (and (eq goal (application-goal (mission-context-application context)))
@@ -302,6 +413,7 @@
 (defun mission--admit (context &key (inference-p t) new-work-p)
   "Admit work in an active mission or let an admitted child finish during quarantine.
 NEW-WORK-P requires an active mission. Hard budgets apply to both paths."
+  (mission-lease-check-admission context)
   (let* ((goal        (mission-context-goal context))
          (application (mission-context-application context)))
     (if (getf goal :candidate-id)
@@ -320,6 +432,7 @@ NEW-WORK-P requires an active mission. Hard budgets apply to both paths."
 (-> mission--admit-budget (mission-context &key (:inference-p boolean) (:new-work-p boolean)) null)
 (defun mission--admit-budget (context &key (inference-p t) new-work-p)
   "Apply the same finite budget and settling policy after exact slot authorization."
+  (mission-lease-check-admission context)
   (let ((goal (mission-context-goal context)))
     (when (and (or (eq (getf goal :status) ':active) (getf goal :candidate-id))
                (mission--unknown-usage-blocks-p goal)
@@ -351,23 +464,33 @@ NEW-WORK-P requires an active mission. Hard budgets apply to both paths."
   "Run FUNCTION inline through cl-jobpond within the mission's remaining time,
 preserving the calling thread's provider bindings and authorization callbacks."
   (mission-exhaustion--admitting context (lambda () (mission--admit context :inference-p nil)))
-  (let* ((terminal-condition nil)
+  (let* ((operation          (or *tool-execution-current-job* *mission-admitted-operation*))
+         (ticket             (execution-lease-ticket-create context :operation operation))
+         (terminal-condition nil)
          (evaluated-p        (eq (mission-exhaustion--policy context) :evaluate))
          (milliseconds       (if evaluated-p *mission-operation-milliseconds*
                                  (mission--remaining-milliseconds context)))
-         (pool               (make-job-pool :name name :maximum-concurrency 1
+         (pool               (make-job-pool :name                name
+                                            :job-class           (if (and (typep operation 'tool-execution-job)
+                                                                          (string= (tool-execution-job-tool-name operation) "shell.run"))
+                                                                     'execution-lease-cooperative-inline-job
+                                                                     'execution-lease-inline-job)
+                                            :maximum-concurrency 1
                                             :maximum-batch-size 1 :maximum-live-jobs 1
                                             :maximum-runtime-milliseconds
                                             (max 1 (if timeout (min milliseconds timeout) milliseconds))
                                             :terminal-retention-limit 1 :start-threads-p nil))
          (job                (first (job-pool-submit-batch
                                      pool (list (list :name name :inline-only-p t
-                                                      :function (lambda (job)
-                                                                  (job-check-cancellation job)
-                                                                  (handler-case (funcall function)
-                                                                    (serious-condition (condition)
-                                                                      (setf terminal-condition condition)
-                                                                      (error condition))))))))))
+                                                       :initargs (list :lease-ticket ticket)
+                                                      :function  (lambda (job)
+                                                                   (job-check-cancellation job)
+                                                                   (execution-lease-call ticket job
+                                                                      (lambda ()
+                                                                       (handler-case (funcall function)
+                                                                        (serious-condition (condition)
+                                                                          (setf terminal-condition condition)
+                                                                          (error condition))))))))))))
     (unwind-protect
          (progn
            (mission-exhaustion--admitting
@@ -386,11 +509,18 @@ preserving the calling thread's provider bindings and authorization callbacks."
               ((eq (getf snapshot :state) ':completed)
                (getf snapshot :result))
               ((eq (getf snapshot :cancellation-reason) ':timeout)
+               (let ((ledger (mission-context-lease-ledger context)))
+                 (when (and ledger operation) (execution-lease-cancel ledger operation ':timeout)))
                (if (and timeout (< timeout milliseconds))
                    (mission--reject ':gate-timeout "Gate execution reached its deadline.")
                    (progn
                      (when evaluated-p
-                       (mission--reject :operation-timeout "Mission operation reached its per-operation cap."))
+                        ;; A containing task must observe cancellation even if
+                        ;; its guardian has not interrupted this return path.
+                        (when (typep operation 'session-job)
+                          (error 'job-aborted :identifier (job-identifier operation) :reason ':timeout
+                                              :message "Mission operation reached its per-operation cap."))
+                        (mission--reject :operation-timeout "Mission operation reached its per-operation cap."))
                      (mission--transition context ':exhausted "Mission operation reached its wall-clock deadline.")
                      (mission--reject ':exhausted "Mission operation reached its deadline."))))
               (t
@@ -943,6 +1073,8 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
   (when (mission-goal-p (application-goal application))
     (when (member (getf (application-goal application) :status) '(:active :paused :blocked))
       (application-mission-stop application ':cancelled "User cleared or replaced the mission goal."))
+    (let ((context (mission-context-find (application-conversation application))))
+      (when context (execution-lease-revoke-context context ':replaced)))
     (with-lock-held (*mission-contexts-lock*)
       (remhash (application-configuration application) *mission-contexts*)
       (remhash (application-conversation application) *mission-contexts*)))
@@ -1031,25 +1163,22 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
 
 (-> mission-task-job-run (task-job) t)
 (defun mission-task-job-run (job)
-  "Run a child using the exact mission and absolute deadline captured at admission."
-  (let* ((context                      (task-job-mission-context job))
-         (*mission-admitted-operation* job)
-         (*mission-candidate-ticket*   (and context (mission-context-candidate-ticket context))))
-    (if context
-        (progn
-          (mission-exhaustion--admitting
-           context (lambda () (mission--admit context :inference-p nil :new-work-p t)))
-          (let ((*mission-admitted-operation* job))
-            (mission--supervise context "Mission child" (lambda () (task-job--run job)))))
-        (task-job--run job))))
+  "Enter the exact queued task before constructing its private mission scope."
+  (execution-lease-call
+   (session-job-lease-ticket job) job
+   (lambda ()
+     (let* ((context                      (task-job-mission-context job))
+            (*mission-admitted-operation* job)
+            (*mission-candidate-ticket*   (and context (mission-context-candidate-ticket context))))
+       (if context
+           (mission--supervise context "Mission child" (lambda () (task-job--run job)))
+           (task-job--run job))))))
 
 (defmethod initialize-instance :after ((job session-job) &key mission-context review-claim &allow-other-keys)
   "Capture exact mission identity before a session job can enter its worker queue."
+  (execution-lease-associate (session-job-lease-ticket job) job)
   (mission-context-bind mission-context job)
   (when review-claim (mission-draft-review-bind-job job review-claim)))
-
-(defparameter *mission-candidate-policy-audit* nil
-  "Optional original candidate audit failure after confirmed durable publication.")
 
 (defclass mission-draft-ticket ()
   ((context :initarg :context :reader mission-draft-ticket-context

@@ -792,34 +792,35 @@ handed rather than storing a second copy."
     (let ((progress (task-job-progress job)))
       (with-lock-held ((task-progress-lock progress))
         (let ((now (or ended-at (get-internal-real-time))))
-          (list :id                   (job-identifier job)
-                :agent                agent-name
-                :status               (task-progress-status progress)
-                :provider-connections (copy-tree (task-progress-provider-connections progress))
-                :current-tool         (task-progress-current-tool progress)
-                :current-tool-duration-ms
-                (and (task-progress-current-tool-started-at progress)
-                     (task--milliseconds-between
-                      (task-progress-current-tool-started-at progress)
-                      now))
-                :recent-tools
-                (coerce (deque->vector (task-progress-recent-tools progress)) 'list)
-                :recent-output        (copy-seq (task-progress-output-tail progress))
-                :request-count        (task-progress-request-count progress)
-                :usage                (task-progress--usage-summary (task-progress-usage progress))
-                :duration-ms
-                (and (task-progress-started-at progress)
-                     (task--milliseconds-between
-                      (task-progress-started-at progress)
-                      now))
-                :model
-                (or (getf result :model)
-                    (and parent
-                         definition
-                         (config :model
-                          (task-configuration-for-definition
-                           (agent-configuration parent)
-                           definition))))))))))
+          (append (task-checkpoint-projection result)
+                  (list :id              (job-identifier job)
+                   :agent                agent-name
+                   :status               (task-progress-status progress)
+                   :provider-connections (copy-tree (task-progress-provider-connections progress))
+                   :current-tool         (task-progress-current-tool progress)
+                   :current-tool-duration-ms
+                   (and (task-progress-current-tool-started-at progress)
+                        (task--milliseconds-between
+                         (task-progress-current-tool-started-at progress)
+                         now))
+                   :recent-tools
+                   (coerce (deque->vector (task-progress-recent-tools progress)) 'list)
+                   :recent-output        (copy-seq (task-progress-output-tail progress))
+                   :request-count        (task-progress-request-count progress)
+                   :usage                (task-progress--usage-summary (task-progress-usage progress))
+                   :duration-ms
+                   (and (task-progress-started-at progress)
+                        (task--milliseconds-between
+                         (task-progress-started-at progress)
+                         now))
+                   :model
+                   (or (getf result :model)
+                       (and parent
+                            definition
+                            (config :model
+                             (task-configuration-for-definition
+                              (agent-configuration parent)
+                              definition)))))))))))
 
 (-> task-progress-snapshot (task-job) list)
 (defun task-progress-snapshot (job)
