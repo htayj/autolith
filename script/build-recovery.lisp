@@ -59,6 +59,7 @@
                                   "recovery/runtime.lisp"
                                   "script/trace-context.lisp"
                                   "recovery/launcher.lisp"
+                                  "recovery/bootstrap.lisp"
                                   "bin/autolith"
                                   "bin/autolith-active"
                                   "bin/autolith-runtime"
@@ -87,6 +88,7 @@
                        :runtime-requirement-blob    (file-identity "script/runtime-requirement.lisp")
                        :windows-stat-blob           (file-identity "script/windows-stat.lisp")
                        :source-launcher-blob        (file-identity "recovery/launcher.lisp")
+                       :bootstrap-source-blob       (file-identity "recovery/bootstrap.lisp")
                        :stable-launcher-blob        (file-identity "bin/autolith")
                        :active-source-launcher-blob (file-identity "bin/autolith-active")
                        :runtime-adapter-blob        (file-identity "bin/autolith-runtime")

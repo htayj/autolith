@@ -5,6 +5,209 @@
     (load (merge-pathnames "recovery/runtime.lisp"
                            (asdf:system-source-directory :autolith)))))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (load (merge-pathnames "recovery/bootstrap.lisp"
+                         (asdf:system-source-directory :autolith))))
+
+;;;; -- Offline Bootstrap Tests --
+
+(defvar *recovery-bootstrap-test-cause* nil
+  "Dynamically scoped initiating condition in genuine ASDF source fixtures.")
+
+(-> test-recovery-bootstrap-selection () null)
+(defun test-recovery-bootstrap-selection ()
+  "Select explicit setup authority without touching an unused local setup."
+  (test-call-with-temporary-root
+   (lambda (root)
+    (let* ((home (merge-pathnames "home/" root))
+           (project (merge-pathnames ".qlot/setup.lisp" root))
+           (user (merge-pathnames "quicklisp/setup.lisp" home))
+           (explicit (merge-pathnames "packaged/setup.lisp" root)))
+      (test-assert (null (cl-user::recovery-bootstrap--setup root :override nil :home home))
+                   "No setup leaves dependency discovery to offline ASDF.")
+      (recovery-tests--write-form user '(values))
+      (test-assert (equal user (cl-user::recovery-bootstrap--setup root :override "" :home home))
+                   "An empty override permits user setup when the project setup is absent.")
+      (recovery-tests--write-form project '(error "Unused local setup was loaded."))
+      (recovery-tests--write-form explicit '(values))
+      (dolist (override (list nil ""))
+        (test-assert (equal project (cl-user::recovery-bootstrap--setup root :override override :home home))
+                     "Project setup precedes user setup when no override is supplied."))
+      (test-assert (equal explicit (cl-user::recovery-bootstrap--setup
+                                   root :override (namestring explicit) :home home))
+                   "An explicit usable setup precedes the project setup.")
+      (dolist (invalid (list (namestring (merge-pathnames "missing.lisp" root))
+                            (namestring home)))
+        (let ((failure
+                (handler-case
+                    (cl-user::recovery-bootstrap--setup root :override invalid :home home)
+                  (cl-user::recovery-bootstrap-error (condition) condition))))
+          (test-assert (typep failure 'cl-user::recovery-bootstrap-error)
+                       "An invalid explicit authority cannot fall through.")
+          (test-assert (eq ':setup-selection (cl-user::recovery-bootstrap-error-phase failure))
+                       "Invalid setup selection has a typed phase.")
+          (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'file-error)
+                       "Selection retains the original file condition."))))))
+  nil)
+
+(-> test-recovery-bootstrap-setup-error () null)
+(defun test-recovery-bootstrap-setup-error ()
+  "Preserve a real setup reader error before any dependency/runtime loading."
+  (test-call-with-temporary-root
+   (lambda (root)
+    (let ((setup (merge-pathnames "malformed.lisp" root)))
+      (with-open-file (stream setup :direction ':output :if-exists ':error)
+        (write-string "(" stream))
+      (let ((failure
+              (handler-case
+                  (cl-user::recovery-bootstrap root :override (namestring setup) :home root)
+                (cl-user::recovery-bootstrap-error (condition) condition))))
+        (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'error)
+                     "The actual setup LOAD condition is retained.")
+        (test-assert (eq ':setup-load (cl-user::recovery-bootstrap-error-phase failure))
+                     "A malformed setup is not classified as library absence.")))))
+  nil)
+
+(-> test-recovery-bootstrap-offline-errors () null)
+(defun test-recovery-bootstrap-offline-errors ()
+  "Use genuine ASDF absence and failing source loads, with scoped registry state."
+  (test-call-with-temporary-root
+   (lambda (root)
+    (let ((asdf:*central-registry* nil)
+          (asdf:*system-definition-search-functions*
+            '(asdf/system-registry:sysdef-source-registry-search))
+          (asdf/source-registry:*source-registry* (make-hash-table :test 'equal))
+          (asdf/source-registry:*source-registry-parameter*
+            '(:source-registry :ignore-inherited-configuration)))
+      (let ((failure
+              (handler-case (cl-user::recovery-bootstrap--load-dependency
+                             "autolith-recovery-intentionally-unavailable-721")
+                (cl-user::recovery-bootstrap-error (condition) condition))))
+        (test-assert (eq ':missing-dependency (cl-user::recovery-bootstrap-error-phase failure))
+                     "An unavailable ASDF system has a distinct phase.")
+        (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'asdf:missing-component)
+                     "The genuine ASDF missing-system condition is retained."))
+      (let* ((name "autolith-recovery-bootstrap-load-fixture")
+             (asd (merge-pathnames (concatenate 'string name ".asd") root))
+             (*recovery-bootstrap-test-cause*
+               (make-condition 'file-error :pathname "recovery-bootstrap-fixture")))
+        (unwind-protect
+             (progn
+               (recovery-tests--write-form
+                asd `(asdf:defsystem ,name :components ((:file "failure"))))
+               (recovery-tests--write-form
+                (merge-pathnames "failure.lisp" root)
+                '(error (symbol-value
+                         (find-symbol "*RECOVERY-BOOTSTRAP-TEST-CAUSE*" "AUTOLITH"))))
+               (setf (gethash name asdf/source-registry:*source-registry*) asd)
+               (let ((failure
+                       (handler-case (cl-user::recovery-bootstrap--load-dependency name)
+                         (cl-user::recovery-bootstrap-error (condition) condition))))
+                 (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'file-error)
+                              "A real source component was loaded.")
+                 (test-assert (eq ':dependency-load (cl-user::recovery-bootstrap-error-phase failure))
+                              "A load failure is not treated as missing-library selection.")
+                 (test-assert (eq *recovery-bootstrap-test-cause*
+                                  (cl-user::recovery-bootstrap-error-cause failure))
+                              "The actual load condition is retained by identity.")))
+          (asdf:clear-system name))))))
+  nil)
+
+(-> test-recovery-bootstrap-state-boundaries () null)
+(defun test-recovery-bootstrap-state-boundaries ()
+  "Restore fixture state after genuine offline load success and bootstrap refusal."
+  (let ((registry asdf/source-registry:*source-registry*)
+        (central asdf:*central-registry*)
+        (output asdf/output-translations:*output-translations*)
+        (environment (uiop:getenv "AUTOLITH_PROJECT_SETUP"))
+        (standard *standard-output*)
+        (errors *error-output*))
+    (test-call-with-temporary-root
+     (lambda (root)
+       (dolist (fail-p (list nil t))
+         (test-call-with-environment
+          (list (list "AUTOLITH_PROJECT_SETUP"
+                      (if fail-p (namestring (merge-pathnames "absent-setup.lisp" root)) "")))
+          (lambda ()
+            (let ((asdf:*central-registry* nil)
+                  (asdf:*system-definition-search-functions*
+                    '(asdf/system-registry:sysdef-source-registry-search))
+                  (asdf/source-registry:*source-registry* (make-hash-table :test 'equal))
+                  (asdf/source-registry:*source-registry-parameter*
+                    '(:source-registry :ignore-inherited-configuration))
+                  (asdf/output-translations:*output-translations* nil)
+                  (asdf/output-translations:*output-translations-parameter* nil))
+              (with-output-to-string (stream)
+                (let ((*standard-output* stream)
+                      (*error-output* stream))
+                  (if fail-p
+                      (let ((failure
+                              (handler-case (cl-user::recovery-bootstrap root :home root)
+                                (cl-user::recovery-bootstrap-error (condition) condition))))
+                        (test-assert (eq ':setup-selection
+                                         (cl-user::recovery-bootstrap-error-phase failure))
+                                     "An invalid environment override gives a typed refusal."))
+                      (let* ((name "autolith-recovery-bootstrap-success-fixture")
+                             (asd (merge-pathnames (concatenate 'string name ".asd") root)))
+                        (unwind-protect
+                             (progn
+                               (recovery-tests--write-form asd `(asdf:defsystem ,name))
+                               (setf (gethash name asdf/source-registry:*source-registry*) asd)
+                               (test-assert (cl-user::recovery-bootstrap--load-dependency name)
+                                            "The actual scalar loader accepts a genuine offline ASDF system."))
+                          (asdf:clear-system name)))))))))
+         (test-assert (eq registry asdf/source-registry:*source-registry*)
+                      "The enclosing source registry is restored.")
+         (test-assert (eq central asdf:*central-registry*) "The central registry is restored.")
+         (test-assert (eq output asdf/output-translations:*output-translations*)
+                      "Output translations are restored.")
+         (test-assert (equal environment (uiop:getenv "AUTOLITH_PROJECT_SETUP"))
+                      "The setup environment is restored on both paths.")
+         (test-assert (and (eq standard *standard-output*) (eq errors *error-output*))
+                      "Output streams are restored on both paths.")))))
+  nil)
+
+(-> test-recovery-bootstrap-definition-errors () null)
+(defun test-recovery-bootstrap-definition-errors ()
+  "Distinguish genuine ASDF definition and compilation errors from absent systems."
+  (test-call-with-temporary-root
+   (lambda (root)
+     (let* ((name "autolith-recovery-bootstrap-broken-fixture")
+            (asd (merge-pathnames (concatenate 'string name ".asd") root))
+            (asdf:*central-registry* nil)
+            (asdf:*system-definition-search-functions*
+              '(asdf/system-registry:sysdef-source-registry-search))
+            (asdf/source-registry:*source-registry* (make-hash-table :test 'equal)))
+       (unwind-protect
+            (progn
+              (with-open-file (stream asd :direction ':output :if-exists ':error)
+                (write-string "(" stream))
+              (setf (gethash name asdf/source-registry:*source-registry*) asd)
+              (let ((failure
+                      (handler-case (cl-user::recovery-bootstrap--load-dependency name)
+                        (cl-user::recovery-bootstrap-error (condition) condition))))
+                (test-assert (eq ':dependency-definition
+                                 (cl-user::recovery-bootstrap-error-phase failure))
+                             "A malformed actual system definition is not library absence.")
+                (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'error)
+                             "The actual ASDF definition condition is retained."))
+              (asdf:clear-system name)
+              (recovery-tests--write-form
+               asd `(asdf:defsystem ,name :components ((:file "broken"))))
+              (recovery-tests--write-form
+               (merge-pathnames "broken.lisp" root)
+               '(defun recovery-bootstrap-intentionally-broken (value value) value))
+              (let ((failure
+                      (handler-case (cl-user::recovery-bootstrap--load-dependency name)
+                        (cl-user::recovery-bootstrap-error (condition) condition))))
+                (test-assert (eq ':dependency-load (cl-user::recovery-bootstrap-error-phase failure))
+                             "A genuine component compile failure cannot trigger another setup.")
+                (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure)
+                                   'uiop/lisp-build:compile-file-error)
+                             "The initiating ASDF compile failure is retained.")))
+         (asdf:clear-system name)))))
+  nil)
+
 ;;;; -- Recovery Runtime Tests --
 
 (-> test-recovery-launcher-trace-context () null)

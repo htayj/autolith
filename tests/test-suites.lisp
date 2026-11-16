@@ -1299,6 +1299,11 @@
   test-image-commit-replay-probe)
 
 (define-test-suite recovery
+  test-recovery-bootstrap-selection
+  test-recovery-bootstrap-setup-error
+  test-recovery-bootstrap-offline-errors
+  test-recovery-bootstrap-state-boundaries
+  test-recovery-bootstrap-definition-errors
   test-recovery-launcher-trace-context
   test-recovery-object-store-copy
   test-recovery-xdg-directories
