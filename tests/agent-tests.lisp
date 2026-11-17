@@ -3203,3 +3203,604 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
             "the expansion is journaled once as a durable provider item"))
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
   nil)
+
+
+;;;; -- Completion Snapshot Baseline --
+
+(defclass agent-test-completion-result (tool-result)
+  ((reads :initform 0 :accessor agent-test-completion-result-reads
+          :documentation "Number of details snapshots requested.")
+   (threads :initform nil :accessor agent-test-completion-result-threads
+            :documentation "Threads requesting the owned test details.")
+   (payload :initarg :payload :reader agent-test-completion-result-payload
+            :documentation "Small tagged details returned by identity."))
+  (:documentation "An owned result with observable generic details access."))
+
+(defmethod tool-result-details ((result agent-test-completion-result))
+  "Count snapshots of the test-owned payload without changing it."
+  (incf (agent-test-completion-result-reads result))
+  (push (current-thread) (agent-test-completion-result-threads result))
+  (agent-test-completion-result-payload result))
+
+(defclass agent-test-completion-tool (tool)
+  ((results :initarg :results :reader agent-test-completion-tool-results
+            :documentation "Results indexed by each registered call.")
+   (next :initarg :next :accessor agent-test-completion-tool-next
+         :documentation "Next permitted finish index, counting down.")
+   (lock :initform      (make-lock "Completion fixture")
+         :reader        agent-test-completion-tool-lock
+         :documentation "Protects finish order.")
+   (conditions :initarg :conditions :reader agent-test-completion-tool-conditions
+               :documentation "One condition variable for each finish index.")
+   (finished :initform nil :accessor agent-test-completion-tool-finished
+             :documentation "Reverse chronological finish indices."))
+  (:documentation "A real registry tool with barrier-controlled return order."))
+
+(defmethod tool-execute ((tool agent-test-completion-tool)
+                         (context tool-context) (arguments hash-table))
+  "Return the indexed result after its successor finishes, without sleeps."
+  (declare (ignore context))
+  (let ((index (parse-integer (tool-argument arguments "index" :required t))))
+    (with-lock-held ((agent-test-completion-tool-lock tool))
+      (loop until (= index (agent-test-completion-tool-next tool))
+            do (unless (condition-wait
+                        (aref (agent-test-completion-tool-conditions tool) index)
+                        (agent-test-completion-tool-lock tool) :timeout 5)
+                 (error "Completion barrier timed out for ~D" index)))
+      (push index (agent-test-completion-tool-finished tool))
+      (decf (agent-test-completion-tool-next tool))
+      (when (plusp index)
+        (condition-notify
+         (aref (agent-test-completion-tool-conditions tool) (1- index)))))
+    (aref (agent-test-completion-tool-results tool) index)))
+
+(-> agent-test-completion-baseline (&key (:count (integer 1 3))) null)
+(defun agent-test-completion-baseline (&key count)
+  "Exercise actual registry dispatch and completion with finite owned results."
+  (let* ((configuration (test-configuration))
+         (root          (test-configuration-root configuration))
+         (conversation  (conversation-create configuration))
+         (owner-thread  (current-thread))
+         (results
+           (map 'vector
+                (lambda (index)
+                  (make-instance 'agent-test-completion-result
+                                 :content (format nil "result~D" index)
+                                 :success-p t :payload (list :tag index)))
+                (loop for index below count collect index)))
+         (tool          (make-instance 'agent-test-completion-tool
+                                       :namespace "completion" :name "probe"
+                                       :description "Return finite owned completion results."
+                                       :parameters
+                                       (tool-object-schema
+                                        (json-object "index" (tool-string-property "Index."))
+                                        '("index"))
+                                       :results results :next (1- count)
+                                       :conditions  (map 'vector (lambda (item)
+                                                                   (declare (ignore item))
+                                                                   (make-condition-variable))
+                                                         results)))
+         (registry      (make-instance 'tool-registry))
+         (calls         (loop for index below count
+                              collect (agent-test-call
+                                       :call-id   (format nil "completion~D" index)
+                                       :namespace "completion" :name "probe"
+                                       :arguments (format nil "{\"index\":\"~D\"}" index))))
+         (provider      (make-instance 'scripted-provider
+                                       :results (list (agent-test-result "calls" calls)
+                                                      (agent-test-result
+                                                       "done" (list (agent-test-message "done")))))))
+    (unwind-protect
+         (let ((*telemetry-run*                         nil)
+               (*agent-maximum-concurrent-tool-workers* 3))
+           (tool-registry-register registry tool)
+           (agent-run-user-turn
+            (agent-create :configuration configuration :provider provider
+                          :conversation conversation :tool-registry registry :worker ':unused)
+            "Exercise finite completion controls.")
+           (test-assert (equal (agent-test-tool-outputs conversation)
+                               (loop for index below count collect (format nil "result~D" index)))
+                        "actual results persist in wire order")
+           (test-assert (equal (reverse (agent-test-completion-tool-finished tool))
+                               (loop for index downfrom (1- count) to 0 collect index))
+                        "barriers enforce reverse finish order")
+           (loop for result across results
+                 do (test-assert (= 2 (agent-test-completion-result-reads result))
+                                 "baseline requests details for persistence and observer")
+                    (test-assert (every (lambda (thread) (eq thread owner-thread))
+                                        (agent-test-completion-result-threads result))
+                                 "baseline snapshots occur on the completion thread")))
+      (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
+  nil)
+
+(-> test-agent-completion-accessors () null)
+(defun test-agent-completion-accessors ()
+  "Characterize a single real-registry result with telemetry disabled."
+  (agent-test-completion-baseline :count 1))
+
+(-> test-agent-completion-reverse-order () null)
+(defun test-agent-completion-reverse-order ()
+  "Characterize three actual registry results finishing in reverse order."
+  (agent-test-completion-baseline :count 3))
+
+(-> test-agent-completion-failure-priority () null)
+(defun test-agent-completion-failure-priority ()
+  "Characterize original condition priority and early consumer failures."
+  (dolist (mode '(:original :missing :observer :persistence))
+    (let* ((configuration   (test-configuration))
+           (root            (test-configuration-root configuration))
+           (conversation    (conversation-create configuration))
+           (agent           (agent-create :configuration configuration
+                                          :provider      (make-instance 'scripted-provider :results nil)
+                                          :conversation conversation :tool-registry (agent-test-registry)
+                                          :worker        ':unused))
+           (original        (make-condition 'job-aborted :message "owned original"
+                                            :identifier "completion" :reason ':test))
+           (consumer        (make-condition 'simple-error :format-control "owned consumer failure"))
+           (executions
+             (loop for index below 3
+                   collect (list :plan      (list :call        (agent-test-call
+                                                                :call-id (format nil "failure~D" index))
+                                                  :persistence ':durable)
+                                 :result    (cond ((and (= index 1) (eq mode ':missing))
+                                                   nil)
+                                                  ((= index 1)
+                                                   (tool-failure "failed"))
+                                                  (t
+                                                   (tool-success "ok")))
+                                 :condition (cond ((and (= index 1) (not (eq mode ':missing)))
+                                                   original)
+                                                  ((and (= index 2) (eq mode ':original))
+                                                   consumer)))))
+           (observer        (callback-agent-observer-create
+                             :status-callback
+                             (lambda (status details)
+                               (declare (ignore details))
+                               (when (and (eq mode ':observer) (eq status ':tool-call-completed))
+                                 (error consumer)))))
+           (escaped         nil)
+           (*telemetry-run* nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (if (eq mode ':persistence)
+                     (test-call-with-function-replacements
+                      (list (list 'conversation-append-tool-result
+                                  (lambda (&rest arguments)
+                                    (declare (ignore arguments))
+                                    (error consumer))))
+                      (lambda ()
+                        (agent--complete-tool-executions agent executions
+                                                         :observer observer :tool-round 1)))
+                     (agent--complete-tool-executions agent executions
+                                                      :observer observer :tool-round 1))
+               (serious-condition (condition) (setf escaped condition)))
+             (test-assert
+              (case mode
+                (:original
+                 (eq escaped original))
+                (:missing
+                 (and (typep escaped 'agent-loop-error)
+                      (eq escaped (getf (second executions) :condition))))
+                (t
+                 (eq escaped consumer)))
+              "the exact original or first consumer condition escapes")
+             (test-assert
+              (= (length (agent-test-tool-outputs conversation))
+                 (case mode (:persistence
+                             0)
+                            (:observer
+                             1)
+                            (t
+                             3)))
+              "consumer failure cuts off completion; stored conditions wait for siblings")
+             (when (eq mode ':missing)
+               (test-assert (equal (second (agent-test-tool-outputs conversation))
+                                   *conversation-interrupted-tool-output*)
+                            "missing result persists an explicit unknown outcome")))
+        (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore))))
+  nil)
+
+
+;;;; -- Completion Ownership --
+
+(defclass agent-test-projection-tool (tool)
+  ((next :initarg :next :accessor agent-test-projection-tool-next
+         :documentation "Next reverse body finish index.")
+   (reverse-p :initarg :reverse-p :initform t :reader agent-test-projection-tool-reverse-p
+              :documentation "Whether the fixture requires reverse tool-body order.")
+   (lock :initform (make-lock "Projection fixture") :reader agent-test-projection-tool-lock
+         :documentation "Protects fixture counters and weak observations.")
+   (conditions :initarg :conditions :reader agent-test-projection-tool-conditions
+               :documentation "Per-index reverse body barriers.")
+   (weak-results :initform nil :accessor agent-test-projection-tool-weak-results
+                 :documentation "Weak observations, never fixture-owned raw results.")
+   (weak-backing :initform nil :accessor agent-test-projection-tool-weak-backing
+                 :documentation "Weak observations of oversized producer arrays.")
+   (finished :initform nil :accessor agent-test-projection-tool-finished
+             :documentation "Reverse chronological tool-body finish indices."))
+  (:documentation "A real registry producer with no retained raw result owner."))
+
+(defmethod tool-execute ((tool agent-test-projection-tool)
+                         (context tool-context) (arguments hash-table))
+  "Produce an exact builtin result over a large privately owned backing array."
+  (declare (ignore context))
+  (let* ((index   (parse-integer (tool-argument arguments "index" :required t)))
+         (text    (format nil "owned~D" index))
+         (backing (make-string (* 128 1024) :initial-element #\x))
+         (view    (make-array (length text) :element-type 'character :displaced-to backing))
+         (result  nil))
+    (replace view text)
+    (setf result (make-instance 'tool-result :content view :success-p t
+                               :content-blocks (list view)))
+    (with-lock-held ((agent-test-projection-tool-lock tool))
+      (when (agent-test-projection-tool-reverse-p tool)
+        (loop until (= index (agent-test-projection-tool-next tool))
+              do (unless (condition-wait
+                          (aref (agent-test-projection-tool-conditions tool) index)
+                          (agent-test-projection-tool-lock tool) :timeout 5)
+                   (error "Projection reverse barrier timed out"))))
+      (push (sb-ext:make-weak-pointer result) (agent-test-projection-tool-weak-results tool))
+      (push (sb-ext:make-weak-pointer backing) (agent-test-projection-tool-weak-backing tool))
+      (push index (agent-test-projection-tool-finished tool))
+      (decf (agent-test-projection-tool-next tool))
+      (when (plusp index)
+        (condition-notify (aref (agent-test-projection-tool-conditions tool) (1- index)))))
+    result))
+
+(-> agent-test-projection-wave
+    (&key (:count (integer 1 3)) (:waves (integer 1 4)) (:persistence keyword)) null)
+(defun agent-test-projection-wave (&key (count 3) (waves 1) (persistence ':durable))
+  "Check the original published vector before joins and its cleanup after transfer."
+  (with-test-configuration (configuration root)
+    (let* ((conversation                            (conversation-create configuration))
+           (registry                                (make-instance 'tool-registry))
+           (tool                                    (make-instance 'agent-test-projection-tool
+                                                                   :namespace "ownership" :name "probe"
+                                                                   :description "Produce privately owned completion payloads."
+                                                                   :parameters  (tool-object-schema
+                                                                                 (json-object "index" (tool-string-property "Index."))
+                                                                                 '("index"))
+                                                                   :next        (1- count)
+                                                                   :conditions  (map 'vector (lambda (index)
+                                                                                               (declare (ignore index))
+                                                                                               (make-condition-variable))
+                                                                                     (make-list count))))
+           (agent                                   (agent-create :configuration configuration :conversation conversation
+                                                                  :provider (make-instance 'scripted-provider :results nil)
+                                                                  :tool-registry registry :worker ':unused))
+           (plans                                   (loop for index below count
+                                                          collect (list :call (agent-test-call
+                                                                               :call-id   (format nil "owned~D" index)
+                                                                               :namespace "ownership" :name "probe"
+                                                                               :arguments (format nil "{\"index\":\"~D\"}" index))
+                                                                        :tool tool :persistence persistence)))
+           (publish                                 (symbol-function 'agent--publish-tool-execution))
+           (join                                    (symbol-function 'join-thread))
+           (lock                                    (make-lock "Published vector fixture"))
+           (ready                                   (make-condition-variable))
+           (release                                 (make-condition-variable))
+           (published                               0)
+           (released-p                              (= count 1))
+           (vectors                                 nil)
+           (plists                                  nil)
+           (threads                                 nil)
+           (owner                                   (current-thread))
+           (*agent-maximum-concurrent-tool-workers* 3)
+           (*telemetry-run*                         nil))
+      (declare (ignore root))
+      (tool-registry-register registry tool)
+      (dotimes (wave waves)
+        (setf (agent-test-projection-tool-next tool) (1- count)
+              (agent-test-projection-tool-finished tool) nil
+              published 0 released-p (= count 1) vectors nil plists nil threads nil)
+       (test-call-with-function-replacements
+        (list
+         (list 'agent--publish-tool-execution
+               (lambda (vector index execution)
+                 (funcall publish vector index execution)
+                 ;; Retain only the already projected execution for explicit cleanup checks.
+                 (with-lock-held (lock)
+                   (pushnew vector vectors :test #'eq)
+                   (push (aref vector index) plists)
+                   (incf published)
+                   (condition-notify ready)
+                   (when (= count 1)
+                     (test-assert (typep (getf (aref vector index) :result) 'tool-completion-result)
+                                  "single-call publication contains an owned envelope"))
+                   (loop until released-p
+                         do (unless (condition-wait release lock :timeout 5)
+                              (error "Projection publication release timed out"))))
+                 nil))
+         (list 'join-thread
+               (lambda (thread &rest arguments)
+                 (when (eq (current-thread) owner)
+                   (with-lock-held (lock)
+                     (loop until (= published count)
+                           do (unless (condition-wait ready lock :timeout 5)
+                                (error "Projection pre-join barrier timed out")))
+                     (unless released-p
+                       (test-assert (= (length vectors) 1) "workers publish into one original vector")
+                       (test-assert
+                        (every (lambda (execution)
+                                 (typep (getf execution :result) 'tool-completion-result))
+                               (first vectors))
+                        "all completed slots contain only bounded envelopes before join")
+                      (test-assert
+                       (every (lambda (execution)
+                                (null (array-displacement
+                                       (tool-result-content (getf execution :result)))))
+                              (first vectors))
+                       "published text owns storage while producer frames await join")
+                      (setf released-p t)
+                      (dotimes (index count)
+                        (condition-notify release)))
+                     (pushnew thread threads :test #'eq)))
+                 (apply join thread arguments))))
+        (lambda ()
+          (agent--run-tool-wave agent plans
+                               :observer   (callback-agent-observer-create)
+                               :tool-round 1)))
+       (test-assert (every (lambda (vector) (every #'null vector)) vectors)
+                    "original vector slots are cleared after completion")
+       (test-assert (every (lambda (execution)
+                             (loop for tail on execution by (lambda (tail) (rest (rest tail)))
+                                   always (null (second tail))))
+                           plists)
+                    "shared execution plist values do not retain plans or results")
+       (test-assert (every (lambda (thread) (not (thread-alive-p thread))) threads)
+                    "all fixture worker closures have stopped before root release")
+       (test-assert (equal (reverse (agent-test-projection-tool-finished tool))
+                           (loop for index downfrom (1- count) to 0 collect index))
+                    "actual tool bodies finish in reverse order")
+       (test-assert (equal (agent-test-tool-outputs conversation)
+                           (loop repeat (1+ wave)
+                                 append (loop for index below count collect (format nil "owned~D" index))))
+                    "genuine persistence retains wire-ordered values")
+      ;; This supplements explicit roots; producer frames and fixture owners are gone.
+       (sb-ext:gc :full t)
+       (test-assert (every (lambda (pointer) (null (sb-ext:weak-pointer-value pointer)))
+                           (agent-test-projection-tool-weak-results tool))
+                    "raw results are collectible after joined producer frames exit")
+       (test-assert (every (lambda (pointer) (null (sb-ext:weak-pointer-value pointer)))
+                           (agent-test-projection-tool-weak-backing tool))
+                    "tiny projected text does not retain oversized backing arrays"))))
+  nil)
+
+(-> test-agent-completion-bounded-ownership () null)
+(defun test-agent-completion-bounded-ownership ()
+  "Exercise direct and reverse parallel registry publication and owned storage."
+  (agent-test-projection-wave :count 1)
+  (agent-test-projection-wave :count 3 :persistence ':next-response)
+  nil)
+
+(-> test-agent-completion-four-wave-release () null)
+(defun test-agent-completion-four-wave-release ()
+  "Exercise four waves on one agent and conversation, plus storm failure ownership transfer."
+  (agent-test-projection-wave :count 3 :waves 4)
+  (let* ((state (agent-tool-storm-state-create))
+         (plan  (list :storm-state state :signature "owned-call")))
+    (agent--tool-retry-output plan (tool-result-completion-projection (tool-failure "owned failure")))
+    (test-assert (equal (gethash "owned-call" (agent-tool-storm-state-failures state)) "owned failure")
+                 "storm state owns the bounded failure text semantically")
+    (agent--tool-retry-output plan (tool-result-completion-projection (tool-success "ok")))
+    (test-assert (zerop (hash-table-count (agent-tool-storm-state-failures state)))
+                 "successful retry removes the storm failure owner"))
+  nil)
+
+(defclass agent-test-unsafe-result (tool-result) ()
+  (:documentation "An extension inheriting builtin readers without projection authority."))
+
+(-> test-agent-completion-projection-compatibility () null)
+(defun test-agent-completion-projection-compatibility ()
+  "Verify bounded builtin values, recursive contracts and unsafe method fallback."
+  (let* ((base       (tool-success "ok"))
+         (skill      (make-instance 'skill-load-result :content "selected" :success-p t
+                                    :name "local-development" :newly-selected-p t))
+         (shell      (shell-command-result "exit" (list :exit-code 7) nil))
+         (task       (make-instance 'task-tool-result :content "snapshot" :success-p t
+                                    :details (list :job (list :state ':completed))))
+         (mission    (make-instance 'mission-tool-result :content "snapshot" :success-p t
+                                    :details (list :goal (list :status ':active))))
+         (executable (make-instance 'executable-skill-result :content "executed" :success-p t
+                                    :record (list :status ':completed)))
+         (mcp        (make-instance 'mcp-content-result :content "text" :success-p t
+                                    :sections (list (list ':text 0 4))))
+         (contract   (tool-contract--recording-result mcp (list (json-object "message" "mapping"))))
+         (extension  (make-instance 'agent-test-unsafe-result :content "extension" :success-p t)))
+    (dolist (result (list base skill shell task mission executable mcp contract))
+      (let ((projection (tool-result-completion-projection result)))
+        (test-assert (typep projection 'tool-completion-result) "reviewed bounded builtin opts in")
+        (when projection
+          (test-assert (equal (tool-result-details projection) (tool-result-details result))
+                       "builtin metadata values survive pure snapshotting")
+          (test-assert (and (equal (tool-result-content projection) (tool-result-content result))
+                            (not (eq (tool-result-content projection) (tool-result-content result))))
+                       "snapshot content has equal values and independent ownership"))))
+    (test-assert (null (tool-result-completion-projection extension)) "inherited extensions stay legacy")
+    (test-assert (null (tool-result-completion-projection
+                        (tool-contract--recording-result extension (list (json-object "message" "mapping")))))
+                 "contract over an extension stays legacy")
+    (test-assert (null (tool-result-completion-projection
+                        (shell-command-result "big" (list :text (make-string 70000)) t)))
+                 "oversized raw observer metadata stays legacy")
+    (let* ((method (eval `(defmethod tool-result-details :around ((result (eql ,base)))
+                           (call-next-method)))))
+      (unwind-protect
+           (test-assert (null (tool-result-completion-projection base))
+                        "EQL accessor methods prevent worker-thread snapshotting")
+        (remove-method #'tool-result-details method)))
+    (let ((method (eval '(defmethod tool-result-details :after ((result shell-command-tool-result))
+                          (declare (ignore result)) nil))))
+      (unwind-protect
+           (test-assert (null (tool-result-completion-projection shell))
+                        "auxiliary methods prevent worker-thread snapshotting")
+        (remove-method #'tool-result-details method)))
+    (let ((details (tool-result-details skill)))
+      (test-assert (eq details (conversation--bounded-tool-details details))
+                   "the signed accepted metadata helper preserves value identity")))
+  nil)
+
+(-> test-agent-completion-delivery-ownership () null)
+(defun test-agent-completion-delivery-ownership ()
+  "Reuse genuine jobpond delivery, receipt recovery and unknown-outcome owners."
+  (test-job-completion-durable-delivery)
+  (test-job-completion-delivery-crash-points)
+  (test-job-completion-terminal-truth-and-reconstruction)
+  (let ((*task-completion-capacity*      2)
+        (*task-completion-history-limit* 2))
+    (job-completion-tests--fixture
+     (lambda (parent runtime configuration)
+       (declare (ignore configuration))
+       (dotimes (index 4)
+         (declare (ignore index))
+         (let* ((job        (job-completion-tests--start parent runtime))
+                (identifier (session-job-execution-identifier job)))
+           (test-assert (= 1 (length (task-completion-deliver parent)))
+                        "actual detached delivery consumes one completed notice")
+           (test-assert (task-completion--delivered-p (agent-conversation parent) identifier)
+                        "durable append receipt exists before acknowledgment pruning")
+           (task-completion-watch job parent)
+           (test-assert (null (task-completion-pending parent))
+                        "a repeated genuine watch does not redeliver an acknowledged result")))
+       (test-assert (null (task-completion--messages (task-completion--service parent)))
+                    "receipt-backed subscription history is pruned after actual delivery"))))
+  nil)
+
+(-> test-agent-completion-owned-failures () null)
+(defun test-agent-completion-owned-failures ()
+  "Verify original vector cleanup and exact condition identity through finite failures."
+  (dolist (mode '(:creation :join :observer :persistence))
+    (with-test-configuration (configuration root)
+      (let* ((conversation                            (conversation-create configuration))
+             (registry                                (make-instance 'tool-registry))
+             (tool                                    (make-instance 'agent-test-projection-tool
+                                                                     :namespace "ownership" :name "failure"
+                                                                     :description "Produce owned failure controls."
+                                                                     :parameters  (tool-object-schema
+                                                                                   (json-object "index" (tool-string-property "Index."))
+                                                                                   '("index"))
+                                                                     :reverse-p nil :next 2
+                                                                     :conditions  (vector (make-condition-variable)
+                                                                                          (make-condition-variable)
+                                                                                          (make-condition-variable))))
+             (agent                                   (agent-create :configuration configuration :conversation conversation
+                                                                    :provider (make-instance 'scripted-provider :results nil)
+                                                                    :tool-registry registry :worker ':unused))
+             (plans                                   (loop for index below 3
+                                                            collect (list :call (agent-test-call
+                                                                                 :call-id   (format nil "failure~D" index)
+                                                                                 :namespace "ownership" :name "failure"
+                                                                                 :arguments (format nil "{\"index\":\"~D\"}" index))
+                                                                          :tool tool :persistence ':durable)))
+             (fault                                   (make-condition 'simple-error :format-control "owned wave fault"))
+             (observer                                (callback-agent-observer-create
+                                                       :status-callback
+                                                       (lambda (status details)
+                                                         (declare (ignore details))
+                                                         (when (and (eq mode ':observer) (eq status ':tool-call-completed))
+                                                           (error fault)))))
+             (publish                                 (symbol-function 'agent--publish-tool-execution))
+             (create                                  (symbol-function 'make-thread))
+             (join                                    (symbol-function 'join-thread))
+             (persist                                 (symbol-function 'conversation-append-tool-result))
+             (lock                                    (make-lock "Owned failure observations"))
+             (vectors                                 nil)
+             (plists                                  nil)
+             (threads                                 nil)
+             (join-failed-p                           nil)
+             (escaped                                 nil)
+             (*agent-maximum-concurrent-tool-workers* 3)
+             (*telemetry-run*                         nil))
+        (declare (ignore root))
+        (tool-registry-register registry tool)
+        (test-call-with-function-replacements
+         (list
+          (list 'agent--publish-tool-execution
+                (lambda (vector index execution)
+                  (funcall publish vector index execution)
+                  (with-lock-held (lock)
+                    (pushnew vector vectors :test #'eq)
+                    (push (aref vector index) plists))))
+          (list 'make-thread
+                (lambda (&rest arguments)
+                  (when (eq mode ':creation) (error fault))
+                  (let ((thread (apply create arguments)))
+                    (push thread threads)
+                    thread)))
+          (list 'join-thread
+                (lambda (thread &rest arguments)
+                  (prog1 (apply join thread arguments)
+                    (when (and (eq mode ':join) (not join-failed-p))
+                      (setf join-failed-p t)
+                      (error fault)))))
+          (list 'conversation-append-tool-result
+                (lambda (&rest arguments)
+                  (when (eq mode ':persistence) (error fault))
+                  (apply persist arguments))))
+         (lambda ()
+           (handler-case
+               (agent--run-tool-wave agent plans :observer observer :tool-round 1)
+             (serious-condition (condition) (setf escaped condition)))))
+        (test-assert (eq escaped fault) "the exact injected condition escapes the genuine wave")
+        (test-assert (= (length plists) 3) "all finite producers published before completion failed")
+        (test-assert (every (lambda (vector) (every #'null vector)) vectors)
+                     "the original vector is cleared on every tested unwind")
+        (test-assert (every (lambda (execution)
+                             (loop for tail on execution by (lambda (tail) (rest (rest tail)))
+                                   always (null (second tail))))
+                           plists)
+                     "the published execution plist roots are cleared on every tested unwind")
+        (test-assert (every (lambda (thread) (not (thread-alive-p thread))) threads)
+                     "all actually created producer threads have stopped")
+        (test-assert (= (length (agent-test-tool-outputs conversation))
+                        (case mode
+                          (:persistence
+                           0)
+                          (:observer
+                           1)
+                          (t
+                           3)))
+                     "consumer faults cut off transfer; infrastructure faults follow sibling transfer"))))
+  nil)
+
+(-> test-agent-completion-telemetry () null)
+(defun test-agent-completion-telemetry ()
+  "Verify completion consumers with isolated telemetry capture, including emission failure."
+  (dolist (mode '(:off :on :failure))
+    (with-test-configuration (configuration root)
+      (let* ((conversation    (conversation-create configuration))
+             (agent           (agent-create :configuration configuration :conversation conversation
+                                            :provider (make-instance 'scripted-provider :results nil)
+                                            :tool-registry (agent-test-registry) :worker ':unused))
+             (result          (tool-result-completion-projection
+                               (shell-command-result "exit evidence" (list :exit-code 7) nil)))
+             (execution       (list :plan (list :call        (agent-test-call :call-id "exit-evidence")
+                                                :persistence ':durable)
+                                    :result result :telemetry-duration-ms 12))
+             (observed        nil)
+             (notes           nil)
+             (observer        (callback-agent-observer-create
+                               :status-callback
+                               (lambda (status details)
+                                 (when (eq status ':tool-call-completed) (setf observed details)))))
+             (*telemetry-run* (not (eq mode ':off))))
+        (declare (ignore root))
+        (test-call-with-function-replacements
+         (list (list 'telemetry-note-tool
+                     (lambda (&rest arguments)
+                       (push arguments notes)
+                       (when (eq mode ':failure) (error "isolated telemetry failure")))))
+         (lambda ()
+           (agent--complete-tool-executions agent (vector execution)
+                                            :observer observer :tool-round 1)))
+        (test-assert (equal (agent-test-tool-outputs conversation) '("exit evidence"))
+                     "telemetry presence or failure does not interrupt actual result persistence")
+        (test-assert (= 7 (getf (getf observed :details) :exit-code))
+                     "the observer receives the bounded shell exit metadata")
+        (test-assert (= (length notes) (if (eq mode ':off) 0 1))
+                     "completion invokes isolated telemetry only when enabled")
+        (when notes
+          (test-assert (= 7 (getf (first notes) :exit-code))
+                       "telemetry receives the shell exit code before optional emission failure")))))
+  nil)

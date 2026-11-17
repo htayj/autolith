@@ -1138,6 +1138,34 @@ restricted turn cannot discover tools outside its allowlist."
           (round (* (- (get-internal-real-time) real-start) 1000000)
                  internal-time-units-per-second)))))
 
+(-> agent--project-tool-execution (list) list)
+(defun agent--project-tool-execution (execution)
+  "Replace a raw result with an eligible owned snapshot before publication.
+Projection failure declines to legacy delivery, never a tool condition."
+  (let ((result (getf execution :result)))
+    (when result
+      (let ((projection (tool-result-completion-projection result)))
+        (when projection
+          (setf (getf execution :result) projection)))))
+  execution)
+
+(-> agent--publish-tool-execution (vector integer list) null)
+(defun agent--publish-tool-execution (executions index execution)
+  "Publish only the projected handoff in the original wave vector."
+  (setf (aref executions index) (agent--project-tool-execution execution))
+  nil)
+
+(-> agent--release-tool-executions (vector) null)
+(defun agent--release-tool-executions (executions)
+  "Release owned execution roots after the wave's existing producer join cleanup."
+  (loop for index below (length executions)
+        for execution = (aref executions index)
+        do (when execution
+             (loop for tail on execution by (lambda (tail) (rest (rest tail)))
+                   do (setf (second tail) nil)))
+           (setf (aref executions index) nil))
+  nil)
+
 (-> agent--tool-retry-output (list tool-result) string)
 (defun agent--tool-retry-output (plan result)
   "Return RESULT text with a changed prior failure diagnosis for the same PLAN."
@@ -1164,89 +1192,94 @@ restricted turn cannot discover tools outside its allowlist."
        content))))
 
 (-> agent--complete-tool-executions
-    (agent list &key (:observer agent-observer) (:tool-round integer))
+    (agent sequence &key (:observer agent-observer) (:tool-round integer))
     null)
 (defun agent--complete-tool-executions
     (agent executions &key observer tool-round)
   "Persist EXECUTIONS and report completions in provider wire order.
 
-Every execution receives an output before its condition is re-signalled. Missing
-worker results become explicit unknown outcomes so provider history stays valid."
-  (dolist (execution executions)
-    (let* ((plan      (getf execution :plan))
-           (call      (getf plan :call))
-           (call-id   (json-get call "call_id"))
-           (tool-name (function-call-canonical-name call))
-           (result    (getf execution :result))
-           (condition (getf execution :condition)))
-      (unless (or result condition)
-        (setf condition
-              (make-condition
-               'agent-loop-error
-               :message        (format nil "Tool ~A ended without returning a result."
-                                       tool-name)
-               :conversation-id
-               (conversation-identifier (agent-conversation agent))
-               :request-number nil)
-              (getf execution :condition) condition))
-      (let* ((effective-result
-               (or result
-                   (tool-failure *conversation-interrupted-tool-output*
-                                 :code ':unknown-outcome)))
-             (error-type (when condition (telemetry--condition-error-type condition)))
-             (output
-               (if result
-                   (agent--tool-retry-output plan result)
-                   *conversation-interrupted-tool-output*)))
-        (when *telemetry-run*
-          (telemetry--call-safely
-           (lambda ()
-             (telemetry-note-tool
-              :run               *telemetry-run*
-              :tool              tool-name
-              :arguments         (or (getf execution :telemetry-arguments) (json-get call "arguments"))
-              :corrects-previous (getf execution :telemetry-corrects-previous-p)
-              :error-code        (tool-result-error-code effective-result)
-              :error-type        error-type
-              :exit-code         (getf (tool-result-details effective-result) :exit-code)
-              :outcome           (telemetry--outcome
-                                  :success-p  (tool-result-success-p effective-result)
-                                  :error-type error-type
-                                  :denied-p   (tool-result-denied-p effective-result)
-                                  :error-code (tool-result-error-code effective-result))
-              :duration-ms       (getf execution :telemetry-duration-ms)))))
-        (conversation-append-tool-result
-         (agent-conversation agent)
-         call-id
-         :tool-name         tool-name
-         :tool-label        (when (getf plan :tool)
-                              (tool-display-name (getf plan :tool)))
-         :output            output
-         :details           (tool-result-details effective-result)
-         :content-blocks    (tool-result-content-blocks effective-result)
-         :success-p         (tool-result-success-p effective-result)
-         :category          (tool-result-category effective-result)
-         :cpu-microseconds  (getf execution :cpu-microseconds)
-         :real-microseconds (getf execution :real-microseconds)
-         :persistence       (getf plan :persistence))
-        (agent-observer-status
-         observer
-         ':tool-call-completed
-         (list :tool-round        tool-round
-               :call-id           call-id
+Consumer failures retain their original priority and may escape before later outputs.
+Missing results become explicit unknown outcomes before the first stored condition."
+  (let ((first-condition nil))
+    (loop for index below (length executions)
+          for execution = (elt executions index)
+          do
+     (let* ((plan      (getf execution :plan))
+            (call      (getf plan :call))
+            (call-id   (json-get call "call_id"))
+            (tool-name (function-call-canonical-name call))
+            (result    (getf execution :result))
+            (condition (getf execution :condition)))
+       (unless (or result condition)
+         (setf condition
+               (make-condition
+                'agent-loop-error
+                :message        (format nil "Tool ~A ended without returning a result."
+                                        tool-name)
+                :conversation-id
+                (conversation-identifier (agent-conversation agent))
+                :request-number nil)
+               (getf execution :condition) condition))
+       (unless first-condition
+         (setf first-condition condition))
+       (let* ((effective-result
+                (or result
+                    (tool-failure *conversation-interrupted-tool-output*
+                                  :code ':unknown-outcome)))
+              (error-type (when condition (telemetry--condition-error-type condition)))
+              (output
+                (if result
+                    (agent--tool-retry-output plan result)
+                    *conversation-interrupted-tool-output*)))
+         (when *telemetry-run*
+           (telemetry--call-safely
+            (lambda ()
+              (telemetry-note-tool
+               :run               *telemetry-run*
                :tool              tool-name
-               :success-p         (tool-result-success-p effective-result)
-               :category          (tool-result-category effective-result)
-               :cpu-microseconds  (getf execution :cpu-microseconds)
-               :real-microseconds (getf execution :real-microseconds)
-               :output            output
-               :details           (tool-result-details effective-result))))))
-  (let ((failure
-          (find-if (lambda (execution)
-                     (getf execution :condition))
-                   executions)))
-    (when failure
-      (error (getf failure :condition))))
+               :arguments         (or (getf execution :telemetry-arguments) (json-get call "arguments"))
+               :corrects-previous (getf execution :telemetry-corrects-previous-p)
+               :error-code        (tool-result-error-code effective-result)
+               :error-type        error-type
+               :exit-code         (getf (tool-result-details effective-result) :exit-code)
+               :outcome           (telemetry--outcome
+                                   :success-p  (tool-result-success-p effective-result)
+                                   :error-type error-type
+                                   :denied-p   (tool-result-denied-p effective-result)
+                                   :error-code (tool-result-error-code effective-result))
+               :duration-ms       (getf execution :telemetry-duration-ms)))))
+         (conversation-append-tool-result
+          (agent-conversation agent)
+          call-id
+          :tool-name         tool-name
+          :tool-label        (when (getf plan :tool)
+                               (tool-display-name (getf plan :tool)))
+          :output            output
+          :details           (tool-result-details effective-result)
+          :content-blocks    (tool-result-content-blocks effective-result)
+          :success-p         (tool-result-success-p effective-result)
+          :category          (tool-result-category effective-result)
+          :cpu-microseconds  (getf execution :cpu-microseconds)
+          :real-microseconds (getf execution :real-microseconds)
+          :persistence       (getf plan :persistence))
+         (agent-observer-status
+          observer
+          ':tool-call-completed
+          (list :tool-round        tool-round
+                :call-id           call-id
+                :tool              tool-name
+                :success-p         (tool-result-success-p effective-result)
+                :category          (tool-result-category effective-result)
+                :cpu-microseconds  (getf execution :cpu-microseconds)
+                :real-microseconds (getf execution :real-microseconds)
+                :output            output
+                 :details          (tool-result-details effective-result))))
+       (when (vectorp executions)
+         (loop for tail on execution by (lambda (tail) (rest (rest tail)))
+               do (setf (second tail) nil))
+         (setf (aref executions index) nil))))
+    (when first-condition
+      (error first-condition)))
   nil)
 
 (-> agent--tool-thread-function (function) function)
@@ -1284,79 +1317,84 @@ worker results become explicit unknown outcomes so provider history stays valid.
          (executions
            (map 'vector (lambda (plan) (list :plan plan)) plans))
          (record-timings-p (= count 1)))
-    (if (= count 1)
-        (setf (aref executions 0)
-              (agent--execute-tool-plan agent (first plans)
-                                        :observer           observer
-                                        :tool-restriction-p tool-restriction-p
-                                        :record-timings-p   t))
-        (let ((next-index                0)
-              (claim-lock                (make-lock "Autolith tool wave claims"))
-              (threads                   nil)
-              (thread-creation-condition nil)
-              (thread-join-condition     nil))
-          (flet ((work ()
-                   (loop
-                     (let ((index
-                             (with-lock-held (claim-lock)
-                               (when (< next-index count)
-                                 (prog1 next-index
-                                   (incf next-index))))))
-                       (unless index
-                         (return))
-                       (setf (aref executions index)
+    (unwind-protect
+         (progn
+          (if (= count 1)
+              (agent--publish-tool-execution
+               executions 0
+               (agent--execute-tool-plan agent (first plans)
+                                         :observer           observer
+                                         :tool-restriction-p tool-restriction-p
+                                         :record-timings-p   t))
+              (let ((next-index                0)
+                    (claim-lock                (make-lock "Autolith tool wave claims"))
+                    (threads                   nil)
+                    (thread-creation-condition nil)
+                    (thread-join-condition     nil))
+                (flet ((work ()
+                         (loop
+                           (let ((index
+                                   (with-lock-held (claim-lock)
+                                     (when (< next-index count)
+                                       (prog1 next-index
+                                         (incf next-index))))))
+                             (unless index
+                               (return))
+                            (agent--publish-tool-execution
+                             executions index
                              (agent--execute-tool-plan
                               agent
                               (nth index plans)
                               :observer           observer
                               :tool-restriction-p tool-restriction-p
                               :record-timings-p   record-timings-p))))))
-            (unwind-protect
-                 (progn
-                   (loop repeat
-                           (min count *agent-maximum-concurrent-tool-workers*)
-                         while (null thread-creation-condition)
-                         do
-                           (handler-case
-                               (push
-                                 (make-thread
-                                  (agent--tool-thread-function #'work)
-                                  :name "autolith-tool-call")
-                                threads)
-                             (serious-condition (condition)
-                               (setf thread-creation-condition condition))))
-                   (when thread-creation-condition
-                     (work))
-                   (handler-case
-                       (mapc #'join-thread threads)
-                     (serious-condition (condition)
-                       (setf thread-join-condition condition))))
-              (mapc (lambda (thread)
-                      (when (thread-alive-p thread)
-                        (handler-case
-                            (join-thread thread)
-                          (serious-condition ()
-                            nil))))
-                    threads))
-            (when thread-join-condition
-              (loop for execution across executions
-                    when (and (null (getf execution :result))
-                              (null (getf execution :condition)))
-                      do (setf (getf execution :condition)
-                               thread-join-condition)))
-            (when thread-creation-condition
-              (agent--complete-tool-executions agent (coerce executions 'list)
-                                               :observer   observer
-                                               :tool-round tool-round)
-              (error thread-creation-condition))
-            (when thread-join-condition
-              (agent--complete-tool-executions agent (coerce executions 'list)
-                                               :observer   observer
-                                               :tool-round tool-round)
-              (error thread-join-condition)))))
-    (agent--complete-tool-executions agent (coerce executions 'list)
-                                     :observer   observer
-                                     :tool-round tool-round))
+                  (unwind-protect
+                       (progn
+                         (loop repeat
+                                 (min count *agent-maximum-concurrent-tool-workers*)
+                               while (null thread-creation-condition)
+                               do
+                                 (handler-case
+                                     (push
+                                       (make-thread
+                                        (agent--tool-thread-function #'work)
+                                        :name "autolith-tool-call")
+                                      threads)
+                                   (serious-condition (condition)
+                                     (setf thread-creation-condition condition))))
+                         (when thread-creation-condition
+                           (work))
+                         (handler-case
+                             (mapc #'join-thread threads)
+                           (serious-condition (condition)
+                             (setf thread-join-condition condition))))
+                    (mapc (lambda (thread)
+                            (when (thread-alive-p thread)
+                              (handler-case
+                                  (join-thread thread)
+                                (serious-condition ()
+                                  nil))))
+                          threads))
+                  (when thread-join-condition
+                    (loop for execution across executions
+                          when (and (null (getf execution :result))
+                                    (null (getf execution :condition)))
+                            do (setf (getf execution :condition)
+                                     thread-join-condition)))
+                  (when thread-creation-condition
+                    (agent--complete-tool-executions agent executions
+                                                     :observer   observer
+                                                     :tool-round tool-round)
+                    (error thread-creation-condition))
+                  (when thread-join-condition
+                    (agent--complete-tool-executions agent executions
+                                                     :observer   observer
+                                                     :tool-round tool-round)
+                    (error thread-join-condition)))))
+          (agent--complete-tool-executions agent executions
+                                           :observer   observer
+                                           :tool-round tool-round))
+      (agent--release-tool-executions executions)))
   nil)
 
 (-> agent--execute-tool-calls

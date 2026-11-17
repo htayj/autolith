@@ -315,6 +315,7 @@
                                           (:file "application/mission-knowledge")
                                           (:file "application/mission-draft-review")
                                           (:file "application/mission-tools")
+                                          (:file "agent/completion-projection")
                                           (:file "application/mission-review")
                                           (:file "application/mission-exhaustion")
                                           (:file "application/mission-review-tools")

@@ -1361,6 +1361,15 @@
   test-agent-parallel-tool-wave
   test-agent-tool-concurrency-key
   test-agent-exclusive-tool-waves
+  test-agent-completion-accessors
+  test-agent-completion-reverse-order
+  test-agent-completion-failure-priority
+  test-agent-completion-projection-compatibility
+  test-agent-completion-bounded-ownership
+  test-agent-completion-four-wave-release
+  test-agent-completion-owned-failures
+  test-agent-completion-telemetry
+  test-agent-completion-delivery-ownership
   test-agent-parallel-tool-failure
   test-agent-parallel-fatal-propagation
   test-agent-tool-search-round)
