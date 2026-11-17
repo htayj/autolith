@@ -14,14 +14,45 @@
 (defvar *recovery-bootstrap-test-cause* nil
   "Dynamically scoped initiating condition in genuine ASDF source fixtures.")
 
+(defvar *recovery-bootstrap-test-setup-count* 0
+  "Dynamically scoped count of explicit setup loads in the success fixture.")
+
+(-> test-recovery-bootstrap-success () null)
+(defun test-recovery-bootstrap-success ()
+  "Bootstrap genuine dependencies and enumerate an owned empty generation store.
+This in-suite check uses the loaded dependency closure, not a cold Lisp image."
+  (test-call-with-temporary-root
+   (lambda (root)
+     (let ((setup                                 (merge-pathnames "explicit/setup.lisp" root))
+           (*recovery-bootstrap-test-setup-count* 0))
+       (recovery-tests--write-form
+        (merge-pathnames ".qlot/setup.lisp" root)
+        '(error "Unused project setup executed."))
+       (recovery-tests--write-form setup '(incf *recovery-bootstrap-test-setup-count*))
+       (test-call-with-environment
+        (list (list "AUTOLITH_PROJECT_SETUP" (namestring setup))
+              (list "XDG_DATA_HOME" (namestring (merge-pathnames "data/" root)))
+              (list "XDG_STATE_HOME" (namestring (merge-pathnames "state/" root))))
+        (lambda ()
+          (test-assert (eq t (cl-user::recovery-bootstrap root :home root))
+                       "The complete bootstrap accepts the genuine dependency closure.")
+          (test-assert (= *recovery-bootstrap-test-setup-count* 1)
+                       "The selected explicit setup is loaded exactly once.")
+          (test-assert (null (recovery-generation-list (recovery-context-create root)))
+                       "The real generation store starts empty.")
+          (let ((*standard-output* (make-broadcast-stream)))
+            (test-assert (zerop (recovery-run (list (namestring root) "--list")))
+                         "The real runtime lists the empty owned store successfully.")))))))
+  nil)
+
 (-> test-recovery-bootstrap-selection () null)
 (defun test-recovery-bootstrap-selection ()
   "Select explicit setup authority without touching an unused local setup."
   (test-call-with-temporary-root
    (lambda (root)
-    (let* ((home (merge-pathnames "home/" root))
-           (project (merge-pathnames ".qlot/setup.lisp" root))
-           (user (merge-pathnames "quicklisp/setup.lisp" home))
+    (let* ((home     (merge-pathnames "home/" root))
+           (project  (merge-pathnames ".qlot/setup.lisp" root))
+           (user     (merge-pathnames "quicklisp/setup.lisp" home))
            (explicit (merge-pathnames "packaged/setup.lisp" root)))
       (test-assert (null (cl-user::recovery-bootstrap--setup root :override nil :home home))
                    "No setup leaves dependency discovery to offline ASDF.")
@@ -34,7 +65,7 @@
         (test-assert (equal project (cl-user::recovery-bootstrap--setup root :override override :home home))
                      "Project setup precedes user setup when no override is supplied."))
       (test-assert (equal explicit (cl-user::recovery-bootstrap--setup
-                                   root :override (namestring explicit) :home home))
+                                    root :override (namestring explicit) :home home))
                    "An explicit usable setup precedes the project setup.")
       (dolist (invalid (list (namestring (merge-pathnames "missing.lisp" root))
                             (namestring home)))
@@ -73,7 +104,7 @@
   "Use genuine ASDF absence and failing source loads, with scoped registry state."
   (test-call-with-temporary-root
    (lambda (root)
-    (let ((asdf:*central-registry* nil)
+    (let ((asdf:*central-registry*                nil)
           (asdf:*system-definition-search-functions*
             '(asdf/system-registry:sysdef-source-registry-search))
           (asdf/source-registry:*source-registry* (make-hash-table :test 'equal))
@@ -88,7 +119,7 @@
         (test-assert (typep (cl-user::recovery-bootstrap-error-cause failure) 'asdf:missing-component)
                      "The genuine ASDF missing-system condition is retained."))
       (let* ((name "autolith-recovery-bootstrap-load-fixture")
-             (asd (merge-pathnames (concatenate 'string name ".asd") root))
+             (asd  (merge-pathnames (concatenate 'string name ".asd") root))
              (*recovery-bootstrap-test-cause*
                (make-condition 'file-error :pathname "recovery-bootstrap-fixture")))
         (unwind-protect
@@ -116,12 +147,12 @@
 (-> test-recovery-bootstrap-state-boundaries () null)
 (defun test-recovery-bootstrap-state-boundaries ()
   "Restore fixture state after genuine offline load success and bootstrap refusal."
-  (let ((registry asdf/source-registry:*source-registry*)
-        (central asdf:*central-registry*)
-        (output asdf/output-translations:*output-translations*)
+  (let ((registry    asdf/source-registry:*source-registry*)
+        (central     asdf:*central-registry*)
+        (output      asdf/output-translations:*output-translations*)
         (environment (uiop:getenv "AUTOLITH_PROJECT_SETUP"))
-        (standard *standard-output*)
-        (errors *error-output*))
+        (standard    *standard-output*)
+        (errors      *error-output*))
     (test-call-with-temporary-root
      (lambda (root)
        (dolist (fail-p (list nil t))
@@ -129,17 +160,17 @@
           (list (list "AUTOLITH_PROJECT_SETUP"
                       (if fail-p (namestring (merge-pathnames "absent-setup.lisp" root)) "")))
           (lambda ()
-            (let ((asdf:*central-registry* nil)
+            (let ((asdf:*central-registry*                                  nil)
                   (asdf:*system-definition-search-functions*
                     '(asdf/system-registry:sysdef-source-registry-search))
-                  (asdf/source-registry:*source-registry* (make-hash-table :test 'equal))
+                  (asdf/source-registry:*source-registry*                   (make-hash-table :test 'equal))
                   (asdf/source-registry:*source-registry-parameter*
                     '(:source-registry :ignore-inherited-configuration))
-                  (asdf/output-translations:*output-translations* nil)
+                  (asdf/output-translations:*output-translations*           nil)
                   (asdf/output-translations:*output-translations-parameter* nil))
               (with-output-to-string (stream)
                 (let ((*standard-output* stream)
-                      (*error-output* stream))
+                      (*error-output*    stream))
                   (if fail-p
                       (let ((failure
                               (handler-case (cl-user::recovery-bootstrap root :home root)
@@ -148,7 +179,7 @@
                                          (cl-user::recovery-bootstrap-error-phase failure))
                                      "An invalid environment override gives a typed refusal."))
                       (let* ((name "autolith-recovery-bootstrap-success-fixture")
-                             (asd (merge-pathnames (concatenate 'string name ".asd") root)))
+                             (asd  (merge-pathnames (concatenate 'string name ".asd") root)))
                         (unwind-protect
                              (progn
                                (recovery-tests--write-form asd `(asdf:defsystem ,name))
@@ -172,9 +203,9 @@
   "Distinguish genuine ASDF definition and compilation errors from absent systems."
   (test-call-with-temporary-root
    (lambda (root)
-     (let* ((name "autolith-recovery-bootstrap-broken-fixture")
-            (asd (merge-pathnames (concatenate 'string name ".asd") root))
-            (asdf:*central-registry* nil)
+     (let* ((name                                   "autolith-recovery-bootstrap-broken-fixture")
+            (asd                                    (merge-pathnames (concatenate 'string name ".asd") root))
+            (asdf:*central-registry*                nil)
             (asdf:*system-definition-search-functions*
               '(asdf/system-registry:sysdef-source-registry-search))
             (asdf/source-registry:*source-registry* (make-hash-table :test 'equal)))
@@ -207,6 +238,7 @@
                              "The initiating ASDF compile failure is retained.")))
          (asdf:clear-system name)))))
   nil)
+
 
 ;;;; -- Recovery Runtime Tests --
 

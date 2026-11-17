@@ -1299,6 +1299,7 @@
   test-image-commit-replay-probe)
 
 (define-test-suite recovery
+  test-recovery-bootstrap-success
   test-recovery-bootstrap-selection
   test-recovery-bootstrap-setup-error
   test-recovery-bootstrap-offline-errors
