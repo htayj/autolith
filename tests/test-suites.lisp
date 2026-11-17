@@ -1919,6 +1919,11 @@
   run-application-operation-tests
   test-application-operation-argument-keys
   test-application-tool-call-invocation
+  test-application-background-handoff-headers
+  test-application-retained-insertion-actions
+  test-application-deliberate-composer-input
+  test-application-saved-composer-ingress
+  test-application-authorized-composer-queue
   test-compact-operation
   test-compact-operation-empty
   test-fix-skipped-definitions-operation

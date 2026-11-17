@@ -2406,9 +2406,7 @@ while output is deferred and otherwise dropped."
 
 (-> terminal-ui--compact-call-tool ((or string list)) (option string))
 (defun terminal-ui--compact-call-tool (entry)
-  "Return the full tool name of a single-line call, or NIL for other entries.
-
-A call's header spans may be widgets inserting its invocation when clicked."
+  "Return the full tool name of a single-line call, or NIL for other entries."
   (when (and (consp entry)
              (eq (terminal-span-style (first entry)) ':tool))
     (let* ((header    (terminal-span-text (first entry)))

@@ -667,13 +667,9 @@ request, so a terminal reached over SSH or a localgroup relay copies on your own
 machine. Web addresses in every mode are emitted as OSC 8 hyperlinks, which
 terminals open with their usual modifier-click.
 
-Clicking a tool call's header in the fullscreen transcript inserts its Lisp
-invocation, such as =(resource.read :uri "file:///tmp/notes.org")=, into the
-composer at the cursor. Submitting it alone repeats the call with the same
-arguments; editing it first runs a similar call; writing around it asks the
-model about that exact call. Arrays are spelled as =(vector ...)= and objects
-as =(dict ...)=, and argument names with uppercase letters keep their case as
-=:|filePath|= or a string key.
+Tool headers and background-job cancel invocations are passive transcript text.
+To repeat or modify a call, type or paste its Lisp invocation into the composer,
+edit it as needed, then submit it explicitly.
 
 In fullscreen mode, a pending tool call starts with =▸=. When it finishes, the
 same header shows a green =✓= for success or a red =!= for failure. Errors

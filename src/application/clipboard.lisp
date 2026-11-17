@@ -61,16 +61,12 @@ relay. A notice names the route that worked, or the host failure."
 
 (-> application-transcript-action (application list) null)
 (defun application-transcript-action (application action)
-  "Perform clicked transcript ACTION: (:copy TEXT), (:open-url URL) or (:insert TEXT).
-
-Inserting puts TEXT, such as a tool call's Lisp invocation, into the composer."
+  "Perform clicked transcript ACTION: (:copy TEXT) or (:open-url URL)."
   (case (first action)
     (:copy
      (application-copy-text application (second action)))
     (:open-url
-     (application-open-url application (second action)))
-    (:insert
-     (terminal-ui-insert-input (application-ui application) (second action))))
+     (application-open-url application (second action))))
   nil)
 
 (-> application-connect-transcript-actions (application) null)

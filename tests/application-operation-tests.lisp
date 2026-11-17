@@ -496,9 +496,26 @@
                "a reader-upcased keyword names its lowercase member")
   nil)
 
+(-> application-operation-tests--draft-state (terminal-ui) list)
+(defun application-operation-tests--draft-state (ui)
+  "Snapshot editable state and pending previews without inventing selection state."
+  (let ((editor (terminal-ui-editor ui)))
+    (list (clinedi:line-editor-snapshot editor)
+          (terminal-ui--paired-closers editor)
+          (terminal-ui-completion-active-p ui)
+          (terminal-ui-completion-prefix ui)
+          (terminal-ui-completion-history-state ui)
+          (terminal-ui-completion-dismissed-p ui)
+          (list (copy-tree (selector-items (terminal-ui-completion-selector ui)))
+                (selector-selection (terminal-ui-completion-selector ui))
+                (selector-visible-count (terminal-ui-completion-selector ui)))
+          (copy-tree (terminal-ui-image-attachments ui))
+          (copy-list (terminal-ui-steering-input-previews ui))
+          (copy-list (terminal-ui-queued-input-previews ui)))))
+
 (-> test-application-tool-call-invocation () null)
 (defun test-application-tool-call-invocation ()
-  "Test a clicked tool call inserts a local call sending the same arguments again."
+  "Test formatter round trips and passive committed tool headers preserve drafts."
   (dolist (source '("{}"
                     "{\"text\":\"hello\",\"enabled\":false}"
                     "{\"text\":\"two\\nlines \\\"quoted\\\"\",\"limit\":3,\"ratio\":1.5,\"flag\":true}"
@@ -520,24 +537,270 @@
                "invocations spell simple arguments as a person would type them")
   (multiple-value-bind (application root) (application-operation-tests--application)
     (unwind-protect
-         (let ((terminal (make-instance 'recording-terminal :columns 100 :rows 12)))
-           (with-terminal-ui (ui (terminal-ui-create :terminal terminal :fullscreen-p t :prompt "> "))
-             (setf (application-ui application) ui)
-             (application-connect-transcript-actions application)
-             (terminal-ui-append-finalized
-              ui ':call
-              (response-item-entry
-               application
-               (json-object "type"      "function_call"
-                            "call_id"   "invocation-call"
-                            "namespace" "test-operation"
-                            "name"      "echo"
-                            "arguments" "{\"text\":\"hello\",\"enabled\":false}")))
-             (terminal-ui-set-input ui "Why did ")
-             (terminal-ui-process-event ui '(:click 4 1))
-             (test-assert (string= "Why did (test-operation.echo :text \"hello\" :enabled nil)"
-                                   (line-editor-text (terminal-ui-editor ui)))
-                          "clicking a call's header inserts its invocation at the cursor")))
+         (dolist (columns '(100 32))
+           (dolist (draft (list "" "Why did " (format nil "human~%draft") "stashed draft" "human [Image #1]"))
+             (let ((terminal (make-instance 'recording-terminal :columns columns :rows 12)))
+               (with-terminal-ui (ui (terminal-ui-create :terminal terminal :fullscreen-p t :prompt "> "))
+                 (setf (application-ui application) ui)
+                 (application-connect-transcript-actions application)
+                 (let ((item (json-object "type"      "function_call"
+                                          "call_id"   "invocation-call"
+                                          "namespace" "test-operation"
+                                          "name"      "echo"
+                                          "arguments" "{\"text\":\"hello\",\"enabled\":false}")))
+                   (terminal-ui-append-finalized
+                    ui ':call
+                    (if (= columns 32)
+                        (conversation-record-entry
+                         application (list :provider-item :wire-json (json-encode item)))
+                        (response-item-entry application item))))
+                 (terminal-ui-load-history ui '("older" "newer"))
+                 (terminal-ui-set-input
+                  ui (if (search "[Image #1]" draft)
+                         (user-message-input-create :text draft :image-pathnames (list (merge-pathnames "inert.png" root)))
+                         draft))
+                 (terminal-ui-set-pending-inputs ui '("steering preview") '("queued preview"))
+                 (setf (terminal-ui-completion-dismissed-p ui) t)
+                 (unless (zerop (length draft))
+                   (terminal-ui-process-event ui :left))
+                 (when (string= draft "stashed draft")
+                   (terminal-ui-process-event ui :history-previous))
+                 (let* ((editor (terminal-ui-editor ui))
+                        (before (application-operation-tests--draft-state ui)))
+                   (dotimes (click 3)
+                     (multiple-value-bind (action payload)
+                         (terminal-ui-process-event ui '(:click 4 1))
+                       (test-assert (and (not (member action '(:submit :queue))) (null payload))
+                                    "header clicks neither submit nor queue input"))
+                     (test-assert (equalp before (application-operation-tests--draft-state ui))
+                                  "committed header clicks preserve text, cursor and history stash"))
+                   (when (string= draft "stashed draft")
+                     (terminal-ui-process-event ui :history-next)
+                     (test-assert (and (string= draft (line-editor-text editor))
+                                       (= (1- (length draft)) (line-editor-cursor editor)))
+                                  "history traversal restores the exact human stash")))))))
+      (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
+  nil)
+
+(-> test-application-background-handoff-headers () null)
+(defun test-application-background-handoff-headers ()
+  "Test real handoff rendering and transcript clicks preserve rich editor state."
+  (multiple-value-bind (application root terminal tool)
+      (application-operation-tests--application)
+    (declare (ignore terminal))
+    (unwind-protect
+         (dolist (columns '(100 72))
+           (dolist (compact-p '(nil t))
+             (setf (application-compact-view-p application) compact-p)
+             (dolist (state '(:queued :running :completed :failed :cancelled :aborted))
+               (let ((terminal (make-instance 'recording-terminal :columns columns :rows 24)))
+                 (with-terminal-ui (ui (terminal-ui-create :terminal terminal :fullscreen-p t :prompt "> "))
+                   (setf (application-ui application) ui)
+                   (application-connect-transcript-actions application)
+                   (let* ((identifier "handoff-job-838")
+                          (record
+                            (list :tool-result
+                                  :tool    "test-operation.echo"
+                                  :status  ':ok
+                                  :output  "unrendered serialized output"
+                                  :details (list :tool-execution
+                                                 :handed-off-p   t
+                                                 :handoff-reason ':grace-expired
+                                                 :job            (list :id identifier :state state :description "owned background task"))))
+                          (entry      (application-tool-result-entry tool application record))
+                          (text       (terminal--spans-text entry))
+                          (active-p   (member state '(:queued :running)))
+                          (status     (case state
+                                        (:queued
+                                         "queued in background")
+                                        (:running
+                                         "still running in background")
+                                        (:completed
+                                         "result ready")
+                                        (:failed
+                                         "failed")
+                                        (otherwise
+                                         "cancelled")))
+                          (token      (if active-p "(job.cancel" identifier))
+                          (position   (search token text)))
+                     (test-assert (and (search "test-operation.echo" text)
+                                       (search status text)
+                                       (not (search "unrendered serialized output" text)))
+                                  "the actual around method presents the tool and background state")
+                     (test-assert (notany #'termdown:widget-p entry)
+                                  "background handoffs contain no insertion affordances")
+                     (test-assert position "the former cancel token or terminal job identity is visible")
+                     (test-assert (if (and active-p (= columns 72))
+                                     (and (search "…" text) (not (search identifier text)))
+                                     (search identifier text))
+                                  "wide identity is readable and narrow active details are clipped")
+                     (test-assert (if (and active-p (= columns 100))
+                                     (search (application--job-cancel-text identifier) text)
+                                     t)
+                                  "a fitting active handoff includes the readable complete cancel call")
+                     (test-assert (if compact-p
+                                     (not (search "owned background task" text))
+                                     (and (search "owned background task" text)
+                                          (search "blocking wait expired" text)))
+                                  "compact and detailed handoffs preserve their task-detail contract")
+                     (test-assert (equal (terminal-ui--separation-group entry)
+                                         (and compact-p (not (eq state ':failed))
+                                              (terminal-span-text (first entry))))
+                                  "handoff grouping follows the existing tool identity and row shape")
+                     (multiple-value-bind (plain display regions)
+                         (terminal-ui--finalized-content ui entry)
+                       (declare (ignore display))
+                       (test-assert (and (null regions) (search token plain))
+                                    "the real finalized renderer emits readable text without action regions"))
+                     (terminal-ui-append-finalized ui ':handoff entry)
+                     (terminal-ui-load-history ui '("older" "newer"))
+                     (terminal-ui-set-input
+                      ui (user-message-input-create
+                          :text            (format nil "human [Image #1]~%draft")
+                          :image-pathnames (list (merge-pathnames "inert.png" root))))
+                     (terminal-ui-set-pending-inputs ui '("steering preview") '("queued preview"))
+                     (setf (terminal-ui-completion-dismissed-p ui) t)
+                     (terminal-ui-process-event ui :left)
+                     (terminal-ui-process-event ui :history-previous)
+                     (let ((before (application-operation-tests--draft-state ui)))
+                       (dolist (offset '(0 1 3))
+                         (multiple-value-bind (action payload)
+                             (terminal-ui-process-event ui (list :click (+ 1 (or position 0) offset) 1))
+                           (test-assert (and (not (member action '(:submit :queue))) (null payload))
+                                        "clicks on former cancel tokens neither submit nor queue input"))
+                         (terminal-ui--run-pending-action ui)
+                         (test-assert (and (null (terminal-ui-pending-action ui))
+                                           (equalp before (application-operation-tests--draft-state ui)))
+                                      "actual clicks and pending draining preserve the complete available draft state")))
+                     (terminal-ui-process-event ui :history-next)
+                     (test-assert (and (string= (format nil "human [Image #1]~%draft")
+                                               (line-editor-text (terminal-ui-editor ui)))
+                                       (= (1- (length (line-editor-text (terminal-ui-editor ui))))
+                                          (line-editor-cursor (terminal-ui-editor ui))))
+                                  "history restores the exact draft and non-end stash cursor")))))))
+      (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
+  nil)
+
+(-> test-application-retained-insertion-actions () null)
+(defun test-application-retained-insertion-actions ()
+  "Test retained transcript insertion actions are inert at both delivery boundaries."
+  (let* ((terminal    (make-instance 'recording-terminal :columns 80))
+         (ui          (terminal-ui-create :terminal terminal))
+         (application (make-instance 'application :ui ui))
+         (action      '(:insert "(test-operation.echo :text \"hello\" :enabled nil)")))
+    (with-terminal-ui (active ui)
+      (application-connect-transcript-actions application)
+      (terminal-ui-load-history active '("older"))
+      (terminal-ui-set-input active (format nil "human~%draft"))
+      (terminal-ui-process-event active :left)
+      (terminal-ui-process-event active :history-previous)
+      (let ((before (application-operation-tests--draft-state active)))
+        (test-assert (terminal-ui-activate active action)
+                     "the installed callback receives retained actions")
+        (test-assert (equalp before (application-operation-tests--draft-state active))
+                     "retained callback insertion leaves the draft and stash untouched")
+        (setf (terminal-ui-pending-action active) action)
+        (terminal-ui--run-pending-action active)
+        (test-assert (null (terminal-ui-pending-action active))
+                     "pending retained actions are drained")
+        (test-assert (equalp before (application-operation-tests--draft-state active))
+                     "drained insertion leaves all editable state untouched"))))
+  nil)
+
+(-> test-application-deliberate-composer-input () null)
+(defun test-application-deliberate-composer-input ()
+  "Test semantic typing and paste preserve deliberate text until explicit submission."
+  (dolist (row (list (list :insert "ordinary human prose")
+                    (list :insert "(+ 1 2)")
+                    (list :paste (format nil "(test-operation.echo :text \"two~%lines \\\"quoted\\\"\" :enabled nil)"))))
+    (let* ((terminal (make-instance 'recording-terminal :columns 80))
+           (ui       (terminal-ui-create :terminal terminal))
+           (text     (second row)))
+      (with-terminal-ui (active ui)
+        (multiple-value-bind (action payload) (terminal-ui-process-event active row)
+          (test-assert (and (not (member action '(:submit :queue))) (null payload))
+                       "typing and paste do not submit or queue input"))
+        (test-assert (string= text (line-editor-text (terminal-ui-editor active)))
+                     "deliberate prose and invocation-shaped Lisp retain exact bytes")
+        (multiple-value-bind (action payload) (terminal-ui-process-event active :submit)
+          (test-assert (and (eq action :submit) (string= payload text))
+                       "explicit submission returns the complete deliberate input"))
+        (terminal-ui-process-event active :history-previous)
+        (test-assert (string= text (line-editor-text (terminal-ui-editor active)))
+                     "deliberate input remains available through real history recall"))))
+  nil)
+
+(-> test-application-saved-composer-ingress () null)
+(defun test-application-saved-composer-ingress ()
+  "Test inert handoff restoration and rich draft setters preserve intentional input."
+  (let* ((terminal (make-instance 'recording-terminal :columns 80))
+         (ui       (terminal-ui-create :terminal terminal))
+         (text     (format nil "saved human~%draft"))
+         (record   (list :handoff :draft text))
+         (image    #P"/owned-inert-image.png"))
+    (with-terminal-ui (active ui)
+      (terminal-ui-set-input active (localgroup-handoff-initial-input record))
+      (test-assert (string= text (line-editor-text (terminal-ui-editor active)))
+                   "actual handoff initial-input ingress restores the saved draft")
+      (terminal-ui-set-input
+       active
+       (user-message-input-create
+        :text            "human [Image #1]"
+        :image-pathnames (list image)))
+      (let ((before (application-operation-tests--draft-state active)))
+        (terminal-ui-set-pending-inputs active nil '("authorized preview"))
+        (test-assert (and (equalp (first before) (clinedi:line-editor-snapshot (terminal-ui-editor active)))
+                          (equal (terminal-ui-image-attachments active) (list (cons "[Image #1]" image))))
+                     "pending previews preserve the human draft, cursor and attachment"))
+      (terminal-ui-recall-follow-up
+       active
+       (user-message-input-create
+        :text            "recalled [Image #1]"
+        :image-pathnames (list image)))
+      (test-assert (and (string= "recalled [Image #1]" (line-editor-text (terminal-ui-editor active)))
+                        (equal (terminal-ui-image-attachments active) (list (cons "[Image #1]" image))))
+                   "explicit rich follow-up recall preserves its attachment")))
+  nil)
+
+(-> test-application-authorized-composer-queue () null)
+(defun test-application-authorized-composer-queue ()
+  "Test authorized admission and explicit recall/cycle without executing queued work."
+  (let* ((configuration (test-configuration))
+         (root          (test-configuration-root configuration))
+         (conversation  (conversation-create configuration :identifier "composer-queue"))
+         (terminal      (make-instance 'recording-terminal :columns 80))
+         (ui            (terminal-ui-create :terminal terminal))
+         (application   (make-instance 'application :configuration configuration
+                                      :conversation conversation :ui ui))
+         (controller    nil))
+    (unwind-protect
+         (with-terminal-ui (active ui)
+           (setf controller (application-input-controller-create
+                             application :load-pending-p nil :start-reader-p nil))
+           (application-input-controller--enqueue controller ':message "active turn")
+           (application-input-controller--next-work controller)
+           (terminal-ui-set-input active "human draft")
+           (terminal-ui-process-event active :left)
+           (let ((before (clinedi:line-editor-snapshot (terminal-ui-editor active))))
+             (dolist (input '("authorized one" "(test-operation.echo :text \"two\")"))
+               (multiple-value-bind (accepted delivery)
+                   (application-input-controller-submit-primary-prompt
+                    controller input :prefer-steering-p nil)
+                 (declare (ignore delivery))
+                 (test-assert accepted "authorized queued text is admitted")))
+             (test-assert (equalp before (clinedi:line-editor-snapshot (terminal-ui-editor active)))
+                          "queue admission and preview publication preserve the human draft")
+             (test-assert (= 2 (length (terminal-ui-queued-input-previews active)))
+                          "authorized queued inputs have separate previews"))
+           (test-assert (application-input-controller--recall-follow-up controller)
+                        "explicit recall selects authorized work")
+           (test-assert (string= "(test-operation.echo :text \"two\")"
+                                 (line-editor-text (terminal-ui-editor active)))
+                        "recall preserves invocation-shaped queued text")
+           (application-input-controller--process-event controller :complete-previous)
+           (test-assert (string= "authorized one" (line-editor-text (terminal-ui-editor active)))
+                        "semantic queue cycling selects the preceding authorized input"))
+      (when controller (application-input-controller-stop controller))
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
   nil)
 
