@@ -112,6 +112,8 @@
   test-context-admission-mission-refusal-settlement
   test-context-admission-mission-refusal-proof
   test-context-admission-mission-handoff-reasons
+  test-context-admission-prepared-images
+
   test-context-admission-boundary
   test-context-admission-fresh-projection
   test-context-admission-switched-reasoning
