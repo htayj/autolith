@@ -453,7 +453,7 @@ Run-end upload is asynchronous and failure-isolated. Unreported exits are intern
 
 (defparameter *telemetry-request-roles*
   '((:agent "agent") (:permission-classifier "permission_classifier")
-    (:title-generation "title_generation") (:compaction "compaction")
+    (:goal-disposition "goal_disposition") (:title-generation "title_generation") (:compaction "compaction")
     (:inference "inference"))
   "Known purposes of actual model requests.")
 
