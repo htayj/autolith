@@ -96,13 +96,19 @@ may use provider token counts when available; the default is not a tokenizer."))
   "Start ordinary request-local evidence; ephemera require the unmeasured fallback."
   (let ((header (provider-context--soft-header provider tools)))
     ;; Preallocate mutable fields to preserve the shared evidence plist head.
-    (append (and header (provider-context--header-components provider tools))
-     (list :provider provider :conversation conversation
-          :history         (and header (provider-context--history provider conversation))
-          :soft-header     header
-          :eligible-p      (and header (null (conversation-ephemeral-input-entries conversation)) t)
-          :encoder nil :projection nil :tools nil :wire-provider nil :wire nil
-          :wire-characters 0))))
+    (let ((context
+            (append (and header (provider-context--header-components provider tools))
+                    (list :provider provider :conversation conversation
+                          :generation (conversation-input-measurement-generation conversation)
+                          :history (and header (provider-context--history provider conversation))
+                          :soft-header header
+                          :eligible-p (and header (null (conversation-ephemeral-input-entries conversation)) t)
+                          :encoder nil :projection nil :tools nil :wire-provider nil :wire nil
+                          :wire-characters 0 :route nil))))
+      (with-recursive-lock-held ((conversation-append-lock conversation))
+        (setf (conversation-context-usage-request conversation) context))
+      context)))
+
 
 (-> provider-context--wire-plan (model-provider hash-table) list)
 (defun provider-context--wire-plan (provider request)
@@ -291,6 +297,15 @@ that prefix. Count every new item and take no credit for removed reasoning."
          (sample           (and conversation (conversation-context-usage-sample conversation)))
          (header-changed-p (not (equal (getf sample :soft-header) (getf context :soft-header)))))
     (when (and (eq provider (getf context :provider)) (getf context :eligible-p)
+               (eq context (conversation-context-usage-request conversation))
+               (= (getf context :generation)
+                  (conversation-input-measurement-generation conversation))
+               (or (not (typep provider 'codex-subscription-provider))
+                   (let ((route (provider-input-measurement--route
+                                 provider *provider-input-measurement-credentials*)))
+                     (and route (equal route *provider-input-measurement-route*)
+                          (equal route (getf sample :route)))))
+
                (provider-context--sample-matches-p
                 sample (getf context :soft-header) (provider-context--history provider conversation)
                 :components context))
@@ -351,7 +366,14 @@ messages that later change fail closed."
          (output       (and (json-object-p usage) (json-get usage "output_tokens")))
          (total        (and (json-object-p usage) (json-get usage "total_tokens"))))
     (when conversation
+      (with-recursive-lock-held ((conversation-append-lock conversation))
+       (when (and (eq context (conversation-context-usage-request conversation))
+                  (= (getf context :generation)
+                     (conversation-input-measurement-generation conversation))
+                  (eq provider (getf context :wire-provider)))
       (when (and (getf context :eligible-p) adapter projection
+                 (or (not (typep provider 'codex-subscription-provider))
+                     (getf context :route))
                  (getf context :wire)
                  (typep input '(integer 1)) (typep output '(integer 0))
                  (or (plusp output) (null (provider-result-output-items result)))
@@ -386,7 +408,7 @@ messages that later change fail closed."
                    (wire                             (provider-context--wire-plan adapter (provider-request-object adapter covered (getf context :tools)))))
               (when (provider-context--wire-fields-compatible-p (getf wire :fields) (getf (getf context :wire) :fields))
                 (let ((sample
-                        (list :format 2 :soft-header (getf context :soft-header)
+                        (list :route (getf context :route) :format 2 :soft-header (getf context :soft-header)
                               :policy         (getf context :policy)
                               :prompt         (getf context :prompt)
                               :tool-header    (getf context :tool-header)
@@ -414,6 +436,7 @@ messages that later change fail closed."
                    (conversation-append-record conversation (list :context-usage :sample sample))
                    (setf (conversation-context-usage-sample conversation)
                          (conversation-context-usage-resolve sample previous)))))))))))
+))
   nil)
 
 (-> provider-context--request-characters ((option model-provider) t) (values (integer 0) boolean))
@@ -456,13 +479,16 @@ messages that later change fail closed."
 (defmethod provider-open-response-stream :before
     ((provider model-provider) (request hash-table) &key credentials conversation)
   "Admit the fully encoded streaming request after provider-specific modifications."
-  (declare (ignore credentials))
   (provider-context--admit-request provider request)
   (when (and conversation *provider-context-request*
              (eq conversation (getf *provider-context-request* :conversation)))
-    (setf (getf *provider-context-request* :wire-provider) provider
+    (setf (getf *provider-context-request* :route)
+          (provider-input-measurement--route provider credentials)
+          (getf *provider-context-request* :wire-provider) provider
           (getf *provider-context-request* :wire) (provider-context--wire-plan provider request)          (getf *provider-context-request* :wire-characters)
           (provider-context--request-characters provider (provider-context--request-items provider request))))
+  (provider-input-measurement--attest provider request conversation)
+
   (when *provider-context-admission-state*
     (setf (first *provider-context-admission-state*) :entered
           (rest *provider-context-admission-state*) nil)))
@@ -533,3 +559,256 @@ encoded request."
               ;; No positive output envelope exists for this encoded candidate.
               (let ((*provider-maximum-output-tokens* ceiling))
                 (provider-context--admit-request provider candidate)))))))
+;;;; -- Measured Ordinary Input --
+
+(defparameter *provider-input-measurement-context* nil
+  "An ordinary request's exact owner, issuance and final transport proof, or NIL.")
+
+(-> provider-input-measurement--digest (t) string)
+(defun provider-input-measurement--digest (value)
+  "Hash portable proof data without retaining its JSON representation."
+  (first (provider-cache-prefix--entry value)))
+
+(-> provider-input-measurement--root (list integer) string)
+(defun provider-input-measurement--root (entries count)
+  "Fold exactly COUNT ordered item fingerprints into one domain-separated root."
+  (provider-input-measurement--digest
+   (vector "autolith-input-prefix-v1" (coerce (subseq entries 0 count) 'vector))))
+
+(-> provider-input-measurement--route (model-provider t) (option string))
+(defun provider-input-measurement--route (provider credentials)
+  "Attest the Codex account header inside credential ownership, not bearer identity.
+
+Unknown or malformed routing has no proof. Only a bounded digest may escape the
+credential scope; access-token refresh does not change a known account route."
+  (when (and (typep provider 'codex-subscription-provider)
+             (typep credentials 'oauth-credentials))
+    (let ((account (oauth-credentials-account-id credentials)))
+      (when (and (stringp account) (<= 1 (length account) 256)
+                 (every (lambda (character)
+                          (or (and (char<= #\a character #\z))
+                              (and (char<= #\A character #\Z))
+                              (and (char<= #\0 character #\9))
+                              (find character "-_.")))
+                        account))
+        (provider-input-measurement--digest
+         (vector "codex-account-route-v1" account))))))
+
+(-> provider-input-measurement--begin-route (model-provider t) (option string))
+(defun provider-input-measurement--begin-route (provider credentials)
+  "Start an actual credential-owned attempt without inheriting an earlier proof."
+  (when *provider-input-measurement-context*
+    (setf (getf *provider-input-measurement-context* :proof) nil))
+  (provider-input-measurement--route provider credentials))
+
+(-> provider-input-measurement--end-route (model-provider t (option string)) null)
+(defun provider-input-measurement--end-route (provider credentials route)
+  "Revoke proof if routing changed before ordinary parsing and cleanup returned."
+  (unless (equal route (provider-input-measurement--route provider credentials))
+    (when *provider-context-request*
+      (setf (getf *provider-context-request* :eligible-p) nil))
+    (when *provider-input-measurement-context*
+      (setf (getf *provider-input-measurement-context* :proof) nil)))
+  nil)
+
+(-> provider-input-measurement--identity (model-provider hash-table) (option string))
+(defun provider-input-measurement--identity (provider request)
+  "Identify the supported full-input interpretation and effective transport route."
+  (when (and (typep provider 'codex-subscription-provider)
+             *provider-input-measurement-route*
+             (equal *provider-input-measurement-route*
+                    (provider-input-measurement--route
+                     provider *provider-input-measurement-credentials*))
+             (vectorp (json-get request "input"))
+             (stringp (json-get request "model"))
+             (null (json-get request "request")))
+    (provider-input-measurement--digest
+     (vector "codex-responses-full-input-v2"
+             *provider-input-measurement-route*
+             (symbol-name (class-name (class-of provider)))
+             (symbol-name (provider-family provider))
+             (config :provider-endpoint (provider-configuration provider))
+             (config :model (provider-configuration provider))
+             (json-get request "model")
+             (json-get request "reasoning")))))
+
+(-> provider-input-measurement--estimate (model-provider hash-table) (values (option integer) keyword))
+(defun provider-input-measurement--estimate (provider request)
+  "Credit only a measured exact ordered prefix, charging all current overhead.
+
+This is a measured/heuristic estimate, not a tokenizer upper bound. The prior
+whole input already includes its old overhead; charging current overhead again
+intentionally avoids subtracting any unproven old estimate."
+  (let* ((context  *provider-input-measurement-context*)
+         (owner    (getf context :owner))
+         (receipt  (and owner (conversation-input-measurement owner)))
+         (identity (provider-input-measurement--identity provider request)))
+    (cond
+      ((not (and owner (eq provider (getf context :adapter))))
+       (values nil :no-owner))
+      ((not (conversation-input-measurement-valid-p receipt))
+       (values nil :no-anchor))
+      ((null identity)
+       (values nil :unsupported-layout))
+      ((not (equal identity (getf receipt :identity)))
+       (values nil :identity-changed))
+      (t
+       (let* ((items   (json-get request "input"))
+              (count   (getf receipt :count))
+              (entries (getf (provider-cache-wire-plan request) :items)))
+         (if (or (< (length entries) count)
+                 (not (equal (provider-input-measurement--root entries count)
+                             (getf receipt :root))))
+             (values nil :prefix-changed)
+             (let ((unaccounted (json-object-copy request)))
+               (setf (gethash "input" unaccounted) (subseq items count))
+               (values (+ (getf receipt :input)
+                          (ceiling (provider-context--request-characters unaccounted) 4))
+                       :measured-prefix))))))))
+
+(defmethod provider-request-input-token-estimate :around
+    ((provider model-provider) (request hash-table))
+  "Use an independently proven ordinary measurement, otherwise the existing estimate."
+  (multiple-value-bind (estimate reason)
+      (provider-input-measurement--estimate provider request)
+    (declare (ignore reason))
+    (if estimate
+        (values estimate t)
+        (call-next-method))))
+
+(defmethod provider-request-object :before
+    ((provider model-provider) (conversation conversation)
+     (tool-namespaces vector) &key goal-context compaction-p)
+  "Authorize measurement only for this ordinary attempt's exact conversation object."
+  (declare (ignore tool-namespaces goal-context))
+  (when (and *provider-context-request*
+             (or compaction-p
+                 (not (eq conversation (getf *provider-context-request* :conversation)))
+                 (not (eq provider (getf *provider-context-request* :provider)))))
+    (setf (getf *provider-context-request* :eligible-p) nil))
+  (when *provider-input-measurement-context*
+    (setf (getf *provider-input-measurement-context* :adapter)
+          (and (not compaction-p)
+               (eq conversation (getf *provider-input-measurement-context* :owner))
+               provider))))
+
+(-> provider-input-measurement--attest (model-provider hash-table (option conversation)) null)
+(defun provider-input-measurement--attest (provider request conversation)
+  "Attest the actual admitted final request, after routing and output headroom."
+  (let* ((context  *provider-input-measurement-context*)
+         (identity (provider-input-measurement--identity provider request)))
+    (when (and context identity
+               (eq conversation (getf context :owner))
+               (eq provider (getf context :adapter)))
+      (let* ((plan  (provider-cache-wire-plan
+                     request :volatile-items (getf *provider-cache-request-prefix* :volatile-items 0)))
+             (count (getf plan :prefix-items)))
+        (setf (getf *provider-input-measurement-context* :proof)
+              (and (plusp count)
+                   (list :version 1 :input 1 :count count
+                         :root (provider-input-measurement--root (getf plan :items) count)
+                         :identity identity :issued (getf context :issued) :layout :responses))))))
+  nil)
+
+(-> provider-input-measurement--usage (provider-result) (option integer))
+(defun provider-input-measurement--usage (result)
+  "Accept complete positive full input, with any cache counter a valid subset."
+  (let ((usage (provider-usage-normalize (provider-result-usage result))))
+    ;; Custom providers may return portable lists or no usage; neither attests input.
+    (when (hash-table-p usage)
+      (let ((input  (json-get usage "input_tokens"))
+            (cached (json-get usage "cached_input_tokens")))
+        (and (typep input '(integer 1))
+             (or (null cached) (and (typep cached '(integer 0)) (<= cached input)))
+             input)))))
+
+(defmethod provider-open-response-stream :around
+    ((provider codex-subscription-provider) (request hash-table) &key credentials conversation)
+  "Bind the actual transport credentials before either final admission check."
+  (declare (ignore request))
+  (let* ((route                                    (provider-input-measurement--route provider credentials))
+         (*provider-input-measurement-credentials* credentials)
+         (*provider-input-measurement-route*       route)
+         (*provider-context-request*
+           (and (eq conversation (getf *provider-context-request* :conversation))
+                *provider-context-request*))
+         (*provider-input-measurement-context*
+           (and (eq conversation (getf *provider-input-measurement-context* :owner))
+                *provider-input-measurement-context*)))
+    (unwind-protect (call-next-method)
+      ;; A mutable credential object must not attest a route changed during transport.
+      (unless (equal route (provider-input-measurement--route provider credentials))
+        (when *provider-context-request*
+          (setf (getf *provider-context-request* :eligible-p) nil))
+        (when *provider-input-measurement-context*
+          (setf (getf *provider-input-measurement-context* :proof) nil))))))
+
+(-> provider-input-measurement--items-root (list integer) string)
+(defun provider-input-measurement--items-root (items count)
+  "Hash each semantic item separately, discarding payload serialization immediately."
+  (provider-input-measurement--root
+   (loop for item in items repeat count
+         collect (provider-cache-prefix--entry item))
+   count))
+
+(-> provider-call-with-input-measurement (conversation function) (values provider-result list))
+(defun provider-call-with-input-measurement (conversation continuation)
+  "Return an ordinary result and an earned receipt only after successful cleanup.
+
+The context is object-local and never inferred from goal context, shared IDs or
+paths. A concurrent replacement or completion cannot publish this stale attempt."
+  (let* ((issued                          (with-recursive-lock-held ((conversation-append-lock conversation))
+                                            (incf (conversation-input-measurement-issuance conversation))))
+         (generation                      (conversation-input-measurement-generation conversation))
+         (log-generation                  (conversation-log-generation conversation))
+         (items                           (conversation-input-items conversation))
+         (count                           (length items))
+         (root                            (provider-input-measurement--items-root items count))
+         ;; Always capture a fresh request-local boundary, even without an observer.
+         (*provider-cache-request-prefix* nil)
+         (*provider-cache-prefix-function*
+           (or *provider-cache-prefix-function* (constantly nil)))
+         (*provider-input-measurement-context*
+           (list :owner conversation :issued issued :adapter nil :proof nil))
+         (result                          (funcall continuation))
+         (input                           (provider-input-measurement--usage result))
+         (proof                           (getf *provider-input-measurement-context* :proof)))
+    (with-recursive-lock-held ((conversation-append-lock conversation))
+      (let ((current (conversation-input-items conversation)))
+        (values result
+                (when (and input proof
+                           (= generation (conversation-input-measurement-generation conversation))
+                           (= log-generation (conversation-log-generation conversation))
+                           (= issued (conversation-input-measurement-issuance conversation))
+                           (<= count (length current))
+                           (equal root (provider-input-measurement--items-root current count)))
+                  (setf (getf proof :input) input)
+                  (list :owner conversation :receipt proof :generation generation
+                        :log-generation log-generation :count count :root root)))))))
+
+(-> provider-input-measurement-ticket-receipt (conversation list) list)
+(defun provider-input-measurement-ticket-receipt (conversation ticket)
+  "Revalidate transient issuance and lineage while holding the owner's append lock."
+  (let ((receipt (getf ticket :receipt))
+        (items   (conversation-input-items conversation)))
+    (when (and (eq conversation (getf ticket :owner))
+               (conversation-input-measurement-valid-p receipt)
+               (= (getf receipt :issued) (conversation-input-measurement-issuance conversation))
+               (eql (getf ticket :generation) (conversation-input-measurement-generation conversation))
+               (eql (getf ticket :log-generation) (conversation-log-generation conversation))
+               (typep (getf ticket :count) '(integer 0))
+               (<= (getf ticket :count) (length items))
+               (equal (getf ticket :root)
+                      (provider-input-measurement--items-root items (getf ticket :count))))
+      receipt)))
+
+(-> provider-input-measurement-close-stream (t) null)
+(defun provider-input-measurement-close-stream (stream)
+  "Keep cleanup best effort, but revoke ordinary attestation when cleanup fails."
+  (handler-case
+      (when (open-stream-p stream)
+        (close stream :abort t))
+    ((or error sb-sys:deadline-timeout) ()
+      (when *provider-input-measurement-context*
+        (setf (getf *provider-input-measurement-context* :proof) nil))))
+  nil)

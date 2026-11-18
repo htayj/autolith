@@ -766,16 +766,18 @@ retries stay auditable next to the request they belong to."
 (-> agent--persist-provider-result
     (agent provider-result
      &key (:request-number integer)
-          (:call-plans list))
+          (:call-plans list)
+          (:input-measurement list))
     null)
 (defun agent--persist-provider-result
-    (agent result &key request-number call-plans)
+    (agent result &key request-number call-plans input-measurement)
   "Append RESULT items in wire order and record the billed usage.
 
 The provider billed the response before it reached this image, so the usage
 record is written even when an item is refused and the turn then fails."
   (let ((conversation (agent-conversation agent)))
-    (unwind-protect
+    (with-recursive-lock-held ((conversation-append-lock conversation))
+     (unwind-protect
          (dolist (item (provider-result-output-items result))
            (unless (json-object-p item)
              (error 'agent-loop-error
@@ -802,13 +804,14 @@ record is written even when an item is refused and the turn then fails."
                   (getf plan :persistence)
                   ':durable)
               :request-number request-number)))
-      (agent--record-provider-result-usage agent result :request-number request-number)))
+      (agent--record-provider-result-usage agent result :request-number request-number
+                                           :input-measurement input-measurement))))
   nil)
 
 (-> agent--record-provider-result-usage
-    (agent provider-result &key (:request-number integer))
+    (agent provider-result &key (:request-number integer) (:input-measurement list))
     null)
-(defun agent--record-provider-result-usage (agent result &key request-number)
+(defun agent--record-provider-result-usage (agent result &key request-number input-measurement)
   "Record RESULT's billed usage independently of its item validation."
   (let ((conversation (agent-conversation agent)))
     (conversation-append-provider-metadata
@@ -819,9 +822,13 @@ record is written even when an item is refused and the turn then fails."
                                       (provider-usage-normalize
                                        (provider-result-usage result)))
                    :request-identity (conversation-request-identity conversation))
+             (let ((receipt (provider-input-measurement-ticket-receipt
+                             conversation input-measurement)))
+               (and receipt (list :input-measurement receipt)))
              ;; The service's effective retention mode, when it reports one.
              (let ((context (agent--result-reasoning-context result)))
                (and context (list :reasoning-context context))))))
+
   nil)
 
 (-> agent--append-provider-item
@@ -2121,7 +2128,7 @@ loop, so compaction ahead of the user message shares the turn's budget."
               :next-request-tool-rounds    tool-rounds)
            (incf request-number compaction-requests)
            (setf next-request-details details)))
-       (let* ((conversation    (agent-conversation agent))
+       (let* ((conversation      (agent-conversation agent))
               (tool-calls-p
                 (and tools-p
                      (eq (agent--request-tool-choice tools-p tool-restriction-p tool-rounds)
@@ -2135,6 +2142,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                         :tool-allowlist     tool-allowlist))
               (cache-prefix    nil)
               (context-request nil)
+              (input-measurement nil)
+
               (result
                 (loop
                   (agent--check-request-budget agent request-number)
@@ -2177,16 +2186,20 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                       (not tool-restriction-p)
                                       (mcp-tool-registry-context-contributions
                                        (agent-tool-registry agent)))))
-                          (provider-stream-turn
-                           (agent-provider agent)
-                           conversation
-                           :tool-namespaces tool-namespaces
-                           :event-callback
-                           (agent--provider-event-callback
-                            observer
-                            :conversation   conversation
-                            :request-number request-number)
-                           :goal-context    goal-context)))
+                          (multiple-value-bind (measured-result ticket)
+                              (provider-call-with-input-measurement conversation (lambda ()
+                                                                                  (provider-stream-turn
+                                                                                   (agent-provider agent)
+                                                                                   conversation
+                                                                                   :tool-namespaces tool-namespaces
+                                                                                   :event-callback
+                                                                                   (agent--provider-event-callback
+                                                                                    observer
+                                                                                    :conversation   conversation
+                                                                                    :request-number request-number)
+                                                                                   :goal-context    goal-context)))
+                            (setf input-measurement ticket)
+                            measured-result)))
                     (provider-context-budget-error (condition)
                       ;; Mission supervision and zero-usage settlement have unwound.
                       (when recovery-used-p (error condition))
@@ -2214,6 +2227,7 @@ loop, so compaction ahead of the user message shares the turn's budget."
               (calls
                 (remove-if-not #'function-call-item-p
                                (provider-result-output-items result)))
+
               (completion-details
                 (list :request-number    request-number
                       :response-id       (provider-result-response-id result)
@@ -2255,7 +2269,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
                        agent
                        result
                        :request-number request-number
-                        :call-plans    call-plans))
+                        :call-plans    call-plans
+                       :input-measurement input-measurement))
                   (unless persistence-started-p
                     (agent--record-provider-result-usage
                      agent result :request-number request-number)))
@@ -2275,6 +2290,7 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                      :usage          (provider-result-usage result))
             (when (or (agent-turn-complete-p agent result)
                       (and (null calls) (mission-agent-terminal-p agent)))
+
               (agent-observer-status
                observer
                :turn-completed
