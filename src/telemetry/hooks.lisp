@@ -71,7 +71,7 @@
 (-> telemetry--condition-error-type (condition) keyword)
 (defun telemetry--condition-error-type (condition)
   "Classify failures without exporting reports, server bodies, or arbitrary class names."
-  (cond ((typep condition 'application-turn-cancelled)
+  (cond ((typep condition '(or application-turn-cancelled provider-owner-ended))
          ':cancelled)
         ((typep condition 'job-aborted)
          (if (eq (job-aborted-reason condition) ':timeout) ':timeout ':cancelled))

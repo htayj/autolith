@@ -291,6 +291,17 @@ fragments that providers interleave with empty content deltas."
          (when (equal (getf details :tool) "plan.update")
            (acp-session--plan session))))))
   (case status
+    (:provider-connection
+     (acp-extension-notify
+      session "provider-connection"
+      (agentcomms:json-object
+       "episode" (getf details :episode)
+       "phase" (string-downcase (symbol-name (getf details :phase)))
+       "endpoint" (getf details :endpoint)
+       "attempt" (getf details :attempt)
+       "routeIndex" (getf details :route-index)
+       "delay" (or (getf details :delay) :null)
+       "nextRetryAt" (or (getf details :next-retry-at) :null))))
     (:provider-request-completed
      (acp-extension-notify session "state"))
     (:compaction-completed
