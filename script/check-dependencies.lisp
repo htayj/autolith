@@ -118,6 +118,9 @@ runtime libraries with the tools' own copies."
 
 (defun autolith-register-check-dependencies (source-root)
   "Make SOURCE-ROOT's installed check tools loadable after the runtime registry."
+  ;; The checker lock selects UIOP's package-local-nickname support.
+  (load (merge-pathnames ".qlot/local-projects/asdf/build/asdf.lisp"
+                         (autolith-check-dependency-root source-root)))
   (setf *autolith-check-dependency-directories*
         (autolith-check-dependency-directories source-root))
   (unless (member 'autolith-locate-check-system asdf:*system-definition-search-functions*)

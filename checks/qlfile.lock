@@ -2,6 +2,10 @@
  (:class qlot/source/dist:source-dist
   :initargs (:distribution "https://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
   :version "2026-01-01"))
+("asdf" .
+ (:class qlot/source/asdf:source-asdf
+  :initargs (:version "3.3.7.4")
+  :version "3.3.7.4"))
 ("cheque" .
  (:class qlot/source/git:source-git
   :initargs (:remote-url "https://github.com/lambda-symbolics/cheque.git")
