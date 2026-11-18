@@ -1356,6 +1356,8 @@
                 #:ordered-map-set
                 #:ordered-map-values)
   (:export #:application-command
+           #:provider-final-request-participation-p
+           #:provider-call-prepared-request-decision
            #:application-command-aliases
            #:application-command-argument
            #:application-command-busy-action

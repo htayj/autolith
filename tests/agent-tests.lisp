@@ -2609,7 +2609,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                                            "text" "Done."))))
                 (provider
                   (make-instance
-                   'scripted-provider
+                   'prepared-scripted-provider
                    :configuration configuration
                    :results       (list (agent-test-result "compact-1"
                                                            (list summary-item)

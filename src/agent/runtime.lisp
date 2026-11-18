@@ -559,6 +559,9 @@ INITARGS supplies subclass assignment metadata, never participant state."
          :worker            (or worker (lisp-worker-pool-create configuration))
          initargs))
 
+(defparameter *agent-unissued-soft-attempts* 0
+  "Turn-local safety attempts refused before transport, shared with nested compaction.")
+
 (defgeneric agent-run-user-turn
     (agent content
      &key observer goal-context tools-p tool-allowlist tool-restriction-p
@@ -1645,6 +1648,9 @@ tool registry reaches the very next provider request."
        (list :message-count (length messages)))))
   nil)
 
+(defparameter *agent-prepared-input-estimate* nil
+  "Input-only estimate of the actual final ordinary candidate, when available.")
+
 (defgeneric agent-should-compact-p (agent)
   (:documentation
    "Return true when AGENT's conversation should compact before continuing."))
@@ -1658,13 +1664,14 @@ tool registry reaches the very next provider request."
   t)
 
 (defmethod agent-should-compact-p ((agent agent))
-  "Compare current matched input accounting with the soft compaction threshold."
-  (>= (context-estimate-known-tokens
-       (agent-configuration agent) (agent-conversation agent)
-       :tool-registry (agent-tool-registry agent)
-       :hurry-up-p    (agent-hurry-up-p agent)
-       :provider      (agent-provider agent)
-       :family        (provider-family (agent-provider agent)))
+  "Compare the final prepared input with the soft threshold, before transport."
+  (>= (or *agent-prepared-input-estimate*
+          (context-estimate-known-tokens
+           (agent-configuration agent) (agent-conversation agent)
+           :tool-registry (agent-tool-registry agent)
+           :hurry-up-p    (agent-hurry-up-p agent)
+           :provider      (agent-provider agent)
+           :family        (provider-family (agent-provider agent))))
       (configuration-compaction-token-limit (agent-configuration agent))))
 
 (-> agent--note-compaction-request
@@ -1890,8 +1897,9 @@ previous one's notes and names the records of VIEW as unsummarized."
 
 (-> agent--check-request-budget (agent (integer 0)) null)
 (defun agent--check-request-budget (agent request-number)
-  "Refuse another request when AGENT's turn has used its request budget."
-  (when (>= request-number *agent-maximum-provider-requests-per-turn*)
+  "Refuse another request when paid and unissued attempts exhaust AGENT's turn budget."
+  (when (>= (+ request-number *agent-unissued-soft-attempts*)
+            *agent-maximum-provider-requests-per-turn*)
     (error 'agent-loop-error
            :message         (format nil "The turn reached its ~D provider-request safety limit."
                                     *agent-maximum-provider-requests-per-turn*)
@@ -2101,12 +2109,13 @@ Return issued request count and optional next-request details."
 
 REQUEST-NUMBER counts provider requests the turn already issued before the
 loop, so compaction ahead of the user message shares the turn's budget."
-    (let ((*task-unfinished-work-agent* agent)
-          (storm-state                  (agent-tool-storm-state-create))
-          (tool-rounds                  0)
-          (tool-calls                   0)
-          (maximum-output-tokens        (agent--configured-max-output-tokens agent))
-          (next-request-details         nil))
+    (let ((*task-unfinished-work-agent*   agent)
+          (*agent-unissued-soft-attempts* 0)
+          (storm-state                    (agent-tool-storm-state-create))
+          (tool-rounds                    0)
+          (tool-calls                     0)
+          (maximum-output-tokens          (agent--configured-max-output-tokens agent))
+          (next-request-details           nil))
      (declare (special *task-unfinished-work-agent*))
      (loop for recovery-used-p = nil
            do (agent--check-request-budget agent request-number)
@@ -2114,7 +2123,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
          (mcp-tool-registry-refresh
           (agent-tool-registry agent)
           :only-dirty-p t))
-       (when (agent-should-compact-p agent)
+       (when (and (not (provider-final-request-participation-p (agent-provider agent)))
+                  (agent-should-compact-p agent))
          (setf recovery-used-p t)
          (multiple-value-bind (compaction-requests details)
              (agent-compact-conversation
@@ -2176,6 +2186,12 @@ loop, so compaction ahead of the user message shares the turn's budget."
                                (*provider-tool-choice*
                                  (agent--request-tool-choice tools-p tool-restriction-p tool-rounds))
                                (*provider-maximum-output-tokens* maximum-output-tokens)
+                               (*provider-prepared-request-decision*
+                                (and (provider-final-request-participation-p (agent-provider agent))
+                                     (lambda (input)
+                                       (let ((*agent-prepared-input-estimate* input))
+                                         (and (not recovery-used-p)
+                                              (agent-should-compact-p agent))))))
                                (*provider-cache-request-prefix*  nil)
                                (*provider-cache-prefix-function*
                                  (lambda (prefix) (setf cache-prefix prefix)))
@@ -2202,6 +2218,11 @@ loop, so compaction ahead of the user message shares the turn's budget."
                             measured-result)))
                     (provider-context-budget-error (condition)
                       ;; Mission supervision and zero-usage settlement have unwound.
+                      ;; A soft refusal consumes safety allowance without a paid slot.
+                      ;; Nested native and summary requests share this turn-local offset.
+                      (when (typep condition 'provider-proactive-compaction-required)
+                        (decf request-number)
+                        (incf *agent-unissued-soft-attempts*))
                       (when recovery-used-p (error condition))
                       (setf recovery-used-p t)
                       (agent--check-request-budget agent request-number)

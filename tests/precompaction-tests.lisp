@@ -229,7 +229,7 @@
   (with-test-configuration (configuration)
     (let* ((original (conversation-create configuration :identifier "precompaction-full"))
            (provider (make-instance
-                      'scripted-provider
+                      'prepared-scripted-provider
                       :configuration configuration
                       :results       (list (agent-test-result "summary" (list (agent-test-checkpoint-call))
                                                               :turn-completion ':end)
