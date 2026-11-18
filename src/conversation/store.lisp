@@ -182,6 +182,21 @@
     :accessor      conversation-log-generation
     :type          (integer 0)
     :documentation "The count of active-log replacements since this object loaded.")
+   (source-revision
+    :initform      nil
+    :accessor      conversation-source-revision
+    :type          (option (integer 0))
+    :documentation "Last synchronized shared source revision; NIL forces durable reconciliation.")
+   (source-state
+    :initform      nil
+    :accessor      conversation-source-state
+    :type          list
+    :documentation "Observed revision and segment metadata, without record payloads.")
+   (writer-state
+    :initform      nil
+    :accessor      conversation-writer-state
+    :type          (member nil :reconciling :writing)
+    :documentation "Non-NIL requires a newly loaded object after incomplete replay or publication.")
    (append-lock
     :initform      (make-recursive-lock "Autolith conversation append")
     :reader        conversation-append-lock
@@ -622,16 +637,19 @@ ordinary append protocol. Failed scans or checkpoint writes can be retried."
                  (with-recursive-lock-held ((conversation-append-lock conversation))
                    (when (conversation-usage-totals conversation)
                      (return-from conversation-usage (conversation-usage-totals conversation)))
-                   (call-with-file-lock
-                    (conversation-picker-source-lock-pathname (conversation-pathname conversation))
-                    (lambda ()
-                      (setf boundary (conversation-next-sequence conversation)
-                            (conversation--usage-since conversation) (list 0 0 0 0 0 nil)
-                            (conversation--usage-sources conversation)
-                            (mapcar (lambda (path)
-                                      (cons path (platform-path-status *platform* path)))
-                                    (conversation-storage-pathnames
-                                     (conversation-pathname conversation)))))))
+                  (conversation--writer-canonical-path conversation (conversation-pathname conversation))
+                  (conversation--writer-canonical-path
+                   conversation (conversation-picker-source-lock-pathname (conversation-pathname conversation)))
+                  (call-with-file-lock
+                   (conversation-picker-source-lock-pathname (conversation-pathname conversation))
+                   (lambda ()
+                     (setf boundary (conversation-next-sequence conversation)
+                           (conversation--usage-since conversation) (list 0 0 0 0 0 nil)
+                           (conversation--usage-sources conversation)
+                           (mapcar (lambda (path)
+                                     (cons path (platform-path-status *platform* path)))
+                                   (conversation-storage-pathnames
+                                    (conversation-pathname conversation)))))))
                  (conversation-map-records
                   conversation
                   (lambda (record)
@@ -1494,6 +1512,7 @@ partial or conflicting outcomes signal UNCERTAIN and require owner quarantine."
                (new      (if before (nthcdr (length before) after) (rest after))))
           (cond
             ((and prefix-p (null new) (equal before after))
+             (setf (conversation-writer-state conversation) nil)
              (candidate-ledger--refuse conversation record "Candidate event is definitely absent after append failure." :outcome ':absent :cause original))
             ((and prefix-p (= 1 (length new))
                   (eql sequence (getf (rest (first new)) :seq))
@@ -1514,7 +1533,8 @@ partial or conflicting outcomes signal UNCERTAIN and require owner quarantine."
                      (conversation--note-activity conversation committed)))
                (setf (conversation-next-sequence conversation) (1+ sequence)
                      (conversation-persisted-p conversation) t
-                     (conversation-incomplete-tail-p conversation) nil)
+                     (conversation-incomplete-tail-p conversation) nil
+                     (conversation-writer-state conversation) nil)
                (values committed ':committed original)))
             (t
              (candidate-ledger--refuse conversation record "Candidate append has an unsupported or contradictory durable outcome." :outcome ':uncertain :cause original))))))))
@@ -2028,6 +2048,17 @@ this append's original EOF, including when publication failed after the write."
            :sequence (conversation-next-sequence conversation)))
   (when (conversation-incomplete-tail-p conversation)
     (conversation--repair-incomplete-tail conversation))
+  ;; A foreign writer's arrivals are not part of this migration's captured tally.
+  ;; Validate the durable head without replaying or authorizing that stale tally.
+  (when (conversation-persisted-p conversation)
+    (let ((head 0))
+      (multiple-value-bind (incomplete-p count)
+          (conversation--map-storage-records
+           (conversation-pathname conversation)
+           (lambda (entry) (setf head (getf (rest entry) :seq))))
+        (declare (ignore count))
+        (when (or incomplete-p (/= (conversation-next-sequence conversation) (1+ head)))
+          (conversation--writer-refuse conversation "The usage migration writer head is not current; reload and recompute its totals.")))))
   (let* ((pathname    (conversation-log-pathname conversation))
          (status      (platform-path-status *platform* pathname))
          (position    (if status (platform-file-status-size status) 0))
@@ -2053,7 +2084,10 @@ this append's original EOF, including when publication failed after the write."
             (when (and published (<= (conversation-next-sequence conversation) sequence))
               (setf (conversation-next-sequence conversation) (1+ sequence)
                     (conversation-persisted-p conversation) t)
-              (conversation--note-activity conversation published))))))))
+              (conversation--note-activity conversation published))
+            ;; The checkpoint reconciler has accounted for a complete append or
+            ;; the exact incomplete tail that the next checkpoint retry repairs.
+            (setf (conversation-writer-state conversation) nil)))))))
 
 (defparameter *conversation-candidate-origin-append* nil
   "Exact writer scoped by canonical ownership for specification and audit reconciliation.")
@@ -2100,30 +2134,199 @@ original condition. Absent and uncertain outcomes retain typed evidence."
            :sequence (conversation-next-sequence conversation)))
   (conversation-append-record conversation (cons :context-decision (copy-list properties))))
 
+(-> conversation--writer-refuse (conversation string) null)
+(defun conversation--writer-refuse (conversation message)
+  "Refuse a write without changing its durable source."
+  (error 'conversation-invariant-error
+         :message message :pathname (conversation-pathname conversation)
+         :sequence (conversation-next-sequence conversation)))
+
+(-> conversation--writer-canonical-path (conversation pathname) null)
+(defun conversation--writer-canonical-path (conversation pathname)
+  "Refuse lexical aliases before acquiring the namestring-keyed source lock.
+First publication may have missing parent directories; validate its nearest
+existing ancestor without creating directories or resolving through a symlink."
+  (labels ((canonical-directory-p (directory)
+             (let* ((components  (pathname-directory directory))
+                    (leaf        (first (last components)))
+                    ;; Inspect a directory symlink without a trailing slash.
+                    (status-path (if (stringp leaf)
+                                     (make-pathname :directory (butlast components)
+                                                    :name leaf :type nil
+                                                    :defaults  directory)
+                                     directory))
+                    (status      (platform-path-status *platform* status-path
+                                                  :follow-links-p nil)))
+               (if status
+                   (and (eq :directory (platform-file-status-kind status))
+                        (equal directory (platform-truename *platform* directory)))
+                   (let ((parent (uiop:pathname-parent-directory-pathname directory)))
+                     (and (not (equal parent directory))
+                          (canonical-directory-p parent)))))))
+    (unless (and (uiop:absolute-pathname-p pathname)
+                 (not (wild-pathname-p pathname))
+                 (notany (lambda (component)
+                           (or (member component '(:up :back))
+                               (member component '("." "..") :test #'equal)))
+                         (pathname-directory pathname))
+                 (canonical-directory-p (uiop:pathname-directory-pathname pathname))
+                 (let ((status (platform-path-status *platform* pathname
+                                                     :follow-links-p nil)))
+                   (or (null status)
+                       (and (eq :file (platform-file-status-kind status))
+                            (equal pathname (platform-truename *platform* pathname))))))
+      (conversation--writer-refuse conversation "Writing requires a canonical absolute source pathname.")))
+  nil)
+
+(-> conversation--writer-source-state (conversation) list)
+(defun conversation--writer-source-state (conversation)
+  "Read strict revision and physical segment metadata under the source lock."
+  (let* ((identity (conversation-pathname conversation))
+         (revision (conversation-picker-revision-read identity))
+         (paths    (conversation-storage-pathnames identity)))
+    (conversation--writer-canonical-path
+     conversation (conversation-picker-revision-pathname identity))
+    ;; Legacy logs predate the picker revision. Revisions count invalidations,
+    ;; not records; their monotonicity is checked against our observed state.
+    (unless paths
+      (conversation--writer-refuse conversation "The durable source is missing."))
+    ;; Chunk names preserve the oldest boundary without reading retired payloads.
+    (unless (= (or (conversation-chunk-start-sequence (first paths)) 1) 1)
+      (conversation--writer-refuse conversation "The complete source history must begin at sequence one."))
+    (cons revision
+          (mapcar (lambda (path)
+                    (conversation--writer-canonical-path conversation path)
+                    (multiple-value-list (sexp-store:file-revision path)))
+                  paths))))
+
+(-> conversation--writer-check-source (conversation) list)
+(defun conversation--writer-check-source (conversation)
+  "Reject revision resets, lost segments and uncoordinated source changes."
+  (let* ((current  (conversation--writer-source-state conversation))
+         (previous (conversation-source-state conversation)))
+    (when previous
+      (unless (and (>= (first current) (first previous))
+                   (every (lambda (old)
+                            (let ((new (assoc (first old) (rest current) :test #'equal)))
+                              (and new (>= (second new) (second old)))))
+                          (rest previous))
+                   (or (> (first current) (first previous))
+                       (and (equal (mapcar #'first (rest current))
+                                   (mapcar #'first (rest previous)))
+                            (equal (first (last current)) (first (last previous))))))
+        (conversation--writer-refuse conversation "The durable source changed without a valid advancing revision, or lost a segment.")))
+    current))
+
+(-> conversation--synchronize-writer (conversation list) null)
+(defun conversation--synchronize-writer (conversation source-state)
+  "Replay a structurally validated suffix; any incomplete replay poisons this object.
+Only conversation projections change; mission execution and accounting owners do not."
+  (when (conversation-persisted-p conversation)
+    (let* ((identity (conversation-pathname conversation))
+           (revision (first source-state)))
+      ;; A cold object's unchanged physical source needs only active-head validation.
+      ;; Foreign revisions still require strict complete-suffix replay below.
+      (when (and (null (conversation-source-revision conversation))
+                 (equal source-state (conversation-source-state conversation)))
+        (let* ((pathnames (conversation-storage-pathnames identity))
+               (active    (first (last pathnames)))
+               (header    (conversation-peek-header active))
+               (head      (if (= (or (and header (getf (rest header) :version)) 0) 2)
+                              (conversation--load-active-segment identity active)
+                              (conversation--load-all-segments identity pathnames))))
+          (when (= (conversation-next-sequence conversation)
+                   (conversation-next-sequence head))
+            (setf (conversation-source-revision conversation) revision))))
+      (unless (eql revision (conversation-source-revision conversation))
+        (let ((next          (conversation-next-sequence conversation))
+              (last-sequence 0)
+              (pending       nil))
+          (multiple-value-bind (incomplete-p count)
+              (conversation--map-storage-records
+               identity
+               (lambda (record)
+                 (let ((sequence (getf (rest record) :seq)))
+                   (when sequence
+                     (setf last-sequence sequence)
+                     (when (>= sequence next)
+                       (unless (= sequence next)
+                         (conversation--writer-refuse conversation "The stale writer has no complete durable suffix."))
+                       (push record pending)
+                       (incf next))))))
+            (declare (ignore count))
+            (unless (= next (1+ last-sequence))
+              (conversation--writer-refuse conversation "The writer is ahead of durable storage."))
+            ;; Structural validation cannot make semantic projectors transactional.
+            ;; Preserve the original signaled condition and require fresh reload on failure.
+            (setf (conversation-writer-state conversation) ':reconciling)
+            (dolist (record (nreverse pending))
+              (conversation--apply-record conversation record))
+            (let ((active (conversation-storage-active-pathname identity)))
+              (unless (equal active (conversation-log-pathname conversation))
+                (incf (conversation-log-generation conversation)))
+              (setf (conversation-log-pathname conversation) active))
+            (setf (conversation-incomplete-tail-p conversation) incomplete-p
+                  (conversation-source-revision conversation) revision
+                  (conversation-source-state conversation) source-state
+                  (conversation-writer-state conversation) nil))))))
+  nil)
+
 (defgeneric conversation-append-record (conversation record)
   (:documentation "Append portable RECORD to CONVERSATION and return the sequenced form."))
 
 (defmethod conversation-append-record :around ((conversation conversation) (record list))
-  "Exclude picker reconstruction across invalidation, log writes and publication."
+  "Exclude source reconstruction across validation, append and publication."
   (with-recursive-lock-held ((conversation-append-lock conversation))
+    (when (conversation-writer-state conversation)
+      (conversation--writer-refuse conversation "Incomplete replay or publication requires a newly loaded conversation object."))
+    (conversation--writer-canonical-path conversation (conversation-pathname conversation))
+    (conversation--writer-canonical-path
+     conversation (conversation-picker-source-lock-pathname (conversation-pathname conversation)))
     (call-with-file-lock
      (conversation-picker-source-lock-pathname (conversation-pathname conversation))
      (lambda ()
-        (cond
-          ((eq conversation *conversation-candidate-origin-append*)
-           (candidate-ledger--append-checked
-            conversation record (lambda (replacement) (call-next-method conversation replacement))
-            :origin-record-p t))
-          ((eq (first record) :candidate-ledger)
-           (candidate-ledger--call-with-append
-            conversation record (lambda (replacement) (call-next-method conversation replacement))))
-          ((and (eq (first record) :provider)
-                (conversation--usage-totals-p
-                 (getf (getf (rest record) :metadata) :usage-checkpoint)))
-           (conversation--call-with-usage-checkpoint
-            conversation record (lambda () (call-next-method))))
-          (t
-           (call-next-method)))))))
+       (let ((prepared-next (conversation-next-sequence conversation))
+             (source-state  (and (conversation-persisted-p conversation)
+                                 (conversation--writer-check-source conversation))))
+         (unless (or (eq conversation *conversation-candidate-origin-append*)
+                     (eq (first record) :candidate-ledger)
+                     (and (eq (first record) :provider)
+                          (conversation--usage-totals-p (getf (getf (rest record) :metadata) :usage-checkpoint))))
+           (conversation--synchronize-writer conversation source-state))
+         (when (and (eq (first record) :turn-aborted)
+                    (or (conversation--property-present-p (rest record) :turn-start-seq)
+                        (conversation--property-present-p (rest record) :last-complete-seq))
+                    (or (/= prepared-next (conversation-next-sequence conversation))
+                        (not (eql (getf (rest record) :last-complete-seq)
+                                  (1- (conversation-next-sequence conversation))))))
+           (conversation--writer-refuse conversation "The prepared aborted-turn boundary is stale; reload and revalidate the turn."))
+         (when (conversation--compaction-record-p record)
+           (unless (and (= prepared-next (conversation-next-sequence conversation))
+                        (eql (getf (rest record) :through-seq (1- prepared-next))
+                             (1- (conversation-next-sequence conversation))))
+             (conversation--writer-refuse conversation "The prepared compaction snapshot is stale or has no matching through boundary; recompute and revalidate it.")))
+         (setf (conversation-source-revision conversation) nil)
+         (multiple-value-prog1
+             (cond
+               ((eq conversation *conversation-candidate-origin-append*)
+                (candidate-ledger--append-checked
+                 conversation record (lambda (replacement) (call-next-method conversation replacement))
+                 :origin-record-p t))
+               ((eq (first record) :candidate-ledger)
+                (candidate-ledger--call-with-append
+                 conversation record (lambda (replacement) (call-next-method conversation replacement))))
+               ((and (eq (first record) :provider)
+                     (conversation--usage-totals-p
+                      (getf (getf (rest record) :metadata) :usage-checkpoint)))
+                (conversation--call-with-usage-checkpoint
+                 conversation record (lambda () (call-next-method))))
+               (t
+                (call-next-method)))
+           (setf (conversation-source-state conversation)
+                 (conversation--writer-source-state conversation)
+                 (conversation-source-revision conversation)
+                 (first (conversation-source-state conversation))
+                 (conversation-writer-state conversation) nil)))))))
 
 (defmethod conversation-append-record ((conversation conversation) (record list))
   "Assign metadata, initialize persistence if needed, and append RECORD."
@@ -2141,11 +2344,16 @@ original condition. Absent and uncertain outcomes retain typed evidence."
                                          :seq  sequence
                                          :time (get-universal-time)
                                          (rest record)))
-           (picker-search-message (conversation--record-preview sequenced)))
+           (picker-search-message (conversation--record-preview sequenced))
+           (source-before         (and (conversation-persisted-p conversation)
+                                       (rest (conversation--writer-source-state conversation)))))
       (when (conversation--compaction-record-p sequenced)
         ;; Retired source segments remain authoritative if the cache is unavailable.
         ; mallet:suppress no-ignore-errors -- pre-warming input history must not prevent durable compaction
         (ignore-errors (conversation-input-history--ensure-current conversation)))
+      ;; A nonlocal exit after invalidation can leave durable or projected state uncertain.
+      ;; Clear the marker after complete publication or a proven append outcome.
+      (setf (conversation-writer-state conversation) ':writing)
       ;; Invalidate under the shared source lock before changing durable bytes.
       ;; Cache reconstruction holds this same lock through publication.
       (when picker-search-message
@@ -2167,6 +2375,14 @@ original condition. Absent and uncertain outcomes retain typed evidence."
                         (setf (conversation-incomplete-tail-p conversation) nil))))
                 (conversation--write-initial-record conversation sequenced))
           (error (condition)
+            ;; Before-write failures leave the append-only source untouched.
+            ;; Changed or unreadable storage retains the incomplete-write marker.
+            (when (handler-case
+                      (if source-before
+                          (equal source-before (rest (conversation--writer-source-state conversation)))
+                          (not (conversation-storage-occupied-p (conversation-pathname conversation))))
+                    (error () nil))
+              (setf (conversation-writer-state conversation) nil))
             (when (and (not (conversation-persisted-p conversation))
                        (not (conversation-storage-occupied-p
                              (conversation-pathname conversation))))
@@ -2187,6 +2403,8 @@ original condition. Absent and uncertain outcomes retain typed evidence."
                    :sequence sequence)))
         (incf (conversation-next-sequence conversation))
         (conversation--note-activity conversation sequenced)
+        (when (eq (first sequenced) :message)
+          (conversation--project-initial-title conversation (rest sequenced)))
         (conversation--note-pending-input-identifier conversation sequenced)
         (when picker-search-message
           (conversation--note-picker-search-message
@@ -2194,8 +2412,14 @@ original condition. Absent and uncertain outcomes retain typed evidence."
         (conversation--publish-mission-slots conversation sequenced)
         (when (eq (first sequenced) :candidate-ledger)
           (candidate-ledger--publish conversation sequenced)))
-      (conversation-input-history--publish conversation sequenced)
       (conversation-picker-metadata-publish conversation)
+      ;; Source publication is complete before repairable input-history maintenance.
+      (setf (conversation-source-state conversation)
+            (conversation--writer-source-state conversation)
+            (conversation-source-revision conversation)
+            (first (conversation-source-state conversation))
+            (conversation-writer-state conversation) nil)
+      (conversation-input-history--publish conversation sequenced)
       sequenced)))
 
 (-> conversation--bounded-turn-abort-text (t string integer) non-empty-string)
@@ -2366,7 +2590,8 @@ original condition. Absent and uncertain outcomes retain typed evidence."
                 (if published-record
                     (progn
                       (setf (conversation-next-sequence conversation) (1+ sequence)
-                            (conversation-incomplete-tail-p conversation) nil)
+                            (conversation-incomplete-tail-p conversation) nil
+                            (conversation-writer-state conversation) nil)
                       (conversation--note-activity conversation published-record)
                       ; mallet:suppress no-ignore-errors -- the picker cache refresh is best-effort once the title is durable
                       (ignore-errors
@@ -2752,7 +2977,8 @@ transcript show automatic INPUT as a short notice."
          (item    (user-message-item content attachments)))
     (with-recursive-lock-held ((conversation-append-lock conversation))
       (let* ((initial-title
-               (and (not automatic-p)
+               (and (not (conversation-persisted-p conversation))
+                    (not automatic-p)
                     (zerop (conversation-user-turn-count conversation))
                     (null (conversation-title conversation))
                     (conversation-title-derive
@@ -2794,8 +3020,9 @@ transcript show automatic INPUT as a short notice."
                (values (conversation--append-input-item conversation item)
                        record))
           (unless durable-p
-            (setf (conversation-title conversation) previous-title
-                  (conversation-title-source conversation) previous-title-source)
+            (when (and initial-title (not (conversation-persisted-p conversation)))
+              (setf (conversation-title conversation) previous-title
+                    (conversation-title-source conversation) previous-title-source))
             (conversation--delete-image-attachments attachments)))))))
 
 (-> conversation--validate-provider-item (conversation json-object) json-object)
@@ -3652,20 +3879,31 @@ later picker searches read it without scanning the log."
     (setf (conversation-context-usage-sample conversation)
           (when (conversation-context-usage-sample-p sample) sample))))
 
-(defmethod conversation--project-record
-    ((kind (eql :message)) conversation properties)
-  "Derive the initial title from the first user message and project its image attachments."
-  (let ((content (getf properties :content))
-        (images  (getf properties :images)))
+(-> conversation--project-initial-title (conversation list) null)
+(defun conversation--project-initial-title (conversation properties)
+  "Derive the first ordinary user title after its durable turn is counted."
+  (let ((content (getf properties :content)))
     (when (and (null (conversation-title conversation))
                (= (conversation-user-turn-count conversation) 1)
                (eq (getf properties :role) ':user)
                (not (getf properties :automatic-p))
                (stringp content))
-      (let ((title (conversation-title-derive content)))
+      (let ((title (conversation-title-derive
+                    (if (and (not (non-empty-string-p content))
+                             (getf properties :images))
+                        *conversation-image-only-title*
+                        content))))
         (when title
           (setf (conversation-title conversation) title
-                (conversation-title-source conversation) ':initial))))
+                (conversation-title-source conversation) ':initial)))))
+  nil)
+
+(defmethod conversation--project-record
+    ((kind (eql :message)) conversation properties)
+  "Derive the initial title from the first user message and project its image attachments."
+  (conversation--project-initial-title conversation properties)
+  (let ((content (getf properties :content))
+        (images  (getf properties :images)))
     (when images
       (let ((attachments (conversation--record-images conversation images)))
         (unless (stringp content)
@@ -4232,6 +4470,12 @@ later picker searches read it without scanning the log."
              (if (= (or (and header (getf (rest header) :version)) 0) 2)
                  (conversation--load-active-segment identity active)
                  (conversation--load-all-segments identity pathnames))))
+      ;; Keep physical load observations even while the writer's full scan cache is NIL.
+      (setf (conversation-source-state conversation)
+            (cons (conversation-picker-revision-read identity)
+                  (mapcar (lambda (path)
+                            (multiple-value-list (sexp-store:file-revision path)))
+                          pathnames)))
       (conversation--repair-incomplete-tool-calls conversation)
       (setf (conversation-resumed-p conversation) t)
       conversation)))

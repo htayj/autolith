@@ -97,6 +97,9 @@ Caller holds the original request lock; the registry lock is a leaf lock."
         (with-recursive-lock-held ((mission-context-request-lock context))
           (with-recursive-lock-held ((mission-context-lock context))
             (when (mission-context-accounting-snapshot context)
+              (unless (eq (mission-context-goal context)
+                          (application-goal (mission-context-application context)))
+                (mission--reject ':replaced "The mission was replaced."))
               (mission--reject ':operation-authority "Original accounting generation is detached."))
             (let ((request (make-instance 'mission-inference-request :context context :amount 0 :allowance allowance
                                           :generation   (mission-context-accounting-generation context)
