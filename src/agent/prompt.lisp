@@ -265,6 +265,9 @@ prompt instead of the full Autolith persona.")
    :config         (request-context--config configuration :hurry-up-p hurry-up-p)
    :output-profile ':prompt))
 
+(defparameter *context-request-isolated-p* nil
+  "Request-local exact-prompt and contributor isolation, never a configuration setting.")
+
 (-> system-prompt (configuration) string)
 (defun system-prompt (configuration)
   "Return the system prompt specialized for CONFIGURATION and this process's session date.
