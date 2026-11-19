@@ -2356,3 +2356,9 @@
 
 (define-test-suite mission-draft
   test-mission-draft-coexistence)
+
+(define-test-suite mission-draft-review
+ test-mission-draft-review-discovery
+ test-mission-draft-review-verdict
+ test-mission-draft-review-failure
+ test-mission-draft-review-native)
