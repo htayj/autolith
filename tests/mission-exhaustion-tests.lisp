@@ -437,6 +437,89 @@
        (let ((usage (find :exhaustion-usage records :key #'first)))
          (test-assert (= 5 (getf (rest usage) :tokens)) "Measured reviewer usage durable"))))))
 
+(-> test-mission-exhausted-resume () null)
+(defun test-mission-exhausted-resume ()
+  "Explicit recovery appends history without spending or changing accounting."
+  (mission-exhaustion-test--run
+   (lambda (application provider context goal)
+     (setf (getf goal :turns-used) (getf goal :turn-limit))
+     (setf (mission-exhaustion-test-response provider)
+           (json-encode (mission-exhaustion-test--data :decision "stop")))
+     (mission-exhaustion-test--admit context)
+     (test-assert (eq :exhausted (getf goal :status)) "the real evaluator stop exhausts the fixture")
+     (incf (getf goal :turn-limit) 10)
+     (setf (getf goal :tokens-used) 13 (getf goal :tokens-reserved) 17)
+     (let* ((keys     '(:turns-used :tokens-used :tokens-reserved :requests-outstanding :unknown-usage
+                        :turn-limit :token-limit :deadline :criteria :gates :exhaustion))
+            (before   (copy-tree (mapcar (lambda (key) (getf goal key)) keys)))
+            (history  (copy-tree (getf goal :evidence)))
+            (calls    (mission-exhaustion-test-calls provider))
+            (sequence (conversation-next-sequence (application-conversation application))))
+       (test-assert (eq :exhausted (getf goal :status)) "raising a limit alone does not resume")
+       (test-assert (handler-case (progn (application-mission-command application :resume) t)
+                      (mission-error () nil))
+                    "the supported explicit command accepts eligible exhausted missions")
+       (test-assert (eq :active (getf goal :status)) "explicit resume activates the same mission")
+       (test-assert (eq goal (mission-context-goal context)) "mission identity is conserved")
+       (test-assert (equal before (mapcar (lambda (key) (getf goal key)) keys))
+                    "usage, reservations, pins, limits and evaluator history are conserved")
+       (test-assert (and (= (1+ (length history)) (length (getf goal :evidence)))
+                         (equal history (butlast (getf goal :evidence))))
+                    "resume appends evidence without rewriting history")
+       (test-assert (> (conversation-next-sequence (application-conversation application)) sequence)
+                    "the state change is durable")
+       (test-assert (= calls (mission-exhaustion-test-calls provider))
+                    "resume neither replays nor starts a provider request"))))
+  nil)
+
+(-> test-mission-exhausted-resume-refusals () null)
+(defun test-mission-exhausted-resume-refusals ()
+  "Refuse exhausted recovery with spent limits, unsettled work or pending review."
+  (dolist (reason '(:wall :turns :tokens :reservation :pending :outstanding :unknown))
+    (mission-exhaustion-test--run
+     (lambda (application provider context goal)
+       (declare (ignore context))
+       (setf (getf goal :status) :exhausted)
+       (case reason
+         (:wall
+          (setf (getf goal :deadline) (get-universal-time)))
+         (:turns
+          (setf (getf goal :turns-used) (getf goal :turn-limit)))
+         (:tokens
+          (setf (getf goal :tokens-used) (getf goal :token-limit)))
+         (:reservation
+          (setf (getf goal :tokens-reserved) (getf goal :token-limit)))
+         (:pending
+          (setf (getf (getf goal :exhaustion) :pending) '(:id 7 :trigger :wall)))
+         (:outstanding
+          (setf (getf goal :requests-outstanding) 1))
+         (:unknown
+          (setf (getf goal :unknown-usage) 1)))
+       (let ((before (copy-tree goal)))
+         (test-assert (handler-case (progn (application-mission-command application :resume) nil)
+                        (mission-error () t))
+                      "ineligible recovery is refused")
+         (test-assert (equal before goal) "refused recovery makes no state or accounting changes")
+         (test-assert (zerop (mission-exhaustion-test-calls provider)) "refused recovery never dispatches")))))
+  nil)
+
+(-> test-mission-resume-status-controls () null)
+(defun test-mission-resume-status-controls ()
+  "Keep terminal refusals and paused or blocked explicit recovery."
+  (dolist (status '(:verified :failed :cancelled :paused :blocked))
+    (mission-exhaustion-test--run
+     (lambda (application provider context goal)
+       (declare (ignore context))
+       (setf (getf goal :status) status)
+       (let ((accepted (handler-case (progn (application-mission-command application :resume) t)
+                         (mission-error () nil))))
+         (test-assert (eq accepted (not (null (member status '(:paused :blocked)))))
+                      "only recoverable legacy statuses resume")
+         (test-assert (eq (getf goal :status) (if accepted :active status))
+                      "terminal statuses are not changed")
+         (test-assert (zerop (mission-exhaustion-test-calls provider)) "resume never starts work implicitly")))))
+  nil)
+
 (-> test-mission-exhaustion-independent-candidates () t)
 (defun test-mission-exhaustion-independent-candidates ()
   "Reject malformed candidates independently and report even after a malformed decision."
