@@ -2269,6 +2269,7 @@
   test-compaction-owner-idle-matrix
   test-compaction-owner-image-and-reuse
   test-compaction-owner-return-values
+  test-compaction-owner-goal-metadata
   test-compaction-owner-idle-cancellation-refusal
   test-compaction-owner-finalization-errors
   test-compaction-owner-scheduled-controller
