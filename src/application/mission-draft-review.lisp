@@ -150,6 +150,39 @@ publish PASS, mutate a candidate, approve a start, or execute acceptance gates."
            (error () nil))
          t)))
 
+(-> mission-draft-review-superseded-p (application t) boolean)
+(defun mission-draft-review-superseded-p (application claim)
+  "Retire only the exact settled host attempt belonging to an older candidate revision."
+  (and (typep claim 'mission-draft-review-claim)
+       (let* ((context (mission-draft-ticket-context claim))
+              (goal    (mission-context-goal context))
+              (old     (getf goal :candidate-claim))
+              (job     (mission-draft-ticket-job claim)))
+         (and (application-candidate-active-p application)
+              (eq application (mission-context-application context))
+              (eq application (candidate-origin-application (mission-context-origin-owner context)))
+              (eq context (application-mission-draft-context application))
+              (eq goal (application-mission-draft application))
+              (eq :draft (getf goal :status))
+              (eq (application-agent application) (mission-draft-review-parent claim))
+              (eq (application-conversation application) (mission-context-conversation context))
+              (eq claim (mission-context-candidate-ticket context))
+              (equal (getf old :candidate-id) (getf goal :candidate-id))
+              (equal (getf old :review-id) (mission-draft-ticket-review-id claim))
+              (eql (getf old :revision) (mission-draft-ticket-revision claim))
+              (equal (getf old :digest) (mission-draft-ticket-digest claim))
+              (< (mission-draft-ticket-revision claim) (getf goal :specification-revision))
+              (eq :settled (mission-draft-review-state claim))
+              (eq :settled (getf old :state))
+              job (job-terminal-p job)
+              (eq context (task-job-mission-context job))
+              (equal (getf old :job-id) (job-identifier job))
+              (equal (getf old :execution-id) (task-job-execution-identifier job))
+              (zerop (getf goal :requests-outstanding 0))
+              (zerop (getf goal :tokens-reserved 0))
+              (not (mission--unknown-usage-blocks-p goal))))
+       t))
+
 (-> mission-draft-review-claim (application string &key (:retry-of (option mission-draft-review-claim))) mission-draft-review-claim)
 (defun mission-draft-review-claim (application start-request &key retry-of)
   "Durably claim this revision before any session, pool or paid request identity."
@@ -184,13 +217,15 @@ publish PASS, mutate a candidate, approve a start, or execute acceptance gates."
                            (zerop (getf goal :tokens-reserved 0)))
                 (mission--reject :review-retry "Explicit retry requires the exact settled failed attempt.")))
             (when (and (not retry-of)
-                       (or prior-ticket (eql (getf old :revision) (getf goal :specification-revision))))
+                       (or (eql (getf old :revision) (getf goal :specification-revision))
+                           (and prior-ticket
+                                (not (mission-draft-review-superseded-p application prior-ticket)))))
               (mission--reject :candidate-claimed "Use explicit retry after the current attempt settles."))
             (mission--admit-budget context)
             (setf (mission-context-candidate-ticket context) claim)
             (handler-case
                 (progn
-                  (when retry-of
+                  (when (or retry-of prior-ticket)
                     ;; Preserve the exact shared plist head when adding the first history slot.
                     (unless (get-properties goal '(:candidate-review-history))
                       (nconc goal (list :candidate-review-history nil)))

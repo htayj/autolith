@@ -382,3 +382,108 @@
        (test-assert (equal "pass" (getf (getf (getf (application-mission-draft application) :candidate-claim) :artifact) :verdict))
                     "native collection retains the explicit verdict"))))
   nil)
+
+(-> review-lifecycle-test--collect (application) mission-draft-review-claim)
+(defun review-lifecycle-test--collect (application)
+  "Run and collect one fixture-backed native review through the public actions."
+  (application-mission-command application :review-draft)
+  (let* ((context (application-mission-draft-context application))
+         (claim   (mission-context-candidate-ticket context)))
+    (test-assert (task-job-await (mission-draft-ticket-job claim) 30) "review terminates")
+    (application-mission-command application :collect-draft-review)
+    (test-assert (eq :settled (mission-draft-review-state claim)) "collection settles claim")
+    claim))
+
+(-> test-mission-draft-review-after-edit () null)
+(defun test-mission-draft-review-after-edit ()
+  "Review an edited candidate afresh without losing its identity or paid provenance."
+  (review287--call
+   (lambda (application)
+     (let ((data (draft-review-test--data)))
+       (setf (gethash "verdict" data) "fail"
+             (scripted-provider-results (application-provider application))
+             (list (mission-review-test--result data))))
+     (let* ((candidate (application-mission-draft application))
+            (identity  (getf candidate :candidate-id))
+            (working   (copy-tree (application-goal application)))
+            (previous  (review-lifecycle-test--collect application))
+            (record    (copy-tree (getf candidate :candidate-claim))))
+       (application-mission-draft-edit application
+         (mission-test--specification
+          :gates (list (list :id "build" :kind :command :command "printf revised"))))
+       (setf (scripted-provider-results (application-provider application))
+             (list (mission-review-test--result (draft-review-test--data))))
+       (let* ((next    (review-lifecycle-test--collect application))
+              (receipt (application-mission-draft-review-collect application)))
+         (test-assert (eq candidate (application-mission-draft application)) "same candidate object")
+         (test-assert (equal identity (getf candidate :candidate-id)) "same accounting identity")
+         (test-assert (equal working (application-goal application)) "working mission unchanged")
+         (test-assert (= 2 (getf candidate :turns-used)) "both paid turns retained")
+         (test-assert (= 10 (getf candidate :tokens-used)) "both paid token charges retained")
+         (test-assert (equal (list record) (getf candidate :candidate-review-history)) "exact old claim archived")
+         (test-assert (not (equal (mission-draft-ticket-review-id previous) (mission-draft-ticket-review-id next)))
+                      "distinct review identities")
+         (test-assert (not (eq (mission-draft-ticket-job previous) (mission-draft-ticket-job next))) "distinct native jobs")
+         (test-assert (> (mission-draft-ticket-revision next) (mission-draft-ticket-revision previous)) "revision advances")
+         (test-assert (not (equal (mission-draft-ticket-digest next) (mission-draft-ticket-digest previous))) "edited digest advances")
+         (test-assert (= (getf receipt :revision) (getf candidate :specification-revision)) "new receipt revision")
+         (test-assert (equal (getf receipt :digest) (getf candidate :specification-digest)) "new receipt digest")
+         (test-assert (handler-case (progn (mission-draft-review-submit application previous) nil)
+                        (mission-error () t)) "retired authority cannot dispatch")))))
+  nil)
+
+(-> test-mission-draft-review-edit-refusals () null)
+(defun test-mission-draft-review-edit-refusals ()
+  "Refuse older attempts with unsettled or unknown usage without changing ownership."
+  (dolist (case '(:assigned :requests-outstanding :tokens-reserved :unknown))
+    (review287--call
+     (lambda (application)
+       (let* ((previous  (review-lifecycle-test--collect application))
+              (context   (application-mission-draft-context application))
+              (candidate (application-mission-draft application))
+              (job       (mission-draft-ticket-job previous)))
+         (application-mission-draft-edit application (mission-test--specification))
+         (ecase case
+           (:assigned
+            (setf (mission-draft-review-state previous) :assigned))
+           (:requests-outstanding
+            (setf (getf candidate :requests-outstanding) 1))
+           (:tokens-reserved
+            (setf (getf candidate :tokens-reserved) 1))
+           (:unknown
+            (setf (getf candidate :unknown-usage) 1)))
+         (let ((before (copy-tree candidate))
+               (state  (task-job-snapshot job)))
+           (test-assert (handler-case (progn (application-mission-draft-review application) nil)
+                          (mission-error () t)) "unsettled prior work refuses fresh review")
+           (test-assert (equal before candidate) "no counter claim or history mutation")
+           (test-assert (eq previous (mission-context-candidate-ticket context)) "exact ownership retained")
+           (test-assert (equal state (task-job-snapshot job)) "prior job unchanged"))))))
+  nil)
+
+(-> test-mission-draft-review-retry-currentness () null)
+(defun test-mission-draft-review-retry-currentness ()
+  "Keep same-revision FAIL retries explicit and reject them after an edit."
+  (review287--call
+   (lambda (application)
+     (let ((data (draft-review-test--data)))
+       (setf (gethash "verdict" data) "fail"
+             (scripted-provider-results (application-provider application))
+             (list (mission-review-test--result data))))
+     (let* ((previous  (review-lifecycle-test--collect application))
+            (candidate (application-mission-draft application))
+            (before    (copy-tree candidate)))
+       (test-assert (mission-draft-review-retryable-p application previous) "current settled FAIL offers retry")
+       (test-assert (handler-case (progn (mission-draft-review-claim application "duplicate") nil)
+                      (mission-error () t)) "same revision requires explicit retry")
+       (test-assert (equal before candidate) "duplicate refusal does not mutate")
+       (let ((next (mission-draft-review-retry application previous "explicit-retry")))
+         (test-assert (mission-draft-review-current-p next) "explicit retry is current")
+         (test-assert (= 5 (getf candidate :tokens-used)) "retry preserves paid usage")
+         (application-mission-draft-edit application (mission-test--specification))
+         (test-assert (not (mission-draft-review-retryable-p application next)) "edited claim is not retryable")
+         (let ((edited (copy-tree candidate)))
+           (test-assert (handler-case (progn (mission-draft-review-retry application next "stale-retry") nil)
+                          (mission-error () t)) "explicit stale retry refuses")
+           (test-assert (equal edited candidate) "stale retry does not mutate"))))))
+  nil)

@@ -2382,6 +2382,9 @@
 
 (define-test-suite mission-draft-host
  test-mission-review287-native
+ test-mission-draft-review-after-edit
+ test-mission-draft-review-edit-refusals
+ test-mission-draft-review-retry-currentness
  test-mission-review287-refusals)
 
 (define-test-suite mission-draft-stateful
