@@ -1792,11 +1792,12 @@ called nothing, or that cannot be replayed, gets a user message instead."
 (defun agent--compaction-failure-terminal-p (condition)
   "Return true when CONDITION ends compaction instead of costing one generation.
 
-An ended owner is terminal, as is a permission failure or a retryable failure
-that still reached this caller: with regeneration turned off, the provider
-layer spent its reconnections before any generation began. Another generation
-cannot repair these failures, and a checkpoint without notes would lose history."
+An ended owner or recovery window is terminal, as is a permission failure or a
+retryable failure that still reached this caller. With regeneration turned off,
+the provider layer spent its reconnections before any generation began. Another
+generation cannot repair these failures; a checkpoint without notes loses history."
   (or (typep condition 'provider-owner-ended)
+      (typep condition 'provider-recovery-expired)
       (eql (provider-error-status condition) 403)
       (typep condition 'provider-retryable-error)))
 

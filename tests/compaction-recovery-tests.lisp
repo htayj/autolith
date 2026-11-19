@@ -2549,6 +2549,8 @@
            (owner        (list :compaction-owner reason))
            (*provider-connection-owner* owner)
            (state        (make-provider-connection-recovery))
+           (condition-type (if (eq reason ':recovery-deadline)
+                               'provider-recovery-expired 'provider-owner-ended))
            (dispatches   0)
            (publications 0)
            (original     nil)
@@ -2564,7 +2566,10 @@
          (setf (provider-connection-recovery-deadline state)
                (1- (/ (get-internal-real-time) internal-time-units-per-second))))
         (:owner-deadline
-         (setf (provider-connection-recovery-owner-check state) (constantly 0))))
+         (setf (provider-connection-recovery-owner-check state) (constantly 0)))
+        (:recovery-deadline
+         (setf (provider-connection-recovery-recovery-deadline state)
+               (1- (/ (get-internal-real-time) internal-time-units-per-second)))))
       (test-call-with-function-replacements
        (list (list 'provider-stream-turn
                    (lambda (actual-provider view &key tool-namespaces event-callback goal-context compaction-p)
@@ -2573,17 +2578,17 @@
                      (test-assert compaction-p "Only the checkpoint dispatch is reached.")
                      (incf dispatches)
                      (funcall event-callback (make-instance 'assistant-delta-event :text ""))
-                     (handler-bind ((provider-owner-ended
+                     (handler-bind ((provider-error
                                       (lambda (condition) (unless original (setf original condition)))))
-                       (provider--check-connection-owner state))))
+                       (provider--connection-remaining state))))
              (list 'conversation-append-summary
                    (lambda (&rest arguments)
                      (incf publications)
                      (apply append-summary arguments))))
        (lambda ()
          (handler-case (agent-compact-conversation agent observer)
-           (provider-owner-ended (condition) (setf failure condition)))))
-      (test-assert (typep original 'provider-owner-ended) "The real owner check signals its terminal condition.")
+           (provider-error (condition) (setf failure condition)))))
+      (test-assert (typep original condition-type) "The real lifetime check signals its terminal condition.")
       (test-assert (and failure (eq original failure)) "Compaction propagates the identical owner condition.")
       (test-assert (= 1 dispatches) "An ended owner cannot dispatch another checkpoint generation.")
       (test-assert (zerop publications) "An ended owner cannot reach checkpoint publication.")
@@ -2604,3 +2609,8 @@
   (dolist (reason '(:caller-deadline :owner-deadline))
     (compaction-owner-test--ended reason))
   nil)
+
+(-> test-compaction-recovery-window-expiry () null)
+(defun test-compaction-recovery-window-expiry ()
+  "Stop an expired provider recovery window without another checkpoint or publication."
+  (compaction-owner-test--ended ':recovery-deadline))

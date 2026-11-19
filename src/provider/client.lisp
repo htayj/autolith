@@ -965,8 +965,21 @@ original condition or weakening the streaming safety limit."
                  (setf (provider-connection-recovery-generation-started-p recovery) t))
                (when (typep event 'provider-attempt-failed-event)
                  (setf last-failure event)
+                 (let ((condition (provider-attempt-failed-event-condition event)))
+                   (when (and (typep condition 'provider-retryable-error)
+                              (cl-llm-provider-api::provider-retryable-error-generation-started-p condition))
+                     (setf (provider-connection-recovery-generation-started-p recovery) t)))
                  (when (provider-attempt-failed-event-retryable-p event)
                    (incf retryable-failures)))
+               (when (typep event 'provider-retry-event)
+                 (let ((remaining (provider--connection-remaining recovery)))
+                   (when (and remaining (< remaining (provider-retry-event-delay event)))
+                     (setf event
+                           (make-instance 'provider-retry-event
+                                          :attempt (provider-retry-event-attempt event)
+                                          :maximum-attempts
+                                          (cl-llm-provider-api:provider-retry-event-maximum-attempts event)
+                                          :delay   remaining)))))
                (handler-case (funcall event-callback event)
                  (error (condition)
                    (error 'provider-observer-failure :cause condition))))
@@ -976,7 +989,7 @@ original condition or weakening the streaming safety limit."
                 (let* ((selected      (funcall select-provider))
                        (manager       (provider-credential-manager selected))
                        (refreshable-p (credential-manager-refreshable-p manager)))
-                 (provider--check-connection-owner recovery)
+                 (provider--connection-remaining recovery)
                  (setf (provider-connection-recovery-endpoint recovery)
                        (provider--connection-display-endpoint selected))
                  (let ((index (provider-connection-recovery-route-index recovery)))
@@ -987,7 +1000,7 @@ original condition or weakening the streaming safety limit."
                  (provider--connection-status recovery :attempting)
                  (call-with-credential-refresh
                   (lambda (force-refresh)
-                   (provider--check-connection-owner recovery)
+                   (provider--connection-remaining recovery)
                    (provider--call-with-transport-normalization
                     (lambda ()
                       (funcall attempt-function force-refresh event-callback))))
@@ -1007,6 +1020,7 @@ original condition or weakening the streaming safety limit."
                 (call-with-streaming-retries
                  #'attempt-with-authentication #'observe
                  :maximum-retries maximum-retries
+                 :sleep-function  (lambda (seconds) (provider--connection-wait recovery seconds))
                  :call-with-attempt
                  (lambda (attempt)
                    (provider--call-with-connection-recovery recovery attempt)))))))

@@ -27,8 +27,12 @@ request, and does not change the selected primary provider or model.
 Each ordinary streaming request starts on its primary route. After the
 configured number of eligible failures before generation, try the next route
 in order. After the last route, cycle back to the primary. Backoff continues
-across route changes, with a ceiling of 300 seconds per wait and the existing
-caller lifetime as the retry boundary.
+across route changes. All automatic pre-generation retries share one 120-second
+monotonic window per logical request, clipped by the caller's remaining lifetime.
+Opening deadlines and retry waits are clipped to that allowance. Window exhaustion
+is terminal, even for a child with a much longer job deadline. Explicit independent
+opening timeouts use the ordinary finite transient retry count, not extended
+connection recovery: one stalled request does not establish an unavailable route.
 
 For each attempt, prepare the logical conversation and tools through the
 selected provider's ordinary request path and resolve its ordinary credentials.
@@ -47,6 +51,12 @@ callers can observe =:provider-connection= through the ordinary agent observer.
 Terminal phases remove only their matching child episode. Cancellation and
 caller expiry terminate the episode through the ordinary ownership path.
 
+A waiting child also queues a structural note for its parent on the first wait,
+then at most once per minute per child job, across connection and finite retries.
+Read queued notes at the parent's next safe request boundary. Terminal and ACP
+progress is immediate; queued notes do not wake the parent or fabricate completion.
+A full note queue does not prevent the provider operation from terminating.
+
 Endpoint notices omit user information, paths, queries and fragments. Invalid
 endpoint identities appear as =endpoint unavailable=. Existing model-attempt
 telemetry records ordinary attempt outcomes; endpoint notices and raw provider
@@ -58,6 +68,7 @@ conditions are not exported as telemetry attributes.
 An explicit outer work scope may retain numeric attempt, route and backoff
 history after a finite ordinary invocation unwinds and settles. Resume only
 the exact conversation, owner and cancellation epoch, under the original caller
-deadline and unchanged route declaration. Rebuild the current conversation and
+and recovery deadlines and unchanged route declaration. Retry, authentication,
+route changes and suspension never renew the window. Rebuild the conversation and
 tools and resolve ordinary credentials for the new invocation. The scope owns
 terminal disposal; a second consumer cannot claim the same retired history.
