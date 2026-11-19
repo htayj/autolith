@@ -2163,21 +2163,33 @@
            (test-assert (null (conversation-input-measurement
                                (conversation--from-header (conversation-pathname owner) (conversation-log-pathname owner) changed))) "Malformed/future persisted headers load without credit.")))
        (conversation-append-provider-metadata owner '(:request-number 2 :usage (("input_tokens" 100) ("output_tokens" 50) ("total_tokens" 150))))
-       (let ((paid (copy-tree (conversation-usage owner))))
+       (let ((paid         (copy-tree (conversation-usage owner)))
+             (continuation (make-continuation
+                            :intent "Continue the measured-context work."
+                            :next (list :text "Use the compacted context." :refs nil)))
+             (validated    nil))
+         (test-assert (continuation-p continuation) "The portable fixture is a valid typed checkpoint.")
          (test-assert (handler-case
-                         (progn (conversation-append-summary owner "Rejected paid summary"
-                                                             :validate-projection (lambda (candidate)
-                                                                                    (declare (ignore candidate))
-                                                                                    (error 'simple-error :format-control "Synthetic candidate refusal"))) nil)
-                       (error () t)) "Failed ordinary candidate validation does not publish a summary.")
+                         (progn
+                           (conversation-append-summary
+                            owner continuation
+                            :validate-projection
+                            (lambda (candidate)
+                              (declare (ignore candidate))
+                              (setf validated t)
+                              (error 'simple-error :format-control "Synthetic candidate refusal")))
+                           nil)
+                       (simple-error () t)) "Failed ordinary candidate validation does not publish a summary.")
+         (test-assert validated "The typed checkpoint reaches candidate validation before rejection.")
          (test-assert (equal history (mapcar #'json-encode (conversation-input-items owner))) "Rejected publication preserves canonical history.")
          (test-assert (equal paid (conversation-usage owner)) "Rejected publication preserves known paid summary usage.")
-         (test-assert (equal receipt (conversation-input-measurement owner)) "Rejected replacement does not invalidate the canonical owner's receipt."))
-       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
-         (declare (ignore result))
-         (conversation-append-summary owner "Portable compacted context")
-         (test-assert (null (conversation-input-measurement owner)) "Portable compaction invalidates the old measured prefix.")
-         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "A precompaction completion cannot publish after chunk rollover."))
+         (test-assert (equal receipt (conversation-input-measurement owner)) "Rejected replacement does not invalidate the canonical owner's receipt.")
+         (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
+           (declare (ignore result))
+           (conversation-append-summary owner continuation)
+           (test-assert (equal continuation (conversation-continuation owner)) "Successful portable publication installs the typed checkpoint.")
+           (test-assert (null (conversation-input-measurement owner)) "Portable compaction invalidates the old measured prefix.")
+           (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "A precompaction completion cannot publish after chunk rollover.")))
        (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
          (test-assert ticket "A postcompaction success captures a fresh stable boundary despite inherited volatile counts.")
          (agent--persist-provider-result (getf fixture :agent) result :request-number 3 :input-measurement ticket))

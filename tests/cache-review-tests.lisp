@@ -616,7 +616,8 @@ The job-pool admission edge constructs registered jobs but queues no worker."
            (test-assert (and (zerop (occurrences "fixture-goal-" (json-get (request) "input")))
                              (null (context-anchors-current conversation)))
                         "removing every owner drops all group messages and metadata")
-           (conversation-append-summary conversation "owned genuine compaction handoff")
+           (conversation-append-summary
+            conversation (make-continuation :intent "Continue the owned work after compaction."))
            (conversation-append-user-message conversation "new owned request epoch")
            (setf goal "fixture-goal-after-compaction" instruction "fixture-current-after-compaction")
            (let ((items (json-get (request) "input")))
