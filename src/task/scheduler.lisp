@@ -715,13 +715,13 @@ live runs for AGENT count too."
     (task-orchestrator agent list
      &key (:parent-call-id (option string))
        (:command-authorization-function (option function))
-       (:tool-authorization-function (option function)))
+       (:tool-authorization-function (option function)) (:review-claim t))
     (values list list))
 (defun task-orchestrator-start-jobs
     (orchestrator parent-agent entries
      &key parent-call-id
        command-authorization-function
-       tool-authorization-function)
+       tool-authorization-function review-claim)
   "Atomically admit ENTRIES and return jobs plus nested synchronous inline jobs.
 
 A cancelled parent is refused here so the asking agent gets a prompt error.
@@ -734,9 +734,9 @@ that check atomic with cascading cancellation."
         (task-orchestrator--refuse-cancelled-parent parent-job))))
   (task-orchestrator--check-children-limit orchestrator parent-agent (length entries))
   (let* ((mission-context
-           (let ((context (mission--agent-context parent-agent)))
+           (let ((context (if review-claim (mission-draft-review-admit review-claim parent-agent entries) (mission--agent-context parent-agent))))
              ;; Refuse new work before consuming any session or pool identity.
-             (when context
+             (when (and context (not review-claim))
                (mission--admit context :inference-p nil :new-work-p t))
              context))
          (count                     (length entries))
@@ -806,6 +806,7 @@ that check atomic with cascading cancellation."
                               :parent-agent          parent-agent
                               :assignment-origin     assignment-origin
                               :mission-context       mission-context
+                              :review-claim          review-claim
                               :review-checkpoint     (getf entry :review-checkpoint)
                               :inherited-reference-p inherited-p
                               :inherited-reference-items
@@ -817,7 +818,9 @@ that check atomic with cascading cancellation."
                               (conversation-adopted-participant (agent-conversation parent-agent))
                               :completion-policy     (or (getf item :completion-policy) ':continue)
                               :completion-mission-id
-                              (task-completion-mission-identifier parent-agent)
+                              (if review-claim
+                                  (getf (mission-context-goal mission-context) :candidate-id)
+                                  (task-completion-mission-identifier parent-agent))
                               :detached-p            (getf entry :detached)
                               :command-authorization-function
                               command-authorization-function
