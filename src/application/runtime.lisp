@@ -3985,7 +3985,11 @@ A fullscreen transcript evicts its oldest output; those records page in again."
                      (if (integerp count) count 0))
                    :created-at
                    (let ((time (getf (rest record) :created-at)))
-                     (if (integerp time) time (getf (rest record) :time)))))))))
+                     (if (integerp time) time (getf (rest record) :time)))
+                   :previous-question-p (eq t (getf (rest record) :previous-question-p))
+                   :last-response-sequence
+                   (let ((sequence (getf (rest record) :last-response-sequence)))
+                     (and (typep sequence '(integer 0)) sequence))))))))
 
 (-> application--load-goal (application) null)
 (defun application--load-goal (application)
@@ -4306,6 +4310,7 @@ STALE and UNVERIFIED count memories whose evidence changed or could not be check
      &key (:steering-function (option function))
           (:steering-persisted-function (option function))
           (:user-message-persisted-function (option function))
+          (:turn-completed-function (option function))
           (:pending-operations-function (option function))
           (:user-message-input (option (or string user-message-input)))
           (:continuation-p boolean)
@@ -4315,7 +4320,7 @@ STALE and UNVERIFIED count memories whose evidence changed or could not be check
     (application
      &key steering-function steering-persisted-function
           user-message-persisted-function pending-operations-function
-          user-message-input (continuation-p nil) operation-request)
+           user-message-input (continuation-p nil) operation-request turn-completed-function)
   "Return a terminal observer streaming one APPLICATION turn as stable lines.
 
 The turn's text, reasoning and status also go to the channel's structured
@@ -4490,6 +4495,13 @@ clients as :TEXT, :REASONING and :STATUS events."
            (application-clients-publish application (list :status :status status :details details))
            (case status
              (:user-message-persisted
+              (when (and (not continuation-p) (not operation-request)
+                         user-message-input
+                         (not (equal (user-message-input-text user-message-input)
+                                     *application-goal-continuation-prompt*))
+                         (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                                    (user-message-input-text user-message-input)))))
+                (application--reset-goal-question-chain application))
               (setf related-memories-shown-p nil
                     procedure-offers-shown-p nil)
               (let ((pending-input-identifier
@@ -4677,6 +4689,8 @@ clients as :TEXT, :REASONING and :STATUS events."
                         application details)))))
               (application-set-activity application activity-label))
              (:steering-applied
+              (when (getf details :nonblank-prose-p)
+                (application--reset-goal-question-chain application))
               (setf related-memories-shown-p nil
                     procedure-offers-shown-p nil)
               (application-render-records application)
@@ -4696,6 +4710,8 @@ clients as :TEXT, :REASONING and :STATUS events."
               (application-render-records application)
               (application-set-activity application activity-label))
              (:turn-completed
+              (when turn-completed-function
+                (funcall turn-completed-function details))
               (application--finish-stream application)
               (terminal-ui-set-compacting ui nil)
               (terminal-ui-set-preview-rows ui nil)
@@ -5038,31 +5054,109 @@ replaces only that name, once, and a process stops asking after
        (sb-sys:deadline-timeout () ':indeterminate))
      identity)))
 
+(-> application--goal-question-ending-p (string) boolean)
+(defun application--goal-question-ending-p (text)
+  "Recognize terminal prose questions, excluding quoted and Markdown code data."
+  (let ((fence nil) (fence-length 0) (question-p nil))
+    (dolist (line (uiop:split-string text :separator '(#\Newline)))
+      (let* ((trimmed (string-trim '(#\Space #\Tab #\Return) line))
+             (indent  (- (length line) (length (string-left-trim '(#\Space) line))))
+             (marker  (and (plusp (length trimmed)) (char trimmed 0)))
+             (run     (and marker (position-if-not (lambda (c) (char= c marker)) trimmed)))
+             (count   (if marker (or run (length trimmed)) 0)))
+        (unless (zerop (length trimmed))
+          (setf question-p nil)
+          (cond
+            (fence
+             (when (and (< indent 4) (eql marker fence) (>= count fence-length)
+                        (zerop (length (string-trim '(#\Space #\Tab #\Return)
+                                                   (subseq trimmed count)))))
+               (setf fence nil)))
+            ((or (>= indent 4) (find #\Tab line :end (min 1 (length line)))
+                 (char= marker #\>))
+             nil)
+            ((and (find marker '(#\` #\~)) (>= count 3))
+             (setf fence marker fence-length count))
+            ((char= (char trimmed (1- (length trimmed))) #\?)
+             (let ((quote-char nil) (code-p nil) (escaped-p nil))
+               (loop for c across trimmed for i from 0 do
+                 (cond
+                   (escaped-p
+                    (setf escaped-p nil))
+                   ((char= c #\\)
+                    (setf escaped-p t))
+                   ((char= c #\`)
+                    (unless quote-char (setf code-p (not code-p))))
+                   (code-p
+                    nil)
+                   (quote-char
+                    (when (char= c quote-char) (setf quote-char nil)))
+                   ((or (char= c #\")
+                        (and (char= c #\')
+                             (or (zerop i) (find (char trimmed (1- i)) '(#\Space #\Tab)))))
+                    (setf quote-char c))))
+               (setf question-p (not (or quote-char code-p escaped-p)))))))))
+    question-p))
+
+(-> application--initialize-goal-question-state (list) null)
+(defun application--initialize-goal-question-state (goal)
+  "Append bounded state slots in place, preserving the goal's cancellation identity."
+  (let ((missing (gensym)))
+    (dolist (key '(:previous-question-p :last-response-sequence))
+      (when (eq (getf goal key missing) missing)
+        (nconc goal (list key nil)))))
+  nil)
+
+(-> application--reset-goal-question-chain (application) null)
+(defun application--reset-goal-question-chain (application)
+  "Persist a real chain boundary without losing the durable replay watermark."
+  (with-lock-held (*provider-connection-episodes-lock*)
+    (let ((goal (application-goal application)))
+      (when (and goal (not (mission-goal-p goal)))
+        (application--initialize-goal-question-state goal)
+        (setf (getf goal :previous-question-p) nil
+              (application-goal application) goal)
+        (application--record-goal application))))
+  nil)
+
 (-> application--apply-goal-disposition
-    (application list keyword &key (:request (option string)) (:generation integer)) null)
-(defun application--apply-goal-disposition (application goal outcome &key request generation)
-  "Commit an owned disposition atomically with cancellation, then present its notice."
+    (application list keyword &key (:request (option string)) (:generation integer)
+     (:sequence (option (integer 0))) (:question-p boolean) (:source keyword)
+     (:state-sequence (option (integer 0)))) null)
+(defun application--apply-goal-disposition
+    (application goal outcome &key request generation sequence question-p
+                                  (source ':assessment) state-sequence)
+  "Commit an owned final reply and optional pause, rejecting reset or replay races."
   (let ((notice nil))
     (when (handler-case
               (progn
-                (when *provider-connection-owner-check*
-                  (funcall *provider-connection-owner-check*))
+                (when *provider-connection-owner-check* (funcall *provider-connection-owner-check*))
                 t)
             (error () nil))
       (with-lock-held (*provider-connection-episodes-lock*)
         (when (and (eq goal (application-goal application))
                    (eq (getf goal :status) ':active)
-                   (= generation (gethash goal *provider-connection-owner-generations* 0)))
+                   (= generation (gethash goal *provider-connection-owner-generations* 0))
+                   (eql state-sequence
+                        (getf (rest (conversation-latest-goal-record
+                                     (application-conversation application))) :seq))
+                   (or (null sequence) (null (getf goal :last-response-sequence))
+                       (> sequence (getf goal :last-response-sequence))))
           (conversation-append-record
            (application-conversation application)
-           (list ':goal-disposition :outcome outcome :request request))
-          (unless (eq outcome ':continue)
+           (list ':goal-disposition :outcome outcome :request request :source source))
+          ;; Missing sequence is permitted only for direct callers, not a durable streak.
+          (application--initialize-goal-question-state goal)
+          (when sequence
+            (setf (getf goal :previous-question-p) question-p
+                  (getf goal :last-response-sequence) sequence))
+          (when (eq outcome ':await-user)
             (setf (getf goal :status) ':paused
-                  (getf goal :pause-reason)
-                  (if (eq outcome ':await-user) ':awaiting-user ':disposition-unavailable)
-                  (getf goal :disposition-request) request
-                  (application-goal application) goal)
-            (application--record-goal application)
+                  (getf goal :pause-reason) ':awaiting-user
+                  (getf goal :disposition-request) request))
+          (setf (application-goal application) goal)
+          (application--record-goal application)
+          (when (eq outcome ':await-user)
             (setf notice
                   (list ':goal-disposition
                         (conversation-identifier (application-conversation application))
@@ -5071,38 +5165,76 @@ replaces only that name, once, and a process stops asking after
     (when notice
       (application-present
        application
-       (if (eq outcome ':await-user)
-           "Goal paused awaiting your decision. Reply to continue."
-           "Goal paused because automatic continuation could not be safely assessed. Reply to continue.")
+       (if (eq source ':consecutive-questions)
+           "Goal paused after two consecutive question-ending replies. Reply to continue."
+           "Goal paused awaiting your decision. Reply to continue.")
        :identifier notice)))
   nil)
 
-(-> application--note-goal-turn (application provider-result) null)
-(defun application--note-goal-turn (application result)
-  "Apply completion first, then a bounded plain-goal continuation disposition."
-  (let ((goal (application-goal application))
-        (text (application--turn-final-text result)))
-    (when (and goal (eq (getf goal :status) ':active) text)
+(-> application--note-goal-turn
+    (application provider-result &key (:sequence (option (integer 0))) (:goal (option list))) null)
+(defun application--note-goal-turn (application result &key sequence (goal (application-goal application)))
+  "Apply completion, explicit waiting, then a durable two-question continuation guard."
+  (let ((text       (application--turn-final-text result))
+        (generation (and goal (provider--connection-owner-generation goal)))
+        (state-sequence nil) (repeated-p nil) (waiting-p nil)
+        (classify-p nil) (complete-p nil) (mission-complete-p nil))
+    (when (and goal text
+               (handler-case
+                   (progn (when *provider-connection-owner-check*
+                            (funcall *provider-connection-owner-check*)) t)
+                 (error () nil)))
+      ;; Snapshot all chain state together. Completion also commits under this lock;
+      ;; assessment runs outside it and revalidates the snapshot before committing.
+      (with-lock-held (*provider-connection-episodes-lock*)
+        (when (and (eq goal (application-goal application))
+                   (eq (getf goal :status) ':active)
+                   (= generation (gethash goal *provider-connection-owner-generations* 0))
+                   (or (null sequence) (null (getf goal :last-response-sequence))
+                       (> sequence (getf goal :last-response-sequence))))
+          (cond
+            ((search *application-goal-complete-marker* text)
+             (if (mission-goal-p goal)
+                 (setf mission-complete-p t)
+                 (progn
+                   (application--initialize-goal-question-state goal)
+                   (setf (getf goal :status) ':complete
+                         (getf goal :previous-question-p) nil)
+                   (when sequence (setf (getf goal :last-response-sequence) sequence))
+                   (application--record-goal application)
+                   (setf complete-p t))))
+            ((not (mission-goal-p goal))
+             (setf classify-p t
+                   state-sequence
+                   (getf (rest (conversation-latest-goal-record
+                                (application-conversation application))) :seq)
+                   repeated-p (and sequence (application--goal-question-ending-p text)
+                                   (getf goal :previous-question-p))
+                   waiting-p (application--goal-waiting-marker-p text))))))
       (cond
-        ((search *application-goal-complete-marker* text)
-         (if (mission-goal-p goal)
-             (application-mission-verify application)
-             (progn
-               (setf (getf goal :status) ':complete)
-               (application--record-goal application)
-               (application-present
-                application
-                (list (terminal-span ':success "✓ goal complete")
-                      (terminal-span ':plain (string #\Newline))
-                      (terminal-span ':dim (format nil "  ~A" (getf goal :objective))))))))
-        ((not (mission-goal-p goal))
-         (let ((generation (provider--connection-owner-generation goal)))
-           (multiple-value-bind (outcome request)
-               (if (application--goal-waiting-marker-p text)
-                   (values ':await-user nil)
-                   (application--goal-disposition application goal text))
-              (application--apply-goal-disposition
-               application goal outcome :request request :generation generation)))))))
+        (mission-complete-p
+         (application-mission-verify application))
+        (complete-p
+         (application-present
+          application
+          (list (terminal-span ':success "✓ goal complete")
+                (terminal-span ':plain (string #\Newline))
+                (terminal-span ':dim (format nil "  ~A" (getf goal :objective))))))
+        (classify-p
+         (multiple-value-bind (outcome request)
+             (if (or waiting-p repeated-p)
+                 (values ':await-user nil)
+                 (application--goal-disposition application goal text))
+           (application--apply-goal-disposition
+            application goal outcome :request request :generation generation
+            :sequence sequence :question-p (application--goal-question-ending-p text)
+            :state-sequence state-sequence
+            :source         (cond (waiting-p
+                                   ':explicit-waiting)
+                                  (repeated-p
+                                   ':consecutive-questions)
+                                  (t
+                                   ':assessment))))))))
   nil)
 
 (-> application-present-context-refusal (application provider-context-budget-error) null)
@@ -5179,7 +5311,8 @@ refusal, as a secondary value."
   (application--call-with-goal-connection-owner
    application
    (lambda ()
-     (let ((ui (application-ui application)) (turn-result nil))
+     (let ((ui (application-ui application)) (turn-result nil)
+           (final-sequence nil) (turn-goal (application-goal application)))
        (unwind-protect
             (progn
               (application-set-activity application (application-thinking-label))
@@ -5198,7 +5331,10 @@ refusal, as a secondary value."
                                                pending-operations-function
                                                :user-message-input content
                                                :continuation-p     continuation-p
-                                               :operation-request  operation-request)
+                                               :operation-request  operation-request
+                                               :turn-completed-function
+                                               (lambda (details)
+                                                 (setf final-sequence (getf details :provider-record-sequence))))
                    :goal-context             (application-goal-context application)
                    :tools-p                  tools-p
                    :tool-allowlist           tool-allowlist
@@ -5213,7 +5349,8 @@ refusal, as a secondary value."
                 (:no-error (&optional result &rest secondary-values)
                   (declare (ignore secondary-values))
                   (setf turn-result result)
-                  (application--note-goal-turn application result)
+                  (application--note-goal-turn application result
+                                               :sequence final-sequence :goal turn-goal)
                   (application--maybe-name-session
                    application :title-p (not (or continuation-p operation-request))))))
          (application--finish-stream application)

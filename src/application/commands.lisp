@@ -1106,6 +1106,7 @@ Return true only when the objective was rewritten."
        (setf (getf (application-goal application) :objective)
              (copy-seq objective)
              (getf (application-goal application) :continuations) 0)
+       (application--reset-goal-question-chain application)
        (application--record-goal application)
        (application-present
         application
@@ -1166,6 +1167,10 @@ work must steer the running turn, not queue as follow-up work."
       (provider-cancel-connection-owner (application-goal application)))
     (mission-detach application)
     (flet ((install ()
+             (when goal
+               (application--initialize-goal-question-state goal)
+               (setf (getf goal :previous-question-p) nil
+                     (getf goal :last-response-sequence) nil))
              (setf (application-goal application) goal)
              (application--record-goal application)))
       (if previous
@@ -1230,6 +1235,7 @@ NIL and :STATUS show the goal. :UPDATE takes one string objective; :PAUSE,
                    (remf goal :disposition-request)
                    (setf (getf goal :status) ':active
                          (getf goal :continuations) 0
+                         (getf goal :previous-question-p) nil
                          (application-goal application) goal)
                    (application--record-goal application)))
              (application-present application

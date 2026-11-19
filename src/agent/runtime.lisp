@@ -798,14 +798,14 @@ retries stay auditable next to the request they belong to."
      &key (:request-number integer)
           (:call-plans list)
           (:input-measurement list))
-    null)
+    (values null list))
 (defun agent--persist-provider-result
     (agent result &key request-number call-plans input-measurement)
-  "Append RESULT items in wire order and record the billed usage.
+  "Append RESULT items in wire order; return NIL and the billed metadata record.
 
 The provider billed the response before it reached this image, so the usage
 record is written even when an item is refused and the turn then fails."
-  (let ((conversation (agent-conversation agent)))
+  (let ((conversation (agent-conversation agent)) (record nil))
     (with-recursive-lock-held ((conversation-append-lock conversation))
      (unwind-protect
          (dolist (item (provider-result-output-items result))
@@ -834,32 +834,35 @@ record is written even when an item is refused and the turn then fails."
                   (getf plan :persistence)
                   ':durable)
               :request-number request-number)))
-      (agent--record-provider-result-usage agent result :request-number request-number
-                                           :input-measurement input-measurement))))
-  nil)
+      (setf record
+            (nth-value 1
+                       (agent--record-provider-result-usage
+                        agent result :request-number request-number
+                        :input-measurement input-measurement)))))
+    (values nil record)))
 
 (-> agent--record-provider-result-usage
     (agent provider-result &key (:request-number integer) (:input-measurement list))
-    null)
+    (values null list))
 (defun agent--record-provider-result-usage (agent result &key request-number input-measurement)
-  "Record RESULT's billed usage independently of its item validation."
+  "Record RESULT's billed usage independently of item validation; return NIL and its record."
   (let ((conversation (agent-conversation agent)))
-    (conversation-append-provider-metadata
-     conversation
-     (append (list :request-number   request-number
-                   :response-id      (provider-result-response-id result)
-                   :usage            (agent--portable-value
-                                      (provider-usage-normalize
-                                       (provider-result-usage result)))
-                   :request-identity (conversation-request-identity conversation))
-             (let ((receipt (provider-input-measurement-ticket-receipt
-                             conversation input-measurement)))
-               (and receipt (list :input-measurement receipt)))
-             ;; The service's effective retention mode, when it reports one.
-             (let ((context (agent--result-reasoning-context result)))
-               (and context (list :reasoning-context context))))))
-
-  nil)
+    (values
+     nil
+     (conversation-append-provider-metadata
+      conversation
+      (append (list :request-number   request-number
+                    :response-id      (provider-result-response-id result)
+                    :usage            (agent--portable-value
+                                       (provider-usage-normalize
+                                        (provider-result-usage result)))
+                    :request-identity (conversation-request-identity conversation))
+              (let ((receipt (provider-input-measurement-ticket-receipt
+                              conversation input-measurement)))
+                (and receipt (list :input-measurement receipt)))
+              ;; The service's effective retention mode, when it reports one.
+              (let ((context (agent--result-reasoning-context result)))
+                (and context (list :reasoning-context context))))))))
 
 (-> agent--append-provider-item
     (agent json-object
@@ -1672,7 +1675,14 @@ tool registry reaches the very next provider request."
       (agent-observer-status
        observer
        :steering-applied
-       (list :message-count (length messages)))))
+       (list :message-count (length messages)
+            :nonblank-prose-p
+            (some (lambda (entry)
+                    (let* ((message (if (typep entry 'agent-steering-input)
+                                        (agent-steering-input-content entry) entry))
+                           (text    (user-message-input-text message)))
+                      (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) text)))))
+                  messages)))))
   nil)
 
 (defparameter *agent-prepared-input-estimate* nil
@@ -2341,12 +2351,13 @@ loop, so compaction ahead of the user message shares the turn's budget."
                       (setf call-plans
                             (agent--tool-call-plans agent calls :storm-state storm-state))
                       (setf persistence-started-p t)
-                      (agent--persist-provider-result
-                       agent
-                       result
-                       :request-number request-number
-                        :call-plans    call-plans
-                       :input-measurement input-measurement))
+                       (setf (getf completion-details :provider-record-sequence)
+                             (getf (rest (nth-value 1
+                                                   (agent--persist-provider-result
+                                                    agent result :request-number request-number
+                                                    :call-plans call-plans
+                                                    :input-measurement input-measurement)))
+                                   :seq)))
                   (unless persistence-started-p
                     (agent--record-provider-result-usage
                      agent result :request-number request-number)))
@@ -2374,7 +2385,8 @@ loop, so compaction ahead of the user message shares the turn's budget."
                 (list :provider-requests request-number
                       :tool-rounds       tool-rounds
                       :tool-calls        tool-calls
-                      :response-id       (provider-result-response-id result))
+                      :response-id       (provider-result-response-id result)
+                      :provider-record-sequence (getf completion-details :provider-record-sequence))
                 (agent-turn-completion-details agent)))
               (agent-learn-procedures agent observer tool-calls)
               (return result))
