@@ -1067,18 +1067,59 @@
                                 configuration conversation :provider provider))
                        "the meter counts already measured nonempty guidance once")
           (setf conversation (conversation-load (conversation-pathname conversation)))
+          ;; Codex anchors lasting goal guidance inside the projected history.
+          ;; Replacing it invalidates that prefix, even when the text shrinks.
           (dolist (entry (list (list guidance #'=)
                               (list (make-string 1200 :initial-element #\g) #'>)
-                              (list (make-string 400 :initial-element #\g) #'<)
-                              (list nil #'<)))
+                              (list (make-string 400 :initial-element #\g) #'>)
+                              (list nil #'>)))
             (let* ((*provider-context-request*
                      (provider-context-request-create provider conversation #()))
                    (request (provider-request-object provider conversation #()
                                                      :goal-context (first entry))))
-              (test-assert (funcall (second entry)
-                                    (provider-request-input-token-estimate provider request)
-                                    1200)
-                           "admission replaces measured guidance after reload"))))))))
+              (multiple-value-bind (tokens uncertain-p mode)
+                  (provider-request-input-token-estimate provider request)
+                (declare (ignore uncertain-p))
+                (test-assert (eq mode (if (equal guidance (first entry))
+                                         :retained-usage :character/image))
+                             "changed anchored guidance requires unmeasured admission")
+                (test-assert (funcall (second entry) tokens 1200)
+                             "only unchanged anchored guidance reuses measured input after reload")))))))))
+  (context-admission-test--with-measured-context
+   (lambda (agent)
+     (let ((guidance (make-string 800 :initial-element #\g)))
+       (test-call-with-function-replacements
+        (list (list 'context-resolve-request
+                    (lambda (configuration conversation tools &key goal-context compaction-p)
+                      (declare (ignore configuration tools goal-context compaction-p))
+                      (make-instance 'context-delivery
+                                     :conversation-identifier (conversation-identifier conversation)
+                                     :contributions           (when guidance
+                                                                (list (make-context-contribution
+                                                                       :identifier  "volatile-measurement"
+                                                                       :instruction guidance
+                                                                       :lifetime    :next-request)))))))
+        (lambda ()
+          (context-admission-test--measure agent)
+          (let* ((provider     (agent-provider agent))
+                 (conversation (conversation-load (conversation-pathname (agent-conversation agent))))
+                 (sample       (copy-tree (conversation-context-usage-sample conversation))))
+            (test-assert (plusp (getf sample :temporary-characters))
+                         "next-request contributions earn replaceable temporary evidence")
+            (dolist (entry (list (list guidance #'=)
+                                (list (make-string 1200 :initial-element #\g) #'>)
+                                (list (make-string 400 :initial-element #\g) #'<)
+                                (list nil #'<)))
+              (setf guidance (first entry))
+              (let* ((*provider-context-request* (provider-context-request-create provider conversation #()))
+                     (request                    (provider-request-object provider conversation #())))
+                (multiple-value-bind (tokens uncertain-p mode)
+                    (provider-request-input-token-estimate provider request)
+                  (declare (ignore uncertain-p))
+                  (test-assert (eq mode :retained-usage)
+                               "volatile delivery changes retain the measured durable prefix")
+                  (test-assert (funcall (second entry) tokens 1200)
+                               "next-request guidance is replaced after disk reload"))))))))))
   nil)
 
 (-> test-context-admission-measured-invalidation () null)
@@ -1250,7 +1291,7 @@
                     (provider-request-input-token-estimate provider request)
                   (test-assert (and (= expected tokens) uncertain-p)
                                "wire admission retains opaque history before transport observation"))
-                (provider-open-response-stream provider request :conversation conversation)
+                (provider-open-response-stream provider request :credentials *provider-input-measurement-credentials* :conversation conversation)
                 (setf (gethash "instructions" request) "Post-encode tamper")
                 (test-assert (not (nth-value 1 (provider-context--matched-input provider request)))
                              "changed soft headers do not authorize post-encode edits")
@@ -1335,7 +1376,10 @@
          (conversation-append-record conversation (list :context-usage :sample legacy))
          (let ((loaded (conversation-context-usage-sample
                         (conversation-load (conversation-pathname conversation)))))
-           (test-assert (and (= 26 (length loaded)) (null (getf loaded :header-text)))
+           (test-assert (and (conversation-context-usage-sample-p loaded)
+                             (equal legacy loaded)
+                             (equal (getf sample :route) (getf loaded :route))
+                             (null (getf loaded :header-text)))
                         "genuine fingerprint-only format-two records load without invented text")
            (test-call-with-function-replacements
             (list (list 'system-prompt
@@ -1788,7 +1832,8 @@
                (test-assert (handler-case (progn (provider-check-request-context provider overhead) nil)
                               (provider-context-budget-error () t)) "Large current overhead can refuse even with a valid measured prefix.")))))
        (let* ((new-image (json-object "type" "input_image" "image_url" "data:image/png;base64,AA"))
-              (tail      (concatenate 'vector (json-get request "input") (vector new-image)))
+              (tail      (concatenate 'vector (json-get request "input") (vector (json-object "type" "message" "role" "user"
+                                                                                  "content" (vector new-image)))))
               (candidate (json-object-copy request)))
          (setf (gethash "input" candidate) tail)
          (let ((small (context-measured-tests--estimate provider conversation candidate)))
