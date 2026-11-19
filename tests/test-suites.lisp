@@ -2292,6 +2292,8 @@
   test-compaction-recovery-exhaustion
   test-compaction-owner-proactive
   test-compaction-owner-manual
+  test-compaction-owner-ended-cancellation
+  test-compaction-owner-ended-deadlines
   test-compaction-owner-reactive
   test-compaction-owner-schedule
   test-compaction-owner-terminal-idle

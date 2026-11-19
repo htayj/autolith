@@ -2535,3 +2535,72 @@
            (test-assert (eql 429 (provider-error-status failure)) "Allowance status is preserved."))
          (test-assert (null *provider-connection-episodes*) "The exact restored episode is removed.")))))
   nil)
+
+
+(-> compaction-owner-test--ended (keyword) null)
+(defun compaction-owner-test--ended (reason)
+  "Propagate an actual owner failure through compaction with a silent observer."
+  (with-test-configuration (configuration)
+    (let* ((conversation (conversation-create configuration))
+           (provider     (make-instance 'scripted-provider :configuration configuration :results nil))
+           (agent        (agent-create :configuration configuration :conversation conversation
+                                       :provider provider :tool-registry (agent-test-registry) :worker nil))
+           (observer     (make-instance 'agent-observer))
+           (owner        (list :compaction-owner reason))
+           (*provider-connection-owner* owner)
+           (state        (make-provider-connection-recovery))
+           (dispatches   0)
+           (publications 0)
+           (original     nil)
+           (failure      nil)
+           (append-summary (symbol-function 'conversation-append-summary)))
+      (conversation-append-user-message conversation "Earlier request.")
+      (conversation-append-provider-item conversation (agent-test-message "Earlier answer."))
+      (conversation-append-user-message conversation "Continue the work.")
+      (ecase reason
+        (:cancellation
+         (provider-cancel-connection-owner owner))
+        (:caller-deadline
+         (setf (provider-connection-recovery-deadline state)
+               (1- (/ (get-internal-real-time) internal-time-units-per-second))))
+        (:owner-deadline
+         (setf (provider-connection-recovery-owner-check state) (constantly 0))))
+      (test-call-with-function-replacements
+       (list (list 'provider-stream-turn
+                   (lambda (actual-provider view &key tool-namespaces event-callback goal-context compaction-p)
+                     (declare (ignore view tool-namespaces goal-context))
+                     (test-assert (eq actual-provider provider) "The checkpoint uses the owning provider.")
+                     (test-assert compaction-p "Only the checkpoint dispatch is reached.")
+                     (incf dispatches)
+                     (funcall event-callback (make-instance 'assistant-delta-event :text ""))
+                     (handler-bind ((provider-owner-ended
+                                      (lambda (condition) (unless original (setf original condition)))))
+                       (provider--check-connection-owner state))))
+             (list 'conversation-append-summary
+                   (lambda (&rest arguments)
+                     (incf publications)
+                     (apply append-summary arguments))))
+       (lambda ()
+         (handler-case (agent-compact-conversation agent observer)
+           (provider-owner-ended (condition) (setf failure condition)))))
+      (test-assert (typep original 'provider-owner-ended) "The real owner check signals its terminal condition.")
+      (test-assert (and failure (eq original failure)) "Compaction propagates the identical owner condition.")
+      (test-assert (= 1 dispatches) "An ended owner cannot dispatch another checkpoint generation.")
+      (test-assert (zerop publications) "An ended owner cannot reach checkpoint publication.")
+      (test-assert (notany (lambda (record) (member (first record) '(:summary :native-compaction)))
+                           (conversation-records-newest conversation 100))
+                   "Neither portable nor native checkpoint records are published.")
+      (test-assert (null (conversation-continuation conversation)) "No fallback continuation is installed.")))
+  nil)
+
+(-> test-compaction-owner-ended-cancellation () null)
+(defun test-compaction-owner-ended-cancellation ()
+  "Stop a cancelled checkpoint owner without another request or publication."
+  (compaction-owner-test--ended ':cancellation))
+
+(-> test-compaction-owner-ended-deadlines () null)
+(defun test-compaction-owner-ended-deadlines ()
+  "Stop expired caller and owner deadlines without retrying or publishing."
+  (dolist (reason '(:caller-deadline :owner-deadline))
+    (compaction-owner-test--ended reason))
+  nil)
