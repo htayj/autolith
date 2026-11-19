@@ -78,6 +78,14 @@
 (define-test-suite context-admission
   test-context-sample-route-validation
   test-context-tool-output-image-accounting
+  test-context-observation-receipts
+  test-context-observation-retained
+  test-context-observation-character-images
+  test-context-observation-soft
+  test-context-observation-hard
+  test-context-observation-candidates
+  test-context-observation-retry-ownership
+  test-context-observation-replay
   test-context-boundary-prepare-change
   test-context-boundary-headroom-change
   test-context-boundary-observer-change

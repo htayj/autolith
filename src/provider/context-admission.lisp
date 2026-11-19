@@ -39,15 +39,19 @@ and URL length are never charged as text tokens.")
 
 REQUEST is the final encoded request, including selected tools and temporary
 context. This local admission estimate is independent of paid usage. Methods
-may use provider token counts when available; the default is not a tokenizer."))
+may use provider token counts when available; the default is not a tokenizer.
+Optional third/fourth values are the estimate mode and failed receipt reason;
+an omitted mode denotes an unsupported extension, not a character estimate."))
 
 (defmethod provider-request-input-token-estimate ((provider model-provider) (request hash-table))
   "Use matched ordinary usage, otherwise estimate the final encoded prompt."
   (multiple-value-bind (tokens matched-p uncertain-p)
       (provider-context--matched-input provider request)
     (if matched-p
-        (values tokens uncertain-p)
-        (provider-context--input-tokens provider nil (provider-request-body provider request)))))
+        (values tokens uncertain-p :retained-usage)
+        (multiple-value-bind (estimated uncertain-p)
+            (provider-context--input-tokens provider nil (provider-request-body provider request))
+          (values estimated uncertain-p :character/image)))))
 
 (-> provider-context--soft-header (model-provider vector) (option list))
 (defun provider-context--soft-header (provider tools)
@@ -476,13 +480,51 @@ image-shaped JSON nested inside a tool payload is ordinary encoded text."
   "Reserve the larger of configured headroom and the request's explicit output cap."
   (reduce #'max (provider-request-output-ceilings provider request)          :initial-value (config :context-output-reserve (provider-configuration provider))))
 
+(defparameter *provider-context-observation* nil
+  "Ordinary invocation's owner, attempt, boundary counter and completion mapping.")
+
+(declaim (special *provider-bounded-assessment-p*))
+
+(-> provider-context--observe
+    (model-provider &key (:stage keyword) (:estimate integer) (:non-text-p boolean)
+     (:mode (option keyword)) (:failure t) (:window integer) (:reserve integer)
+     (:decision keyword)) null)
+(defun provider-context--observe
+    (provider &key stage estimate non-text-p mode failure window reserve decision)
+  "Append one immutable boundary snapshot when this ordinary owner is supported."
+  (let ((context *provider-context-observation*))
+    (when (and context (eq stage :hard)) (setf (getf context :hard) nil))
+    (when (and context (getf context :active-p)
+               (not *provider-bounded-assessment-p*)
+               (eq provider (getf context :provider)))
+      (when (member mode '(:receipt-history :receipt-prefix :retained-usage :character/image))
+        (let ((candidate (incf (getf context :candidate))))
+          (conversation-append-context-decision
+           (getf context :owner)
+           (list :version 1 :attempt (getf context :attempt) :candidate candidate
+                 :stage stage :estimate estimate :mode mode
+                 :receipt-failure (and failure
+                                       (if (member failure '(:no-owner :no-anchor :unsupported-layout
+                                                             :identity-changed :prefix-changed
+                                                             :unattested-provenance :history-changed))
+                                           failure :unknown))
+                 :non-text-p non-text-p :window window :reserve reserve
+                 :soft-threshold (getf context :threshold) :decision decision))
+          (when (and (eq stage :hard) (eq decision :admit))
+            (setf (getf context :hard) candidate))))))
+  nil)
+
 (-> provider-check-request-context (model-provider hash-table) null)
 (defun provider-check-request-context (provider request)
   "Reject an oversized encoded request before network I/O."
-  (multiple-value-bind (input non-text-p)
+  (multiple-value-bind (input non-text-p mode failure)
       (provider-request-input-token-estimate provider request)
     (let ((reserve (provider-request-output-reserve provider request))
           (window  (provider-effective-context-window provider)))
+      (provider-context--observe
+       provider :stage ':hard :estimate input :non-text-p non-text-p
+       :mode mode :failure failure :window window :reserve reserve
+       :decision (if (> (+ input reserve) window) :refuse :admit))
       (when (> (+ input reserve) window)
         (error 'provider-context-budget-error
                :message                (format nil
@@ -576,20 +618,26 @@ provider with a direct-return implementation."))
 (-> provider-call-prepared-request-decision (model-provider hash-table) null)
 (defun provider-call-prepared-request-decision (provider request)
   "Ask the ordinary owner about this final candidate without granting transport permission."
-  (when (and *provider-prepared-request-decision*
-             (funcall *provider-prepared-request-decision*
-                      (provider-request-input-token-estimate provider request)))
-    (let ((condition (make-condition
-                      'provider-proactive-compaction-required
-                      :message                "The prepared ordinary input reached its soft compaction threshold."
-                      :estimated-input-tokens (provider-request-input-token-estimate provider request)
-                      :output-reserve         (provider-request-output-reserve provider request)
-                      :context-window         (provider-effective-context-window provider)
-                      :non-text-estimate-p    t)))
-      (when (and *provider-context-admission-state*
-                 (eq (first *provider-context-admission-state*) :pending))
-        (setf (rest *provider-context-admission-state*) condition))
-      (error condition)))
+  (when *provider-prepared-request-decision*
+    (multiple-value-bind (input non-text-p mode failure)
+        (provider-request-input-token-estimate provider request)
+      (let ((compact-p (funcall *provider-prepared-request-decision* input))
+            (reserve   (provider-request-output-reserve provider request))
+            (window    (provider-effective-context-window provider)))
+        (provider-context--observe
+         provider :stage ':soft :estimate input :non-text-p non-text-p
+         :mode mode :failure failure :window window :reserve reserve
+         :decision (if compact-p :compact :continue))
+        (when compact-p
+          (let ((condition (make-condition
+                            'provider-proactive-compaction-required
+                            :message "The prepared ordinary input reached its soft compaction threshold."
+                            :estimated-input-tokens input :output-reserve reserve
+                            :context-window window :non-text-estimate-p t)))
+            (when (and *provider-context-admission-state*
+                       (eq (first *provider-context-admission-state*) :pending))
+              (setf (rest *provider-context-admission-state*) condition))
+            (error condition))))))
   nil)
 
 (-> provider-call-with-mission-output-allowance (model-provider hash-table function) t)
@@ -915,16 +963,31 @@ intentionally avoids subtracting any unproven old estimate."
   "Use an independently proven ordinary measurement, otherwise the existing estimate."
   (multiple-value-bind (estimate reason)
       (provider-input-measurement--estimate provider request)
-    (declare (ignore reason))
     (if estimate
-        (values estimate t)
-        (call-next-method))))
+        (values estimate t (ecase reason
+                             (:measured-history
+                              :receipt-history)
+                             (:measured-prefix
+                              :receipt-prefix)) nil)
+        (multiple-value-bind (tokens non-text-p mode)
+            (call-next-method)
+          (values tokens non-text-p mode reason)))))
 
 (defmethod provider-request-object :before
     ((provider model-provider) (conversation conversation)
      (tool-namespaces vector) &key goal-context compaction-p)
   "Authorize measurement only for this ordinary attempt's exact conversation object."
   (declare (ignore tool-namespaces goal-context))
+  (when *provider-context-observation*
+    (setf (getf *provider-context-observation* :hard) nil
+          (getf *provider-context-observation* :active-p)
+          (and (not compaction-p) (not *provider-bounded-assessment-p*)
+               (eq conversation (getf *provider-context-observation* :owner))))
+    ;; Every ordinary dispatch, including a different fallback adapter, owns a new attempt.
+    (when (getf *provider-context-observation* :active-p)
+      (setf (getf *provider-context-observation* :provider) provider
+            (getf *provider-context-observation* :attempt) (make-identifier)
+            (getf *provider-context-observation* :candidate) 0)))
   (when (and *provider-context-request*
              (or compaction-p
                  (not (eq conversation (getf *provider-context-request* :conversation)))
