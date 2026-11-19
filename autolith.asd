@@ -519,6 +519,7 @@
                                           (:file "conversation-identifier-tests")
                                           (:file "user-identifier-tests")
                                           (:file "conversation-tests")
+                                          (:file "candidate-ledger-store-tests")
                                           (:file "precompaction-tests")
                                           (:file "compaction-tail-tests")
                                           (:file "conversation-input-history-tests")
