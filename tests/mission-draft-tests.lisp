@@ -1,0 +1,67 @@
+(in-package #:autolith)
+
+;;;; -- Durable Side-by-Side Drafts --
+
+(-> mission-draft-test--submit (application keyword &rest t) boolean)
+(defun mission-draft-test--submit (application action &rest arguments)
+  "Observe refusal at the real native command boundary without an evaluator."
+  (handler-case (progn (apply #'application-mission-command application action arguments) t)
+    (mission-error () nil)))
+
+(-> test-mission-draft-coexistence () null)
+(defun test-mission-draft-coexistence ()
+  "Create and edit a real draft without rebinding working identity or counters."
+  (dolist (status '(:active :paused :blocked))
+    (with-test-configuration (configuration)
+      (let ((application (mission-test--application configuration)))
+        (unwind-protect
+             (progn
+               (application-mission-start application (mission-test--specification))
+               (let* ((goal         (application-goal application))
+                      (conversation (application-conversation application))
+                      (context      (mission-context-find conversation))
+                      (jobs         (list :owned-working-job)))
+                 (setf (getf goal :status) status
+                       (getf goal :turns-used) 3 (getf goal :tokens-used) 17
+                       (getf goal :unknown-usage) 1 (mission-context-jobs context) jobs)
+                 (mission--record context)
+                 (let ((before   (copy-tree goal))
+                       (accepted (mission-draft-test--submit application :draft (mission-test--specification))))
+                   (test-assert accepted "the actual command admits a draft beside the working mission")
+                   (when accepted
+                     (let* ((draft             (slot-value application 'mission-draft))
+                            (candidate-context (slot-value application 'mission-draft-context))
+                            (identity          (getf draft :candidate-id))
+                            (digest            (getf draft :specification-digest))
+                            (specification     (mission-test--specification)))
+                       (test-assert (and (eq goal (application-goal application)) (equal before goal)
+                                         (eq context (mission-context-find conversation))
+                                         (eq context (mission-context-find configuration))
+                                         (eq jobs (mission-context-jobs context)))
+                                    "candidate creation preserves exact working identity, jobs and usage")
+                       (test-assert (and (stringp identity) (not (eq draft goal))
+                                         (not (eq candidate-context context))
+                                         (eq :draft (getf draft :status))
+                                         (null (getf draft :activated-at)) (null (getf draft :deadline))
+                                         (= 1 (getf draft :specification-revision)))
+                                    "candidate has its own identity, revision and nonworking context")
+                       (setf (getf draft :turns-used) 2 (getf draft :tokens-used) 9
+                             (getf draft :unknown-usage) 1)
+                       (setf (getf specification :objective) "Deliver a different artifact.")
+                       (test-assert (mission-draft-test--submit application :draft specification) "edit accepted")
+                       (test-assert (mission-draft-test--submit application :draft (mission-test--specification)) "edit-back accepted")
+                       (test-assert (and (eq draft (slot-value application 'mission-draft))
+                                         (equal identity (getf draft :candidate-id))
+                                         (= 3 (getf draft :specification-revision))
+                                         (equal digest (getf draft :specification-digest))
+                                         (= 2 (getf draft :turns-used)) (= 9 (getf draft :tokens-used))
+                                         (= 1 (getf draft :unknown-usage)))
+                                    "edit-back advances revision without resetting accounting")
+                       (test-assert (mission-draft-test--submit application :draft-clear) "clear accepted")
+                       (test-assert (null (slot-value application 'mission-draft)) "clear removes only draft")
+                       (mission--record candidate-context)
+                       (test-assert (null (slot-value application 'mission-draft)) "stale publication cannot resurrect draft")
+                       (test-assert (equal before goal) "working state is untouched"))))))
+          (tool-registry-close-runtime-state (application-tool-registry application))
+          (terminal-ui-stop (application-ui application))))))
+  nil)

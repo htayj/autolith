@@ -112,11 +112,11 @@
 (-> application-mission-command (application &optional t &rest t) null)
 (defun application-mission-command (application &optional (action ':status) &rest arguments)
   "Apply a native mission action, preserving specifications and literal evidence."
-  (unless (and (member action '(:status :start :run :verify :resume :cancel :accept :invalidate))
+  (unless (and (member action '(:status :start :draft :draft-replace :draft-clear :run :verify :resume :cancel :accept :invalidate))
                (case action
-                 ((:status :run :verify :resume)
+                 ((:status :draft-clear :run :verify :resume)
                   (null arguments))
-                 (:start
+                 ((:start :draft :draft-replace)
                   (and (= (length arguments) 1)
                        (mission--command-specification-p (first arguments))))
                  (:cancel
@@ -129,6 +129,10 @@
     (:status
      (application-present application
                           (application-lisp-value-entry "mission" (application-goal application))))
+    ((:draft :draft-replace)
+     (application-mission-draft-edit application (first arguments) :replace-p (eq action :draft-replace)))
+    (:draft-clear
+     (application-mission-draft-clear application))
     (:start
      (application-mission-start application (first arguments))
      (application-present application "Mission installed; (mission :run) begins it."))
