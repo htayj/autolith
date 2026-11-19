@@ -112,9 +112,9 @@
 (-> application-mission-command (application &optional t &rest t) null)
 (defun application-mission-command (application &optional (action ':status) &rest arguments)
   "Apply a native mission action, preserving specifications and literal evidence."
-  (unless (and (member action '(:status :start :draft :draft-replace :draft-clear :run :verify :resume :cancel :accept :invalidate))
+  (unless (and (member action '(:status :start :draft :draft-replace :draft-clear :review-draft :collect-draft-review :run :verify :resume :cancel :accept :invalidate))
                (case action
-                 ((:status :draft-clear :run :verify :resume)
+                 ((:status :draft-clear :review-draft :collect-draft-review :run :verify :resume)
                   (null arguments))
                  ((:start :draft :draft-replace)
                   (and (= (length arguments) 1)
@@ -128,9 +128,16 @@
   (case action
     (:status
      (application-present application
-                          (application-lisp-value-entry "mission" (application-goal application))))
+                          (application-lisp-value-entry
+                           "mission" (list :working   (application-goal application)
+                                           :candidate (application-mission-draft application)))))
     ((:draft :draft-replace)
      (application-mission-draft-edit application (first arguments) :replace-p (eq action :draft-replace)))
+    (:review-draft
+     (let ((job (application-mission-draft-review application)))
+       (when job (application-present application (format nil "Candidate native review job ~A. Collect its result separately." (job-identifier job))))))
+    (:collect-draft-review
+     (application-present application (format nil "~S" (application-mission-draft-review-collect application))))
     (:draft-clear
      (application-mission-draft-clear application))
     (:start

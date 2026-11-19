@@ -366,3 +366,19 @@
          (mission-context-bind nil child)
          (job-pool-close pool)))))
   nil)
+
+(-> test-mission-draft-native-command () null)
+(defun test-mission-draft-native-command ()
+  "Request and collect a real candidate review through native command actions."
+  (review287--call
+   (lambda (application)
+     (application-mission-command application :review-draft)
+     (let* ((context (application-mission-draft-context application))
+            (claim   (mission-context-candidate-ticket context))
+            (job     (mission-draft-ticket-job claim)))
+       (test-assert (task-job-await job 30) "native command review terminates")
+       (application-mission-command application :collect-draft-review)
+       (test-assert (eq :settled (mission-draft-review-state claim)) "native collection settles the exact claim")
+       (test-assert (equal "pass" (getf (getf (getf (application-mission-draft application) :candidate-claim) :artifact) :verdict))
+                    "native collection retains the explicit verdict"))))
+  nil)
