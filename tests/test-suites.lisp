@@ -76,6 +76,8 @@
   test-provider-status-parent-wait-notes)
 
 (define-test-suite context-admission
+  test-context-sample-route-validation
+  test-context-tool-output-image-accounting
   test-context-boundary-prepare-change
   test-context-boundary-headroom-change
   test-context-boundary-observer-change

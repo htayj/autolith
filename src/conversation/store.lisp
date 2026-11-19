@@ -4157,25 +4157,35 @@ Compaction and context adoption replace the measured history."
 
        (loop for tail on sample by (partial #'nthcdr 2)
              always (keywordp (first tail)))
-       (case (getf sample :format)
-         (1
-          (member (length sample) '(16 18)))
-         (2
-           (and (= (length sample)
-                   (+ 26 (if (getf sample :wire-history-p) 2 0)
-                      (if (conversation--property-present-p sample :header-text) 2 0)))
-                (member (getf sample :wire-history-p) '(nil t))
-               (every (lambda (key) (get-properties sample (list key)))
-                      '(:format :soft-header :policy :prompt :tool-header
-                        :history-count :history-digest :wire-fields :encoder-fields
-                        :wire-count :wire-digest :tokens :temporary-characters))
-               (every #'conversation--context-fingerprint-p
-                      (list (getf sample :policy) (getf sample :prompt)
-                            (getf sample :tool-header)))
-               (or (not (conversation--property-present-p sample :header-text))
-                   (conversation--context-header-text-p
-                        (getf sample :header-text)
-                        (getf sample :prompt) (getf sample :tool-header))))))
+       (= (/ (length sample) 2)
+          (length (remove-duplicates
+                   (loop for tail on sample by (partial #'nthcdr 2)
+                         collect (first tail)))))
+       (let ((route (getf sample :route)))
+         (or (null route)
+             (and (stringp route) (= 64 (length route))
+                  (every (lambda (character) (digit-char-p character 16)) route))))
+       (let ((size (- (length sample)
+                      (if (conversation--property-present-p sample :route) 2 0))))
+         (case (getf sample :format)
+           (1
+            (member size '(16 18)))
+           (2
+            (and (= size
+                    (+ 26 (if (getf sample :wire-history-p) 2 0)
+                       (if (conversation--property-present-p sample :header-text) 2 0)))
+                 (member (getf sample :wire-history-p) '(nil t))
+                 (every (lambda (key) (get-properties sample (list key)))
+                        '(:format :soft-header :policy :prompt :tool-header
+                          :history-count :history-digest :wire-fields :encoder-fields
+                          :wire-count :wire-digest :tokens :temporary-characters))
+                 (every #'conversation--context-fingerprint-p
+                        (list (getf sample :policy) (getf sample :prompt)
+                              (getf sample :tool-header)))
+                 (or (not (conversation--property-present-p sample :header-text))
+                     (conversation--context-header-text-p
+                      (getf sample :header-text)
+                      (getf sample :prompt) (getf sample :tool-header)))))))
        (typep (getf sample :temporary-characters 0) '(integer 0))
        (typep (getf sample :tokens) '(integer 1))
        (typep (getf sample :history-count) '(integer 0))

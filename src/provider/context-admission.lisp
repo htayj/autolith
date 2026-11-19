@@ -445,6 +445,18 @@ messages that later change fail closed."
 ))
   nil)
 
+(defmethod cl-llm-provider-api::request-analysis--image-location-p :around
+    ((provider codex-subscription-provider) path)
+  "Include Codex's structured tool-result image parts in the encoder allowance.
+
+The pinned provider analyzer covers message content, but Codex also accepts
+multimodal function outputs. Match only direct output-array parts in history;
+image-shaped JSON nested inside a tool payload is ordinary encoded text."
+  (or (call-next-method)
+      (and (integerp (first path)) (equal (second path) "output")
+           (integerp (third path))
+           (or (null (cdddr path))
+               (equal (cdddr path) '("input"))))))
 (-> provider-context--request-characters ((option model-provider) t) (values (integer 0) boolean))
 (defun provider-context--request-characters (provider value)
   "Apply Autolith's image allowance to encoder-owned character analysis."
