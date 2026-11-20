@@ -2508,12 +2508,13 @@ Only conversation projections change; mission execution and accounting owners do
         (when (eq (first sequenced) :candidate-ledger)
           (candidate-ledger--publish conversation sequenced)))
       (conversation-picker-metadata-publish conversation)
-      ;; Source publication is complete before repairable client notifications.
+      ;; Publish source state before repairable input history and client notifications.
       (setf (conversation-source-state conversation)
             (conversation--writer-source-state conversation)
             (conversation-source-revision conversation)
             (first (conversation-source-state conversation))
             (conversation-writer-state conversation) nil)
+      (conversation-input-history--publish conversation sequenced)
       (let ((listener (conversation-record-listener conversation)))
         (when listener
           (funcall listener sequenced)))
