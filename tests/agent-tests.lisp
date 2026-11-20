@@ -4167,3 +4167,196 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
       (when (member name '(application-turn-cancelled cl-jobpond:job-aborted))
         (test-assert (not (typep condition 'error)) "actual cancellation controls are not ERROR"))))
   nil)
+
+(-> agent-test-retained-projection (boolean) null)
+(defun agent-test-retained-projection (retained-p)
+  "Run the original 21 checks with natural and precisely retained cancelled producers."
+  (let* ((submit           (symbol-function 'job-pool-submit-batch))
+         (project          (symbol-function 'agent--project-tool-execution))
+         (release          (symbol-function 'agent--release-tool-executions))
+         (await            (symbol-function 'job-await))
+         (lock             (make-lock "Retained projection events"))
+         (events           nil)
+         (selected-results nil)
+         (selected-threads nil)
+         (jobs             nil)
+         (joins            nil))
+    (flet ((event (kind)
+             (with-lock-held (lock) (push kind events))))
+      (test-call-with-function-replacements
+       (list
+        (list 'job-pool-submit-batch
+              (lambda (pool specifications)
+                (let ((submitted
+                        (funcall
+                         submit pool
+                         (loop for specification in specifications for index from 0
+                               collect
+                               (let ((copy     (copy-list specification))
+                                     (function (getf specification :function)))
+                                 ;; Only the first blocked wave producer, never owner or sibling.
+                                 (when (and (zerop index) (null (getf specification :initargs)))
+                                   (setf (getf copy :function)
+                                         (lambda (job)
+                                           (flet ((run ()
+                                                    (prog1 (funcall function job)
+                                                      (event ':producer-normal-return))))
+                                             (if retained-p
+                                                 (sb-sys:without-interrupts (run))
+                                                 (run))))))
+                                 copy)))))
+                  (setf jobs (append submitted jobs))
+                  submitted)))
+        (list 'agent--project-tool-execution
+              (lambda (execution)
+                (let* ((result   (getf execution :result))
+                       (selected (typep result 'agent-test-blocked-result)))
+                  (when selected
+                    (with-lock-held (lock)
+                      (pushnew result selected-results)
+                      (pushnew (current-thread) selected-threads)))
+                  (prog1 (funcall project execution)
+                    (when selected (event ':project-returned))))))
+        (list 'agent--release-tool-executions
+              (lambda (vector)
+                (prog1 (funcall release vector) (event ':closed)))))
+       (lambda ()
+         ;; Replacements remain installed until every selected thread has actually exited.
+         (unwind-protect
+              (test-agent-tool-wave-projection-outside-publication)
+           (unwind-protect
+                (dolist (result selected-results)
+                  (sb-thread:signal-semaphore (agent-test-blocked-result-release result)))
+             (unwind-protect
+                  (dolist (job jobs) (funcall await job :timeout-seconds 5))
+               (dolist (thread selected-threads)
+                 (push (not (eq ':timed-out
+                                (sb-thread:join-thread thread :timeout 5 :default ':timed-out))) joins))))))))
+    (format t "RETAINED-PROJECTION retained=~S events=~S joins=~S~%" retained-p (reverse events) joins)
+    (test-assert (equal joins '(t t)) "both actual selected producer thread joins succeed")
+    (test-assert (and (= (length selected-results) 2) (every #'job-terminal-p jobs))
+                 "both modes select real producers and all observed jobs are terminal")
+    (test-assert (equal (reverse events)
+                        (if retained-p
+                            '(:closed :project-returned :producer-normal-return
+                              :closed :project-returned :producer-normal-return)
+                            '(:closed :closed)))
+                 "retained cancellation reaches the closed guard; natural cancellation has no normal returns"))
+  nil)
+
+(-> test-agent-tool-wave-retained-projection () null)
+(defun test-agent-tool-wave-retained-projection ()
+  "Keep the natural control and assert closed-before-normal-return in both original modes."
+  (agent-test-retained-projection nil)
+  (agent-test-retained-projection t)
+  nil)
+
+(-> agent-test-held-producers (function &key (:fault-phase (option keyword))) null)
+(defun agent-test-held-producers (function &key fault-phase)
+  "Inspect a real full batch held after publication, then release or fault and join."
+  (let* ((submit    (symbol-function 'job-pool-submit-batch))
+         (await     (symbol-function 'job-await))
+         (publish   (symbol-function 'agent--publish-tool-execution))
+         (ready     (sb-thread:make-semaphore))
+         (release   (sb-thread:make-semaphore))
+         (lock      (make-lock "Held producer identities"))
+         (owner     (current-thread))
+         (fault     (make-condition 'simple-error :format-control "Outstanding producer fault"))
+         (jobs      nil)
+         (threads   nil)
+         (vectors   nil)
+         (checked-p nil)
+         (escaped   nil))
+    (labels ((inspect-producers ()
+               (unless checked-p
+                 (loop repeat 3 do
+                   (unless (sb-thread:wait-on-semaphore ready :timeout 5)
+                     (error "A real producer did not reach the publication barrier.")))
+                 (with-lock-held (lock)
+                   (test-assert (and (= (length jobs) 3)
+                                     (= (length (remove-duplicates (mapcar #'job-identifier jobs) :test #'equal)) 3))
+                                "the observed full batch has three exact distinct producer identifiers")
+                   (test-assert (and (= (length threads) 3) (every #'sb-thread:thread-alive-p threads)
+                                     (notany #'job-terminal-p jobs))
+                                "every selected producer is alive and outstanding before release")
+                   (test-assert (and (= (length vectors) 1)
+                                     (every (lambda (execution)
+                                              (typep (getf execution :result) 'tool-completion-result))
+                                            (first vectors)))
+                                "all slots in the original vector are inspected while real producers are held")
+                   (format t "HELD-PRODUCERS phase=~S identifiers=~S alive=~D outstanding=~D~%"
+                           fault-phase (mapcar #'job-identifier jobs) (length threads)
+                           (count-if-not #'job-terminal-p jobs)))
+                 (setf checked-p t)))
+
+             (release-producers ()
+               (sb-thread:signal-semaphore release 3)))
+      (test-call-with-function-replacements
+       (list
+        (list 'job-pool-submit-batch
+              (lambda (pool specifications)
+                (setf jobs
+                      (funcall submit pool
+                               (mapcar
+                                (lambda (specification)
+                                  (let ((copy     (copy-list specification))
+                                        (function (getf specification :function)))
+                                    (setf (getf copy :function)
+                                          (lambda (job)
+                                            (prog1 (funcall function job)
+                                              ;; Outside the production publication mutex.
+                                              (with-lock-held (lock) (pushnew (current-thread) threads))
+                                              (sb-thread:signal-semaphore ready)
+                                              (unless (sb-thread:wait-on-semaphore release :timeout 10)
+                                                (error "Held producer release timed out.")))))
+                                    copy))
+                                specifications)))
+                (when (eq fault-phase ':submission)
+                  ;; The API returns an entire batch, never a partially admitted prefix.
+                  (inspect-producers)
+                  (error fault))
+                jobs))
+        (list 'agent--publish-tool-execution
+              (lambda (vector index execution)
+                (funcall publish vector index execution)
+                (with-lock-held (lock) (pushnew vector vectors))))
+        (list 'job-await
+              (lambda (job &rest options)
+                (when (eq (current-thread) owner)
+                  (inspect-producers)
+                  (when (eq fault-phase ':wait) (error fault))
+                  (release-producers))
+                (apply await job options))))
+       (lambda ()
+         (unwind-protect
+              (handler-case (funcall function)
+                (serious-condition (condition) (setf escaped condition)))
+           (unwind-protect
+                (release-producers)
+             (unwind-protect
+                  (dolist (job jobs) (funcall await job :timeout-seconds 5))
+               (dolist (thread threads)
+                 (test-assert (not (eq ':timed-out (sb-thread:join-thread thread :timeout 5 :default ':timed-out)))
+                              "each actually selected producer thread joins before replacements are restored")))))))
+      (test-assert checked-p "the outstanding producer inspection really executed")
+      (test-assert (if fault-phase (eq escaped fault) (null escaped))
+                   "the exact injected outstanding fault escapes, or the normal wave returns")
+      (test-assert (and (= (length jobs) 3) (every #'job-terminal-p jobs))
+                   "every actually admitted job is terminal after cleanup")
+      (test-assert (and vectors (every (lambda (vector) (every #'null vector)) vectors))
+                   "the inspected original vector is cleared after normal or fault cleanup")))
+  nil)
+
+(-> test-agent-completion-producer-barrier () null)
+(defun test-agent-completion-producer-barrier ()
+  "Retain the direct control and inspect the parallel vector before releasing real producers."
+  (agent-test-projection-wave :count 1)
+  (agent-test-held-producers (lambda () (agent-test-projection-wave :count 3)))
+  nil)
+
+(-> test-agent-completion-outstanding-failures () null)
+(defun test-agent-completion-outstanding-failures ()
+  "Inject submit-return and wait faults with a real full batch still outstanding."
+  (dolist (phase '(:submission :wait))
+    (agent-test-held-producers (lambda () (agent-test-projection-wave :count 3)) :fault-phase phase))
+  nil)
