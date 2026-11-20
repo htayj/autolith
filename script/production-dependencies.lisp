@@ -2,6 +2,12 @@
 (require :asdf)
 (in-package #:cl-user)
 
+;; Define the optional selector before compiling its callers. Its source helpers
+;; contain forward references, so load the complete definition unit together.
+(with-compilation-unit ()
+  (load (merge-pathnames "dependency-setup.lisp"
+                         (uiop:pathname-directory-pathname *load-truename*))))
+
 (defparameter *autolith-dependency-repair-identity*
   "0ebec4f0a3b3ed5d9a5a62fa7207d4c3a594359c3ef2f54bddfc909e382c9531"
   "Source-owned manifest identity; verify alongside the Nix JSON projection.")
