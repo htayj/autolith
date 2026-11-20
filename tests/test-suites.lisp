@@ -1604,6 +1604,8 @@
   test-agent-completion-owned-failures
   test-agent-completion-producer-barrier
   test-agent-completion-outstanding-failures
+  test-agent-producer-failed-join-cleanup
+  test-agent-producer-signalled-join-cleanup
   test-agent-completion-telemetry
   test-agent-completion-delivery-ownership
   test-agent-parallel-tool-failure

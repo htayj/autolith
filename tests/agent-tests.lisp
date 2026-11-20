@@ -4229,9 +4229,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                   (sb-thread:signal-semaphore (agent-test-blocked-result-release result)))
              (unwind-protect
                   (dolist (job jobs) (funcall await job :timeout-seconds 5))
-               (dolist (thread selected-threads)
-                 (push (not (eq ':timed-out
-                                (sb-thread:join-thread thread :timeout 5 :default ':timed-out))) joins))))))))
+                (setf joins (agent-test-join-producers selected-threads))))))))
     (format t "RETAINED-PROJECTION retained=~S events=~S joins=~S~%" retained-p (reverse events) joins)
     (test-assert (equal joins '(t t)) "both actual selected producer thread joins succeed")
     (test-assert (and (= (length selected-results) 2) (every #'job-terminal-p jobs))
@@ -4273,9 +4271,13 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                    (unless (sb-thread:wait-on-semaphore ready :timeout 5)
                      (error "A real producer did not reach the publication barrier.")))
                  (with-lock-held (lock)
-                   (test-assert (and (= (length jobs) 3)
-                                     (= (length (remove-duplicates (mapcar #'job-identifier jobs) :test #'equal)) 3))
-                                "the observed full batch has three exact distinct producer identifiers")
+                    (test-assert (and (= (length jobs) 3)
+                                      (every (lambda (job)
+                                               (let ((identifier (job-identifier job)))
+                                                 (and (stringp identifier) (plusp (length identifier)))))
+                                             jobs)
+                                      (= (length (remove-duplicates (mapcar #'job-identifier jobs) :test #'equal)) 3))
+                                 "the observed full batch has three nonempty string identifiers, all distinct")
                    (test-assert (and (= (length threads) 3) (every #'sb-thread:thread-alive-p threads)
                                      (notany #'job-terminal-p jobs))
                                 "every selected producer is alive and outstanding before release")
@@ -4335,9 +4337,8 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                 (release-producers)
              (unwind-protect
                   (dolist (job jobs) (funcall await job :timeout-seconds 5))
-               (dolist (thread threads)
-                 (test-assert (not (eq ':timed-out (sb-thread:join-thread thread :timeout 5 :default ':timed-out)))
-                              "each actually selected producer thread joins before replacements are restored")))))))
+                (test-assert (every #'identity (agent-test-join-producers threads))
+                             "all selected producer threads join before replacements are restored"))))))
       (test-assert checked-p "the outstanding producer inspection really executed")
       (test-assert (if fault-phase (eq escaped fault) (null escaped))
                    "the exact injected outstanding fault escapes, or the normal wave returns")
@@ -4359,4 +4360,132 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
   "Inject submit-return and wait faults with a real full batch still outstanding."
   (dolist (phase '(:submission :wait))
     (agent-test-held-producers (lambda () (agent-test-projection-wave :count 3)) :fault-phase phase))
+  nil)
+
+(-> agent-test-join-producers (list) list)
+(defun agent-test-join-producers (threads)
+  "Attempt every selected join, then report the first failed outcome unchanged."
+  (let ((outcomes
+          (loop for thread in threads
+                collect
+                (handler-case
+                    (let ((value (sb-thread:join-thread thread :timeout 5 :default ':timed-out)))
+                      (list :value value :condition
+                            (when (eq value ':timed-out)
+                              (make-condition 'simple-error :format-control "Selected producer join timed out."))))
+                  (serious-condition (condition) (list :condition condition))))))
+    (format t "PRODUCER-JOINS attempted=~D values=~S conditions=~S~%"
+            (length outcomes) (mapcar (lambda (outcome) (getf outcome :value)) outcomes)
+            (mapcar (lambda (outcome) (type-of (getf outcome :condition))) outcomes))
+    (dolist (outcome outcomes)
+      (when (getf outcome :condition) (error (getf outcome :condition))))
+    (mapcar (lambda (outcome) (not (getf outcome :condition))) outcomes)))
+
+(-> agent-test-producer-join-failure (keyword keyword) null)
+(defun agent-test-producer-join-failure (mode fixture)
+  "Report a synthetic join failure only after joining a real selected producer."
+  (let* ((join          (symbol-function 'sb-thread:join-thread))
+         (submit        (symbol-function 'job-pool-submit-batch))
+         (publish       (symbol-function 'agent--publish-tool-execution))
+         (project       (symbol-function 'agent--project-tool-execution))
+         (body          (symbol-function 'test-agent-tool-wave-projection-outside-publication))
+         (body-returned nil)
+         (owner         (current-thread))
+         (lock          (make-lock "Join failure witness"))
+         (fault         (make-condition 'simple-error :format-control "Selected join fault"))
+         (threads       nil)
+         (jobs          nil)
+         (joined        nil)
+         (actual-values nil)
+         (installed     nil)
+         (escaped       nil)
+         (terminal-p    nil)
+         (alive         nil)
+         (outer-publish nil)
+         (outer-project nil)
+         (armed-p       t))
+    (setf outer-publish
+          (lambda (vector index execution)
+            (with-lock-held (lock)
+              (when (eq fixture ':held) (pushnew (current-thread) threads)))
+            (funcall publish vector index execution))
+          outer-project
+          (lambda (execution)
+            (when (and (eq fixture ':retained)
+                       (typep (getf execution :result) 'agent-test-blocked-result))
+              (with-lock-held (lock) (pushnew (current-thread) threads)))
+            (funcall project execution)))
+    ;; Rebinding the SBCL join entry is confined to this isolated test process.
+    (sb-ext:without-package-locks
+      (test-call-with-function-replacements
+       (list
+        (list 'job-pool-submit-batch
+              (lambda (pool specifications)
+                (let ((submitted (funcall submit pool specifications)))
+                  (setf jobs (append submitted jobs))
+                  submitted)))
+        (list 'agent--publish-tool-execution outer-publish)
+        (list 'agent--project-tool-execution outer-project)
+        (list 'test-agent-tool-wave-projection-outside-publication
+              (lambda () (prog1 (funcall body) (setf body-returned t))))
+        (list 'sb-thread:join-thread
+              (lambda (thread &rest options)
+                (let ((value (apply join thread options)))
+                  (if (and armed-p (eq (current-thread) owner) (member thread threads)
+                           (or (eq fixture ':held) body-returned)
+                           (eql (getf options :timeout) 5) (eq (getf options :default) ':timed-out))
+                      (progn
+                        (push thread joined)
+                        (push value actual-values)
+                        (push (if (eq fixture ':held)
+                                  (not (eq (symbol-function 'agent--publish-tool-execution) outer-publish))
+                                  (not (eq (symbol-function 'agent--project-tool-execution) outer-project)))
+                              installed)
+                        (if (= (length joined) 1)
+                            (if (eq mode ':signal) (error fault) ':timed-out)
+                            value))
+                      value)))))
+       (lambda ()
+         (unwind-protect
+              (progn
+                ;; Expected fixture failures must escape, not become nested FiveAM failures.
+                (let ((*tests-running-p* nil))
+                  (handler-case
+                      (if (eq fixture ':held)
+                          (agent-test-held-producers (lambda () (agent-test-projection-wave :count 3)))
+                          (agent-test-retained-projection t))
+                    (serious-condition (condition) (setf escaped condition))))
+                (setf terminal-p (and jobs (every #'job-terminal-p jobs))
+                      alive (count-if #'sb-thread:thread-alive-p threads)))
+           (setf armed-p nil)
+           ;; Safety cleanup is separate from the observed fixture joins, including on RED.
+           (agent-test-join-producers threads)))))
+    (format t "JOIN-FAILURE fixture=~S mode=~S selected=~D actual-joins=~D installed=~S values=~S terminal=~S alive=~S identity=~S~%"
+            fixture mode (length threads) (length joined) installed actual-values terminal-p alive (eq escaped fault))
+    (test-assert (= (length threads) (if (eq fixture ':held) 3 2))
+                 "the failure witness selects every real fixture producer")
+    (test-assert (and (= (length joined) (length threads))
+                      (= (length (remove-duplicates joined)) (length threads))
+                      (every #'identity installed))
+                 "all selected actual joins occur before the fixture restores replacements")
+    (test-assert (and (= (length actual-values) (length threads))
+                      (notany (lambda (value) (eq value ':timed-out)) actual-values)
+                      terminal-p (eql alive 0))
+                 "all real join outcomes succeed and all actual jobs and threads are terminal")
+    (test-assert (if (eq mode ':signal) (eq escaped fault) (typep escaped 'simple-error))
+                 "the failed join is reported and a signalled join preserves exact error identity"))
+  nil)
+
+(-> test-agent-producer-failed-join-cleanup () null)
+(defun test-agent-producer-failed-join-cleanup ()
+  "Attempt every real selected join before reporting an injected timeout outcome."
+  (dolist (fixture '(:held :retained))
+    (agent-test-producer-join-failure ':timeout fixture))
+  nil)
+
+(-> test-agent-producer-signalled-join-cleanup () null)
+(defun test-agent-producer-signalled-join-cleanup ()
+  "Attempt every real selected join before resignalling the identical injected error."
+  (dolist (fixture '(:held :retained))
+    (agent-test-producer-join-failure ':signal fixture))
   nil)
