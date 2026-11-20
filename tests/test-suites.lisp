@@ -1173,6 +1173,7 @@
   test-conversation-receipt-attribution-positives
   test-conversation-receipt-attribution-controls
   test-conversation-title-entry-poison
+  test-conversation-receipt-migration-window
   test-conversation-segment-validation
   test-conversation-legacy-storage
   test-conversation-working-seconds
