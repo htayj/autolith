@@ -1283,8 +1283,8 @@ Projection failure declines to legacy delivery, never a tool condition."
 
 (-> agent--publish-tool-execution (vector integer list) null)
 (defun agent--publish-tool-execution (executions index execution)
-  "Publish only the projected handoff in the original wave vector."
-  (setf (aref executions index) (agent--project-tool-execution execution))
+  "Install an already projected handoff in the original wave vector."
+  (setf (aref executions index) execution)
   nil)
 
 (-> agent--release-tool-executions (vector) null)
@@ -1422,14 +1422,14 @@ Missing results become explicit unknown outcomes before the first stored conditi
         (telemetry-run              *telemetry-run*)
         (shell-log-publications     *shell-log-publications*)
         (mission-admitted-operation *mission-admitted-operation*)
-        (execution-lease-receipt     *execution-lease-receipt*))
+        (execution-lease-receipt    *execution-lease-receipt*))
     (lambda ()
       (let ((*skill-logical-turn-state*   skill-logical-turn-state)
             (*worker-host-tool-policy*    worker-host-tool-policy)
             (*telemetry-run*              telemetry-run)
             (*shell-log-publications*     shell-log-publications)
             (*mission-admitted-operation* mission-admitted-operation)
-            (*execution-lease-receipt*     execution-lease-receipt))
+            (*execution-lease-receipt*    execution-lease-receipt))
         (funcall function)))))
 
 (defvar *agent-tool-wave-pools* (make-hash-table :test #'eq)
@@ -1534,6 +1534,8 @@ Missing results become explicit unknown outcomes before the first stored conditi
     (let ((publication-lock (make-lock "Autolith tool wave publication"))
           (closed-p         nil))
       (flet ((publish (index execution)
+               ;; Projection can block in an open method; execution is producer-owned.
+               (agent--project-tool-execution execution)
                ;; A bounded pool close may retain a producer after this wave exits.
                (with-lock-held (publication-lock)
                  (unless closed-p
