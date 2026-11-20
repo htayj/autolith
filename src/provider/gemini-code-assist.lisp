@@ -224,7 +224,7 @@ catalog follows the exact model identifiers consumed by streamGenerateContent."
         condition)
        :retryable-p t))
     (http-request-failed (condition)
-      (provider-signal-http-failure provider condition))))
+      (provider--signal-observed-http-failure provider condition))))
 
 (-> gemini-code-assist--get-once
     (gemini-code-assist-provider oauth-credentials non-empty-string)
@@ -249,7 +249,7 @@ catalog follows the exact model identifiers consumed by streamGenerateContent."
         condition)
        :retryable-p t))
     (http-request-failed (condition)
-      (provider-signal-http-failure provider condition))))
+      (provider--signal-observed-http-failure provider condition))))
 
 
 ;;;; -- Account Setup --

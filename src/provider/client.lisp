@@ -642,6 +642,14 @@ and codes follow the Codex reference at commit 6f51c65958."
       (error () nil)))
   body)
 
+(-> provider--signal-observed-http-failure (subscription-provider condition) nil)
+(defun provider--signal-observed-http-failure (provider condition)
+  "Note an uncaptured stream before delegating unchanged to shared normalization."
+  (provider--note-unpreserved-error-body
+   (handler-case (dexador.error:response-body condition)
+     (error () nil)))
+  (provider-signal-http-failure provider condition))
+
 (-> provider--unauthorized-body-fields (t) (values (option string) (option string)))
 (defun provider--unauthorized-body-fields (raw-body)
   "Read one bounded body and return only sanitized JSON message and code strings."
@@ -668,7 +676,7 @@ and codes follow the Codex reference at commit 6f51c65958."
 (defmethod provider-signal-transport-failure
     ((provider subscription-provider) (condition condition))
   "Signal the shared HTTP failure classification."
-  (provider-signal-http-failure provider condition))
+  (provider--signal-observed-http-failure provider condition))
 
 (define-condition provider--unauthorized-without-message (provider-unauthorized) ()
   (:documentation "Unauthorized response without a usable provider body message."))

@@ -5015,35 +5015,77 @@ Transport is synthetic; retry delays are suppressed."
 
 (-> test-provider-only-copy-stream-preservation-skip () null)
 (defun test-provider-only-copy-stream-preservation-skip ()
-  "Skip stream preservation without probing, reading, replacing or closing the handler's body."
-  (let* ((body      (make-instance 'test-error-body-character-stream
-                                   :source "{\"error\":{\"message\":\"safe message\"}}"))
-         (condition (make-condition 'http-request-failed :body body :status 401
-                                    :headers nil :uri (quri:uri "https://example.invalid/") :method ':post))
-         (seen      nil)
-         (log       (make-string-output-stream)))
-    (unwind-protect
-         (progn
-           (let ((*error-output* log))
-            (handler-case
-                (handler-bind ((http-request-failed
-                                 (lambda (actual)
-                                   (setf seen actual)
-                                   (test-assert (eq body (dexador.error:response-body actual))
-                                                "the actual handler sees its original only-copy stream")
-                                   (test-assert (eq body (provider--note-unpreserved-error-body
-                                                          (dexador.error:response-body actual)))
-                                                "preservation skips without stream substitution")
-                                   (test-assert (zerop (test-error-body-reads body))
-                                                "the preservation observer does not consume the body")
-                                   (test-assert (zerop (test-error-body-closes body))
-                                                "the preservation observer does not close the body"))))
-                  (error condition))
-              (http-request-failed () nil)))
-           (test-assert (eq condition seen) "handler condition identity is unchanged")
-           (test-assert (char= #\{ (read-char body)) "the handler can read the untouched stream")
-           (let ((text (get-output-stream-string log)))
-             (test-assert (= 1 (count #\Newline text)) "one sanitized skip diagnostic is emitted")
-             (test-assert (not (search "safe message" text)) "body contents are not logged")))
-      (close body)))
+  "Observe actual HTTP normalization without consuming or replacing its handler's body."
+  (with-test-configuration (configuration)
+    (dolist (route '(:subscription :post :get))
+      (dolist (status '(429 500))
+        (dolist (delegate-p '(nil t))
+          (let* ((body        (make-instance 'test-error-body-character-stream
+                                            :source "synthetic-stream-secret"))
+                 (condition   (make-condition 'http-request-failed :body body :status status
+                                              :headers nil :uri nil :method ':post))
+                 (provider    (make-instance (if (eq route ':subscription)
+                                                'anthropic-api-key-provider
+                                                'gemini-code-assist-provider)
+                                             :configuration configuration))
+                 (credentials (make-instance 'oauth-credentials :access-token "synthetic-token-secret"))
+                 (normalizer  (symbol-function 'provider-signal-http-failure))
+                 (observed    0)
+                 (seen        nil)
+                 (failure     nil)
+                 (diagnostic  "")
+                 (log         (make-string-output-stream)))
+            (unwind-protect
+                 (let ((*error-output* log))
+                   (test-call-with-function-replacements
+                    (list
+                     (list 'dexador:post (lambda (&rest arguments)
+                                           (declare (ignore arguments))
+                                           (error condition)))
+                     (list 'dexador:get (lambda (&rest arguments)
+                                          (declare (ignore arguments))
+                                          (error condition)))
+                     (list 'provider-signal-http-failure
+                           (lambda (actual-provider actual)
+                             (incf observed)
+                             (test-assert (eq condition actual) "normalization receives the original HTTP condition")
+                             (test-assert (eq body (dexador.error:response-body actual))
+                                          "normalization receives the original body")
+                             (test-assert (zerop (test-error-body-reads body)) "the observer performs zero reads")
+                             (test-assert (zerop (test-error-body-closes body)) "the observer performs zero closes")
+                             (setf diagnostic (get-output-stream-string log))
+                             (test-assert (= 1 (count #\Newline diagnostic))
+                                          "the production boundary emits exactly one skip diagnostic")
+                             (if delegate-p
+                                 (funcall normalizer actual-provider actual)
+                                 (error actual)))))
+                    (lambda ()
+                      (handler-case
+                          (ecase route
+                            (:subscription
+                             (provider-signal-transport-failure provider condition))
+                            (:post
+                             (gemini-code-assist--post-once provider credentials :method "generateContent"
+                                                          :request                       (json-object)))
+                            (:get
+                             (gemini-code-assist--get-once provider credentials "operations/synthetic")))
+                        (http-request-failed (actual)
+                          (setf seen actual)
+                          (test-assert (eq condition actual) "a downstream handler retains exact condition identity")
+                          (test-assert (eq body (dexador.error:response-body actual)) "the handler retains exact body identity")
+                          (test-assert (char= #\s (read-char body)) "the handler can read the untouched body"))
+                        (provider-error (actual) (setf failure actual)))))
+                   (test-assert (= 1 observed) "each affected production route reaches the observed shared boundary once")
+                   (if delegate-p
+                       (progn
+                         (test-assert (and (null seen) (typep failure 'provider-retryable-error)
+                                           (= status (provider-error-status failure)))
+                                      "ordinary normalization retains its typed status failure")
+                         (test-assert (plusp (test-error-body-reads body)) "ordinary normalization still reads its body")
+                         (test-assert (= 1 (test-error-body-closes body)) "ordinary normalization still closes its body once"))
+                       (test-assert (eq seen condition) "a declining downstream normalizer does not alter the raw condition"))
+                   (let ((text (concatenate 'string diagnostic (get-output-stream-string log))))
+                     (test-assert (not (search "synthetic-stream-secret" text)) "the skip diagnostic excludes body secrets")
+                     (test-assert (not (search "synthetic-token-secret" text)) "the skip diagnostic excludes credential secrets")))
+              (when (open-stream-p body) (close body))))))))
   nil)
