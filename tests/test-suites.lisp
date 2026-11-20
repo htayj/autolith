@@ -2205,6 +2205,7 @@
   test-xdg-explicit-roots)
 
 (define-test-suite test-runner
+  test-runner-case-identifiers
   test-runner-identifier-isolation
   test-runner-identifier-cleanup
   test-runner-selection

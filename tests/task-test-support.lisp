@@ -559,7 +559,9 @@
   "Orchestrators created by tests, closed when the task suite finishes.")
 
 (defvar *task-tests--cleanup-failures* nil
-  "Process-global (orchestrator . outcome) records after incomplete test shutdown.
+  "Process-global (handle . outcome) records after incomplete test shutdown.
+A handle is a test orchestrator or a test-owned thread whose join is unproved.
+Outcomes are NIL close results, original errors, or :JOIN-TIMEOUT property lists.
 Access the global value so dynamic fixture bindings cannot conceal unsafe cleanup.
 A later successful close does not prove that earlier timed-out threads stopped.")
 
@@ -567,7 +569,9 @@ A later successful close does not prove that earlier timed-out threads stopped."
   ((failures
     :initarg       :failures
     :reader        test-cleanup-error-failures
-    :documentation "Orchestrators paired with NIL close results or original errors."))
+    :documentation "(Handle . outcome) records for test orchestrators or test-owned
+threads whose joins are unproved; outcomes are NIL, original errors, or
+:JOIN-TIMEOUT property lists."))
   (:report (lambda (condition stream)
              (format stream "Incomplete test shutdown; restart the test process. Failures: ~S"
                      (test-cleanup-error-failures condition))))

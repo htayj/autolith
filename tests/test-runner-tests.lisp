@@ -2,6 +2,85 @@
 
 ;;;; -- Test Runner Behavior --
 
+(-> test-runner--cross-thread-probe () null)
+(defun test-runner--cross-thread-probe ()
+  "Exhaust one second's real allocator capacity across two joined threads."
+  (let* ((identifiers (loop repeat 57 collect (make-user-identifier)))
+         (unjoined    (list :unjoined))
+         (joined      nil)
+         (problem     nil)
+         (worker      (sb-thread:make-thread
+                       (lambda ()
+                         (handler-case (list :ok (make-user-identifier))
+                           (error (condition) (list :error condition))))
+                       :name "runner identifier worker")))
+    (unwind-protect
+         (multiple-value-bind (value join-problem)
+             (sb-thread:join-thread worker :default unjoined :timeout 10)
+           (if (eq value unjoined)
+               (setf problem join-problem)
+               (setf joined value)))
+      ;; Record only: a cleanup failure must not replace a primary error or throw.
+      (unless (or joined (eq problem :abort))
+        (push (cons worker (list :join-timeout :problem problem
+                                :alive         (sb-thread:thread-alive-p worker)))
+              (sb-ext:symbol-global-value '*task-tests--cleanup-failures*))))
+    (test-assert joined "the real worker joined and returned normally")
+    (test-assert (eq :ok (first joined)) "the worker allocated an identifier")
+    (when (eq :ok (first joined))
+      (push (second joined) identifiers))
+    (test-assert (= 58 (length (remove-duplicates identifiers :test #'string=)))
+                 "57 caller identifiers and one joined worker identifier are distinct")
+    (test-assert
+     (handler-case (progn (make-user-identifier) nil)
+       (idsmall:identifier-space-exhausted () t))
+     "the next allocation exhausts the shared 58-slot namespace"))
+  nil)
+
+(-> test-runner-case-identifiers () null)
+(defun test-runner-case-identifiers ()
+  "Restore cross-thread allocator capacity at real case boundaries."
+  (let ((*test-suites*               *test-suites*)
+        (*test-case-running-p*       nil)
+        (*task-tests--orchestrators* nil)
+        (generate                    (symbol-function 'identifier-generate)))
+    (unwind-protect
+         (progn
+           (define-test-suite runner-cross-thread-probe test-runner--cross-thread-probe)
+           (test-call-with-function-replacements
+            (list (list 'identifier-generate
+                        (lambda (&rest arguments)
+                          (let ((arguments (copy-list arguments)))
+                            (setf (getf arguments :timestamp) 3994000000)
+                            (apply generate arguments)))))
+            (lambda ()
+              (let ((result (tests-run-cases '(test-runner--cross-thread-probe
+                                               test-runner--cross-thread-probe)
+                                            :stream (make-broadcast-stream))))
+                (test-assert (null (getf result :failures))
+                             "two real boundaries each restore full cross-thread capacity")
+                (test-assert (= 8 (getf result :checks))
+                             "both joined probes enforce capacity and exhaustion"))
+              (let ((seen nil))
+                (test-assert
+                 (handler-case
+                     (progn
+                       (make-user-identifier :namespace  "test-runner-occupied"
+                                             :occupied-p (lambda (id) (push id seen) t))
+                       nil)
+                   (idsmall:identifier-space-exhausted () t))
+                 "the caller occupancy predicate exhausts a separate namespace")
+                (test-assert (= 58 (length seen)
+                                  (length (remove-duplicates seen :test #'string=)))
+                             "the real allocator probes 58 distinct occupied candidates")
+                (test-assert (notany (lambda (id)
+                                       (identifier-reserved-p id :namespace "test-runner-occupied"))
+                                     seen)
+                             "occupied candidates never become reservations")))))
+      (fiveam:rem-test 'test-runner--cross-thread-probe)
+      (fiveam:rem-test 'test-suite-runner-cross-thread-probe)))
+  nil)
+
 (-> test-runner--identifier-probe () null)
 (defun test-runner--identifier-probe ()
   "Allocate a full second's capacity without releasing any within the case."
@@ -336,6 +415,12 @@ Require a clean process first; this is not recovery for a real shutdown failure.
                           (and (fboundp name) (fiveam:get-test name)))
                         cases)
                  "catalog entries resolve to functions and FiveAM tests"))
+  (test-assert
+   (handler-case
+       (equal (tests-select :tests '("test-runner-case-identifiers"))
+              '(test-runner-case-identifiers))
+     (test-selection-error () nil))
+   "the legacy exact case selector resolves in the real catalog")
   nil)
 
 
