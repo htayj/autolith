@@ -1169,6 +1169,10 @@
   test-conversation-native-compaction
   test-conversation-chunk-storage
   test-conversation-pending-input-identifier-order
+  test-conversation-receipt-synchronized-refusal
+  test-conversation-receipt-attribution-positives
+  test-conversation-receipt-attribution-controls
+  test-conversation-title-entry-poison
   test-conversation-segment-validation
   test-conversation-legacy-storage
   test-conversation-working-seconds
