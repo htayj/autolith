@@ -2363,6 +2363,9 @@ Only conversation projections change; mission execution and accounting owners do
                   (conversation-writer-state conversation) nil))))))
   nil)
 
+(defvar *conversation-automatic-receipt-reconciliation* nil
+  "The current automatic receipt's shared, attempt-local reconciliation binding.")
+
 (defgeneric conversation-append-record (conversation record)
   (:documentation "Append portable RECORD to CONVERSATION and return the sequenced form."))
 
@@ -2411,6 +2414,12 @@ Only conversation projections change; mission execution and accounting owners do
                      (conversation--usage-totals-p
                       (getf (getf (rest record) :metadata) :usage-checkpoint)))
                 (conversation--call-with-usage-checkpoint
+                 conversation record (lambda () (call-next-method))))
+               ((and (eq conversation (getf *conversation-automatic-receipt-reconciliation* :conversation))
+                     (eq (first record) ':message)
+                     (equal (getf (rest record) :pending-input-identifier)
+                            (getf *conversation-automatic-receipt-reconciliation* :identifier)))
+                (conversation--call-with-automatic-receipt-reconciliation
                  conversation record (lambda () (call-next-method))))
                (t
                 (call-next-method)))
@@ -3411,15 +3420,151 @@ transcript show automatic INPUT as a short notice."
               (conversation--restore-automatic-message-state conversation state)))))
       (values item record))))
 
+(-> conversation--classify-automatic-receipt-tail (conversation list list) (values keyword list))
+(defun conversation--classify-automatic-receipt-tail (conversation capture receipt)
+  "Prove this attempt committed or left only its own incomplete tail under both locks.
+
+Object identity detects atomic migration replacements, not lock-ignoring in-place
+rewrites. SEXP-STORE exposes no exact record serializer; absent attribution rests
+on the source lock, segment identities, revision and validated record boundary."
+  (block nil
+    (let* ((identity      (conversation-pathname conversation))
+           (paths         (conversation-storage-pathnames identity))
+           (active        (conversation-storage-active-pathname identity))
+           (sequence      (getf receipt :sequence))
+           (identifier    (getf receipt :identifier))
+           (found         nil)
+           (last-sequence 0)
+           (matches       0)
+           (headers       0)
+           (records       0))
+      (unless (and (equal identity (getf capture :identity))
+                   (equal active (getf capture :active))
+                   (= (conversation-picker-revision-read identity) (1+ (getf capture :revision))))
+        (return (values ':ambiguous nil)))
+      (if (getf capture :persisted-p)
+          (unless (and (equal paths (mapcar #'first (getf capture :segments)))
+                       (every (lambda (entry)
+                                (let ((status (platform-path-status *platform* (first entry))))
+                                  (and status
+                                       (platform-file-status-same-object-p (second entry) status)
+                                       (if (equal active (first entry))
+                                           (>= (platform-file-status-size status) (getf capture :size))
+                                           (equal (third entry) (multiple-value-list (sexp-store:file-revision (first entry))))))))
+                              (getf capture :segments)))
+            (return (values ':ambiguous nil)))
+          (unless (and (= sequence 1) (= (length paths) 1))
+            (return (values ':ambiguous nil))))
+      (let* ((incomplete-p
+               (conversation--map-storage-records
+                identity
+                (lambda (record)
+                  (incf records)
+                  (setf last-sequence (getf (rest record) :seq))
+                  (when (equal identifier (getf (rest record) :pending-input-identifier))
+                    (incf matches)
+                    (setf found record)))
+                :on-header (lambda (header) (declare (ignore header)) (incf headers))))
+             (status (platform-path-status *platform* active)))
+        (unless status (return (values ':ambiguous nil)))
+        (multiple-value-bind (end active-incomplete-p count)
+            (sexp-store:log-map (lambda (record) (declare (ignore record))) active)
+          (declare (ignore count))
+          (unless (eql active-incomplete-p incomplete-p)
+            (return (values ':ambiguous nil)))
+          (when (and found (= matches 1) (= last-sequence sequence)
+                     (not incomplete-p) (= end (platform-file-status-size status)))
+            (conversation--validate-automatic-message
+             conversation found :message (getf receipt :message) :operation-request (getf receipt :operation-request))
+            (unless (= (getf (rest found) :seq) sequence)
+              (return (values ':ambiguous nil)))
+            (if (getf capture :persisted-p)
+                (let ((tail nil))
+                  (multiple-value-bind (tail-end torn-p tail-count)
+                      (sexp-store:log-map (lambda (record) (push record tail)) active
+                                          :start-position (getf capture :size))
+                    (unless (and (= tail-end end) (not torn-p) (= tail-count 1) (equalp (first tail) found))
+                      (return (values ':ambiguous nil)))))
+                (unless (and (= records 1) (= headers 1))
+                  (return (values ':ambiguous nil))))
+            (return (values ':committed found)))
+          (when (and (getf capture :persisted-p) (= matches 0)
+                     (= last-sequence (1- sequence)) incomplete-p
+                     (= end (getf capture :size)))
+            (multiple-value-bind (tail-end torn-p tail-count)
+                (sexp-store:log-map (lambda (record) (declare (ignore record))) active
+                                    :start-position (getf capture :size))
+              (when (and (= tail-end end) torn-p (zerop tail-count))
+                (return (values ':absent nil)))))))
+      (values ':ambiguous nil))))
+
+(-> conversation--call-with-automatic-receipt-reconciliation (conversation list function) t)
+(defun conversation--call-with-automatic-receipt-reconciliation (conversation record append-function)
+  "Capture and classify one automatic receipt while the caller holds both locks."
+  (declare (ignore record))
+  (let* ((receipt  *conversation-automatic-receipt-reconciliation*)
+         (identity (conversation-pathname conversation)))
+    ;; Refuse before even repairing an old torn tail, preserving successful replay.
+    (unless (= (conversation-next-sequence conversation) (getf receipt :sequence))
+      (setf (getf receipt :restore-state) (conversation--automatic-message-state conversation))
+      (conversation--automatic-message-error conversation "Another durable append preceded receipt capture."))
+    (when (and (conversation-persisted-p conversation) (conversation-incomplete-tail-p conversation))
+      (conversation--repair-incomplete-tail conversation))
+    (let* ((persisted-p (conversation-persisted-p conversation))
+           (active      (conversation-log-pathname conversation))
+           (paths       (conversation-storage-pathnames identity))
+           (capture     (list :identity identity :active active :persisted-p persisted-p
+                              :revision (conversation-picker-revision-read identity)
+                              :size 0 :segments nil))
+           (completed-p nil))
+      (when (and persisted-p (not (equal active (conversation-storage-active-pathname identity))))
+        (conversation--automatic-message-error conversation "The active receipt segment changed before capture."))
+      (if persisted-p
+          (let ((last-sequence 0)
+                (pending-p     nil))
+            (setf (getf capture :segments)
+                  (mapcar (lambda (path)
+                            (let ((status (platform-path-status *platform* path)))
+                              (unless status
+                                (conversation--automatic-message-error conversation "A receipt source segment is missing."))
+                              (when (equal active path) (setf (getf capture :size) (platform-file-status-size status)))
+                              (list path status (multiple-value-list (sexp-store:file-revision path))))) paths))
+            (let ((incomplete-p (conversation--map-storage-records
+                                 identity (lambda (entry)
+                                            (setf last-sequence (getf (rest entry) :seq))
+                                            (when (equal (getf receipt :identifier)
+                                                         (getf (rest entry) :pending-input-identifier))
+                                              (setf pending-p t))))))
+              (multiple-value-bind (end torn-p count)
+                  (sexp-store:log-map (lambda (entry) (declare (ignore entry))) active)
+                (declare (ignore count))
+                (unless (and (not incomplete-p) (not torn-p) (not pending-p)
+                             (= end (getf capture :size)) (= last-sequence (1- (getf receipt :sequence))))
+                  (conversation--automatic-message-error conversation "The receipt baseline is not a complete current prefix.")))))
+          (when (conversation-storage-occupied-p identity)
+            (conversation--automatic-message-error conversation "The initial receipt identity is already occupied.")))
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (multiple-value-prog1 (funcall append-function) (setf completed-p t))
+          (when (and (not completed-p) (eq (conversation-writer-state conversation) ':writing))
+            (handler-case
+                (multiple-value-bind (outcome found)
+                    (conversation--classify-automatic-receipt-tail conversation capture receipt)
+                  (let ((post-state (conversation--writer-source-state conversation)))
+                    (setf (getf receipt :outcome) outcome
+                          (getf receipt :record) found
+                          (getf receipt :post-state) post-state)))
+              (error ()
+                (setf (getf receipt :outcome) ':ambiguous
+                      (getf receipt :record) nil
+                      (getf receipt :post-state) nil)))))))))
+
 (-> conversation-ensure-automatic-user-message
     (conversation string &key (:pending-input-identifier non-empty-string) (:operation-request list))
     (values json-object list))
 (defun conversation-ensure-automatic-user-message
     (conversation message &key pending-input-identifier operation-request)
-  "Ensure one durable receipt and current provider item before acknowledging its input.
-
-Return the provider item and sequenced record. Repair an uncertain append's memory
-state before rethrowing its failure; a retry uses the same durable receipt."
+  "Ensure one durable receipt, reconciling only an outcome proven for this attempt."
   (unless (and (non-empty-string-p message) (non-empty-string-p pending-input-identifier))
     (error 'configuration-error :message "An automatic receipt requires text and a stable pending-input identity."))
   (with-recursive-lock-held ((conversation-append-lock conversation))
@@ -3429,6 +3574,7 @@ state before rethrowing its failure; a retry uses the same durable receipt."
         (setf (conversation-incomplete-tail-p conversation) incomplete-p))
       (let* ((state       (conversation--automatic-message-state conversation))
              (accounted-p (conversation-pending-input-identifier-p conversation pending-input-identifier)))
+        ;; An unlocked lookup never authorizes clearing pre-existing writer poison.
         (when record
           (conversation--validate-automatic-message
            conversation record :message message :operation-request operation-request)
@@ -3445,15 +3591,21 @@ state before rethrowing its failure; a retry uses the same durable receipt."
            conversation "The remembered receipt is unavailable for exact reconciliation."))
         (let ((item              nil)
               (durable-record    nil)
-              (append-returned-p nil))
+              (append-returned-p nil)
+              ;; All read keys exist so SETF GETF mutates shared cells, even on unwind.
+              (receipt           (list :conversation conversation :identifier pending-input-identifier
+                                       :message message :operation-request operation-request
+                                       :sequence (getf state :next-sequence) :restore-state nil
+                                       :outcome nil :record nil :post-state nil)))
           (unwind-protect
-               (progn
+               (let ((*conversation-automatic-receipt-reconciliation* receipt))
                  (conversation-append-user-message
                   conversation message :automatic-p t
                   :pending-input-identifier pending-input-identifier :operation-request operation-request)
                  (setf append-returned-p t))
             (sb-sys:without-interrupts
-              (conversation--restore-automatic-message-state conversation state))
+              (conversation--restore-automatic-message-state
+               conversation (or (getf receipt :restore-state) state)))
             (multiple-value-bind (found torn-p tail-sequence)
                 (conversation--find-automatic-message conversation pending-input-identifier)
               (sb-sys:without-interrupts
@@ -3465,9 +3617,23 @@ state before rethrowing its failure; a retry uses the same durable receipt."
                              (= tail-sequence (getf (rest found) :seq)))
                   (conversation--automatic-message-error
                    conversation "Another durable append crossed receipt reconciliation."))
-                (setf (values item durable-record)
-                      (conversation--install-automatic-message
-                       conversation found :state state :account-p t :incomplete-p torn-p)))
+                (when (or (not (eq (conversation-writer-state conversation) ':writing))
+                          (and (eq (getf receipt :outcome) ':committed)
+                               (not torn-p) (equalp found (getf receipt :record))))
+                  (setf (values item durable-record)
+                        (conversation--install-automatic-message
+                         conversation (or (getf receipt :record) found)
+                         :state state :account-p t :incomplete-p torn-p))))
+              (when (and (eq (conversation-writer-state conversation) ':writing)
+                         (getf receipt :post-state)
+                         (or (and (eq (getf receipt :outcome) ':committed)
+                                  durable-record (not torn-p) (equalp found (getf receipt :record)))
+                             (and (eq (getf receipt :outcome) ':absent)
+                                  (not found) torn-p (= tail-sequence (1- (getf state :next-sequence))))))
+                (sb-sys:without-interrupts
+                  (setf (conversation-source-state conversation) (getf receipt :post-state)
+                        (conversation-source-revision conversation) nil
+                        (conversation-writer-state conversation) nil)))
               (when (and append-returned-p (not found))
                 (conversation--automatic-message-error
                  conversation "An append returned without a durable automatic receipt."))))

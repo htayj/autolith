@@ -4304,6 +4304,7 @@ process without releasing the lease, exercising kernel cleanup."
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
   nil)
 
+
 ;;;; -- Automatic Receipt Attribution --
 
 (-> test-conversation-receipt-synchronized-refusal () null)
@@ -4311,12 +4312,12 @@ process without releasing the lease, exercising kernel cleanup."
   "Preserve a real cooperating writer's synchronized prefix on receipt refusal."
   (dolist (interleave-p '(nil t))
     (with-test-configuration (configuration)
-      (let* ((a (conversation-create configuration))
+      (let* ((a        (conversation-create configuration))
              (original (symbol-function 'conversation-append-user-message))
-             (fired-p nil)
-             (before nil)
+             (fired-p  nil)
+             (before   nil)
              (observed nil)
-             (failure nil))
+             (failure  nil))
         (conversation-append-user-message a "seed")
         (let ((b (conversation-load (conversation-pathname a))))
           (test-call-with-function-replacements
@@ -4375,14 +4376,17 @@ process without releasing the lease, exercising kernel cleanup."
   "Retry attributed failed writes and then use the same writer for an ordinary append."
   (dolist (stage '(:partial :complete :publication :cancel :initial))
     (with-test-configuration (configuration)
-      (let* ((a (conversation-create configuration))
-             (target (case stage (:initial 'conversation--write-initial-record)
-                                 (:publication 'conversation-picker-metadata-publish)
-                                 (t 'log-append)))
+      (let* ((a        (conversation-create configuration))
+             (target   (case stage (:initial
+                                    'conversation--write-initial-record)
+                                   (:publication
+                                    'conversation-picker-metadata-publish)
+                                   (t
+                                    'log-append)))
              (original (symbol-function target))
-             (fault (make-condition 'simple-error :format-control "Receipt attribution fault"))
-             (fired-p nil)
-             (failure nil))
+             (fault    (make-condition 'simple-error :format-control "Receipt attribution fault"))
+             (fired-p  nil)
+             (failure  nil))
         (unless (eq stage ':initial) (conversation-append-user-message a "seed"))
         (labels ((ensure-receipt ()
                    (conversation-ensure-automatic-user-message
@@ -4404,11 +4408,17 @@ process without releasing the lease, exercising kernel cleanup."
           (test-assert (and fired-p failure) (format nil "~S crossed the actual write/publication boundary" stage))
           (handler-case
               (progn
-                (ensure-receipt)
+                (multiple-value-bind (item record) (ensure-receipt)
+                  (test-assert (= (if (eq stage ':initial) 1 2) (getf (rest record) :seq))
+                               "the retry returns the attributed receipt sequence")
+                  (test-assert (= 1 (count item (conversation-input-items a) :test #'eq))
+                               "the retry installs exactly one live provider item"))
                 (conversation-append-user-message a "ordinary")
                 (test-assert (null (conversation-writer-state a)) (format nil "~S leaves the writer ready" stage))
+                (test-assert (= (if (eq stage ':initial) 2 3) (length (conversation-input-items a)))
+                             "the same live projection contains one receipt and the ordinary append")
                 (let* ((loaded (conversation-load (conversation-pathname a)))
-                       (count 0))
+                       (count  0))
                   (conversation-map-records loaded (lambda (record)
                                                      (when (equal "attributed" (getf (rest record) :pending-input-identifier))
                                                        (incf count))))
@@ -4439,17 +4449,17 @@ process without releasing the lease, exercising kernel cleanup."
           (conversation-set-title b "Cooperating title" :source ':generated))
         (unless (eq mode ':natural)
           (setf (conversation-writer-state a) (if (eq mode ':reconciling) ':reconciling ':writing)))
-        (let* ((marker (conversation-writer-state a))
+        (let* ((marker   (conversation-writer-state a))
                (sequence (conversation-next-sequence a))
-               (title (conversation-title a))
-               (source (conversation-title-source a))
-               (bytes (test-conversation--physical-source (conversation-pathname a)))
+               (title    (conversation-title a))
+               (source   (conversation-title-source a))
+               (bytes    (test-conversation--physical-source (conversation-pathname a)))
                (observed nil)
-               (failure (handler-case
-                            (handler-bind ((conversation-invariant-error (lambda (condition) (setf observed condition))))
-                              (conversation-set-title a (if (eq mode ':mismatch) "Other title" "Cooperating title")
-                                                      :source ':generated) nil)
-                          (error (condition) condition))))
+               (failure  (handler-case
+                             (handler-bind ((conversation-invariant-error (lambda (condition) (setf observed condition))))
+                               (conversation-set-title a (if (eq mode ':mismatch) "Other title" "Cooperating title")
+                                                       :source ':generated) nil)
+                           (error (condition) condition))))
           (test-assert (and failure (eq failure observed)
                             (search "Incomplete replay or publication requires a newly loaded conversation object."
                                     (princ-to-string failure)))
@@ -4477,11 +4487,15 @@ process without releasing the lease, exercising kernel cleanup."
                    :retired-change :new-segment :broken-prefix :reconciling
                    :classifier-error :initial-torn :cooperating :lookup-poison :retired-replaced))
     (with-test-configuration (configuration)
-      (let* ((a (conversation-create configuration))
-             (target (if (eq stage ':initial-torn) 'conversation--write-initial-record 'log-append))
-             (original (symbol-function target))
-             (fired-p nil)
-             (failure nil))
+      (let* ((a                  (conversation-create configuration))
+             (target             (if (eq stage ':initial-torn) 'conversation--write-initial-record 'log-append))
+             (original           (symbol-function target))
+             (fired-p            nil)
+             (injected-condition (make-condition 'simple-error
+                                                 :format-control   "Injected ambiguous receipt write: ~S"
+                                                 :format-arguments (list stage)))
+             (observed-condition nil)
+             (failure            nil))
         (unless (eq stage ':initial-torn) (conversation-append-user-message a "seed"))
         (when (member stage '(:retired-change :retired-replaced))
           (conversation-append-summary a (make-continuation :intent "Retire the seed segment.")))
@@ -4492,7 +4506,7 @@ process without releasing the lease, exercising kernel cleanup."
 
                  (replace-object (path)
                    (let ((bytes (uiop:read-file-string path))
-                         (date (file-write-date path)))
+                         (date  (file-write-date path)))
                      (publish-file path (lambda (stream) (write-string bytes stream)))
                      (platform-set-file-times *platform* path date)))
 
@@ -4508,7 +4522,7 @@ process without releasing the lease, exercising kernel cleanup."
             (list (list target
                         (lambda (&rest arguments)
                           (setf fired-p t)
-                          (let* ((path (if (eq stage ':initial-torn) (conversation-log-pathname a) (first arguments)))
+                          (let* ((path   (if (eq stage ':initial-torn) (conversation-log-pathname a) (first arguments)))
                                  (record (unless (eq stage ':initial-torn) (second arguments))))
                             (case stage
                               (:foreign-torn
@@ -4534,8 +4548,10 @@ process without releasing the lease, exercising kernel cleanup."
                               (t
                                (if (eq stage ':cooperating) (torn path) (apply original arguments))
                                (case stage
-                                 (:revision (conversation-picker-metadata-invalidate a))
-                                 (:replace-active (replace-object path))
+                                  ((:revision :cooperating)
+                                   (conversation-picker-metadata-invalidate a))
+                                 (:replace-active
+                                  (replace-object path))
                                  (:retired-replaced
                                   (replace-object (first (conversation-storage-pathnames (conversation-pathname a)))))
                                  (:retired-change
@@ -4549,9 +4565,20 @@ process without releasing the lease, exercising kernel cleanup."
                                  (:broken-prefix
                                   (with-open-file (stream path :direction ':io :if-exists ':overwrite)
                                     (write-char #\) stream))))))
-                          (error "Injected ambiguous receipt write: ~S" stage))))))
-           (lambda () (setf failure (handler-case (progn (ensure-receipt) nil) (error (condition) condition)))))
+                           (error injected-condition))))))
+           (lambda ()
+             (setf failure
+                   (handler-case
+                       (handler-bind ((conversation-invariant-error
+                                        (lambda (condition)
+                                          (unless observed-condition (setf observed-condition condition)))))
+                         (ensure-receipt)
+                         nil)
+                    (error (condition) condition)))))
           (test-assert failure (format nil "~S refuses the uncertain receipt" stage))
+          (when (eq stage ':classifier-error)
+            (test-assert (and observed-condition (eq failure observed-condition))
+                         "classifier errors preserve the identical append condition"))
           (test-assert (or fired-p (eq stage ':reconciling)) "the designated attempt boundary ran")
           (when (eq stage ':cooperating)
             (let ((b (conversation-load (conversation-pathname a))))
