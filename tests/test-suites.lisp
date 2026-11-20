@@ -2500,3 +2500,6 @@
 (define-test-suite fullscreen-application-insertion
   test-terminal-fullscreen-application-cancel-insertion
   test-terminal-fullscreen-application-memory-insertion)
+
+(define-test-suite handoff-cancellation-syntax
+  test-tool-execution-handoff-cancel-literal)
