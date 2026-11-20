@@ -3747,7 +3747,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
     (&key (:count (integer 1 3)) (:waves (integer 1 4)) (:persistence keyword)) null)
 (defun agent-test-projection-wave (&key (count 3) (waves 1) (persistence ':durable))
   "Check the original published vector before joins and its cleanup after transfer."
-  (with-test-configuration (configuration root)
+  (with-test-configuration (configuration)
     (let* ((conversation                            (conversation-create configuration))
            (registry                                (make-instance 'tool-registry))
            (tool                                    (make-instance 'agent-test-projection-tool
@@ -3782,7 +3782,6 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
            (owner                                   (current-thread))
            (*agent-maximum-concurrent-tool-workers* 3)
            (*telemetry-run*                         nil))
-      (declare (ignore root))
       (tool-registry-register registry tool)
       (dotimes (wave waves)
         (setf (agent-test-projection-tool-next tool) (1- count)
@@ -3941,8 +3940,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
     (job-completion-tests--fixture
      (lambda (parent runtime configuration)
        (declare (ignore configuration))
-       (dotimes (index 4)
-         (declare (ignore index))
+       (loop repeat 4 do
          (let* ((job        (job-completion-tests--start parent runtime))
                 (identifier (session-job-execution-identifier job)))
            (test-assert (= 1 (length (task-completion-deliver parent)))
@@ -3960,7 +3958,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
 (defun test-agent-completion-owned-failures ()
   "Verify original vector cleanup and exact condition identity through finite failures."
   (dolist (mode '(:submission :wait :observer :persistence))
-    (with-test-configuration (configuration root)
+    (with-test-configuration (configuration)
       (let* ((conversation                            (conversation-create configuration))
              (registry                                (make-instance 'tool-registry))
              (tool                                    (make-instance 'agent-test-projection-tool
@@ -4001,7 +3999,6 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
              (escaped                                 nil)
              (*agent-maximum-concurrent-tool-workers* 3)
              (*telemetry-run*                         nil))
-        (declare (ignore root))
         (tool-registry-register registry tool)
         (test-call-with-function-replacements
          (list
@@ -4053,7 +4050,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
 (defun test-agent-completion-telemetry ()
   "Verify completion consumers with isolated telemetry capture, including emission failure."
   (dolist (mode '(:off :on :failure))
-    (with-test-configuration (configuration root)
+    (with-test-configuration (configuration)
       (let* ((conversation    (conversation-create configuration))
              (agent           (agent-create :configuration configuration :conversation conversation
                                             :provider (make-instance 'scripted-provider :results nil)
@@ -4070,7 +4067,6 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
                                (lambda (status details)
                                  (when (eq status ':tool-call-completed) (setf observed details)))))
              (*telemetry-run* (not (eq mode ':off))))
-        (declare (ignore root))
         (test-call-with-function-replacements
          (list (list 'telemetry-note-tool
                      (lambda (&rest arguments)
