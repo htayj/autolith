@@ -1272,13 +1272,17 @@ restricted turn cannot discover tools outside its allowlist."
 
 (-> agent--project-tool-execution (list) list)
 (defun agent--project-tool-execution (execution)
-  "Replace a raw result with an eligible owned snapshot before publication.
-Projection failure declines to legacy delivery, never a tool condition."
+  "Replace an eligible raw result, declining ordinary projection errors to legacy delivery."
   (let ((result (getf execution :result)))
     (when result
-      (let ((projection (tool-result-completion-projection result)))
-        (when projection
-          (setf (getf execution :result) projection)))))
+      (handler-bind
+          ((error (lambda (condition)
+                    (unless (typep condition
+                                   '(or conversation-invariant-error agent-loop-error active-image-corruption))
+                      (return-from agent--project-tool-execution execution)))))
+        (let ((projection (tool-result-completion-projection result)))
+          (when projection
+            (setf (getf execution :result) projection))))))
   execution)
 
 (-> agent--publish-tool-execution (vector integer list) null)

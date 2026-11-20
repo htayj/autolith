@@ -4085,3 +4085,85 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
           (test-assert (= 7 (getf (first notes) :exit-code))
                        "telemetry receives the shell exit code before optional emission failure")))))
   nil)
+
+(defclass agent-test-faulting-projection-result (tool-result)
+  ((condition :initarg :condition :reader agent-test-faulting-projection-result-condition
+              :documentation "The exact condition signalled by open projection."))
+  (:documentation "A genuine extension whose projection signals a selected condition."))
+
+(defmethod tool-result-completion-projection ((result agent-test-faulting-projection-result))
+  "Signal from real generic dispatch, including non-ERROR control conditions."
+  (error (agent-test-faulting-projection-result-condition result)))
+
+(-> agent-test-projection-fallback-wave (integer condition) null)
+(defun agent-test-projection-fallback-wave (count condition)
+  "Observe raw object identity at publication and ordinary delivery in a real wave."
+  (with-test-configuration (configuration)
+    (let* ((conversation (conversation-create configuration))
+           (registry     (make-instance 'tool-registry))
+           (raw          (make-instance 'agent-test-faulting-projection-result
+                                        :content "legacy projection" :success-p t :condition condition))
+           (tool         (make-instance 'agent-test-blocked-projection-tool
+                                        :namespace "fallback" :name "probe"
+                                        :description "Return a faulting projection extension."
+                                        :parameters  (tool-object-schema
+                                                      (json-object "kind" (tool-string-property "Kind.")) '("kind"))
+                                        :result      raw))
+           (agent        (agent-create :configuration configuration :conversation conversation
+                                       :provider (make-instance 'scripted-provider :results nil)
+                                       :tool-registry registry :worker ':unused))
+           (publish      (symbol-function 'agent--publish-tool-execution))
+           (seen         nil)
+           (lock         (make-lock "Fallback publication identities")))
+      (tool-registry-register registry tool)
+      (test-call-with-function-replacements
+       (list (list 'agent--publish-tool-execution
+                   (lambda (vector index execution)
+                     (with-lock-held (lock)
+                       (push (eq raw (getf execution :result)) seen))
+                     (funcall publish vector index execution))))
+       (lambda ()
+         (agent--run-tool-wave
+          agent (loop for index below count
+                      collect (list :call (agent-test-call
+                                           :call-id (format nil "fallback~D" index)
+                                           :namespace "fallback" :name "probe" :arguments "{\"kind\":\"blocked\"}")
+                                    :tool tool :persistence ':durable))
+          :observer (callback-agent-observer-create) :tool-round 1)))
+      (test-assert (and (= count (length seen)) (every #'identity seen))
+                   "ordinary projection failure publishes the identical raw result")
+      (test-assert (= count (length (agent-test-tool-outputs conversation)))
+                   "every raw fallback is delivered by the ordinary completion path")))
+  nil)
+
+(-> test-agent-projection-fallback-single () null)
+(defun test-agent-projection-fallback-single ()
+  "Exercise ordinary open-generic failure on the direct wave path."
+  (agent-test-projection-fallback-wave 1 (make-condition 'simple-error :format-control "projection failed"))
+  (agent-test-projection-fallback-wave 1 (make-condition 'type-error :datum 7 :expected-type 'string))
+  nil)
+
+(-> test-agent-projection-fallback-parallel () null)
+(defun test-agent-projection-fallback-parallel ()
+  "Exercise ordinary open-generic failure on genuine concurrent producers."
+  (agent-test-projection-fallback-wave 3 (make-condition 'simple-error :format-control "projection failed"))
+  (agent-test-projection-fallback-wave 3 (make-condition 'type-error :datum 7 :expected-type 'string))
+  nil)
+
+(-> test-agent-projection-control-identity () null)
+(defun test-agent-projection-control-identity ()
+  "Propagate administrative errors and actual non-ERROR controls without substitution."
+  (dolist (name '(conversation-invariant-error agent-loop-error active-image-corruption
+                  application-turn-cancelled cl-jobpond:job-aborted))
+    (let* ((condition (make-condition name))
+           (raw       (make-instance 'agent-test-faulting-projection-result
+                                     :content "control" :success-p t :condition condition))
+           (execution (list :result raw))
+           (escaped   nil))
+      (handler-case (agent--project-tool-execution execution)
+        (serious-condition (caught) (setf escaped caught)))
+      (test-assert (eq condition escaped) "the identical administrative or cancellation condition propagates")
+      (test-assert (eq raw (getf execution :result)) "control propagation preserves the raw result")
+      (when (member name '(application-turn-cancelled cl-jobpond:job-aborted))
+        (test-assert (not (typep condition 'error)) "actual cancellation controls are not ERROR"))))
+  nil)

@@ -1589,15 +1589,21 @@
   test-agent-tool-wave-cancellation
   test-agent-tool-wave-retained-cleanup
   test-agent-tool-wave-projection-outside-publication
+  test-agent-tool-wave-retained-projection
   test-agent-tool-concurrency-key
   test-agent-exclusive-tool-waves
   test-agent-completion-accessors
   test-agent-completion-reverse-order
   test-agent-completion-failure-priority
   test-agent-completion-projection-compatibility
+  test-agent-projection-fallback-single
+  test-agent-projection-fallback-parallel
+  test-agent-projection-control-identity
   test-agent-completion-bounded-ownership
   test-agent-completion-four-wave-release
   test-agent-completion-owned-failures
+  test-agent-completion-producer-barrier
+  test-agent-completion-outstanding-failures
   test-agent-completion-telemetry
   test-agent-completion-delivery-ownership
   test-agent-parallel-tool-failure
