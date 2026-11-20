@@ -632,9 +632,20 @@ and codes follow the Codex reference at commit 6f51c65958."
         ;; BOUNDED-STRING appends a multiline truncation notice; this field must not.
         (subseq text 0 (min (length text) limit))))))
 
+(-> provider--note-unpreserved-error-body (t) t)
+(defun provider--note-unpreserved-error-body (body)
+  "Return BODY unchanged; never probe or copy a potentially only-copy stream."
+  (when (streamp body)
+    (handler-case
+        (format *error-output*
+                "~&Response stream preservation skipped; an only-copy nonseekable body is not captured.~%")
+      (error () nil)))
+  body)
+
 (-> provider--unauthorized-body-fields (t) (values (option string) (option string)))
 (defun provider--unauthorized-body-fields (raw-body)
   "Read one bounded body and return only sanitized JSON message and code strings."
+  (provider--note-unpreserved-error-body raw-body)
   (handler-case
       (let* ((body    (provider--error-body-text
                        (if (and (vectorp raw-body) (> (length raw-body) 4000))
@@ -700,7 +711,8 @@ and codes follow the Codex reference at commit 6f51c65958."
      :headers  headers
      :raw-body (provider--error-body-text
                 (handler-case
-                    (dexador.error:response-body condition)
+                    (provider--note-unpreserved-error-body
+                     (dexador.error:response-body condition))
                   (error ()
                     nil))))))
 

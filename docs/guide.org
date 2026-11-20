@@ -2702,6 +2702,25 @@ OAuth with a local loopback callback.
 Anthropic, Fireworks, OpenCode, OpenRouter, Mistral, OpenAI API, and
 user-registered OpenAI-compatible providers use API keys.
 
+A request already committed to its transport may finish with its old credentials
+after a newer login publishes. Login publication does not wait for that request
+to finish. This exception applies to the committed request, not a new invocation
+bypassing ordinary credential admission. Credential callbacks run on their caller
+thread, including nested calls while that thread owns the recursive account lock.
+Cancellation there requires an interruptible operation.
+
+Each replacement offered to Autolith's private credential store gets a separate
+five-second save allowance while interruptible. A save failure produces a
+sanitized diagnostic and propagates the original failure; this is an attempted
+save, not an unconditional durability guarantee.
+
+Autolith drops independent preservation of an only-copy nonseekable response
+stream. Error-body normalization logs a sanitized skip diagnostic for stream
+bodies conservatively, without probing arbitrary streams for seekability. The
+preservation observer passes the original body through without reading, closing
+or substituting it. Existing response normalization can still read and close the
+body; condition handlers receive the same objects and behavior as before.
+
 The direct Anthropic catalog includes =claude-fable-5-2=, =claude-opus-5-5=,
 =claude-sonnet-5-5= and =claude-haiku-5-5= with one-million-token context windows.
 For these models, =reasoning-effort= selects =low=, =medium=, =high=, =xhigh= or

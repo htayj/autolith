@@ -2396,3 +2396,9 @@
 (define-test-suite mission-draft-interface
  test-mission-draft-native-command
  test-mission-draft-restore-identities)
+
+(define-test-suite credential-compatibility
+  test-credentials-recursive-account-success
+  test-credentials-committed-send-after-login
+  test-credentials-independent-save-attempts
+  test-provider-only-copy-stream-preservation-skip)

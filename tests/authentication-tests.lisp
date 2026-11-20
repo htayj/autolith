@@ -900,3 +900,147 @@
                                                      (second specification)))
         (provider--registry-restore snapshot))))
   nil)
+
+
+;;;; -- Credential compatibility boundaries --
+
+(-> authentication-tests--replacement (configuration string) oauth-credentials)
+(defun authentication-tests--replacement (configuration token)
+  "Make a synthetic, unexpired replacement for the private test store."
+  (make-instance 'oauth-credentials
+                 :access-token token :refresh-token nil :id-token nil
+                 :account-id "compatibility-account" :expires-at nil
+                 :source-path (configuration-auth-path configuration)))
+
+(-> test-credentials-recursive-account-success () null)
+(defun test-credentials-recursive-account-success ()
+  "Use the real account lock and caller-thread callback for successful nested loading."
+  (with-test-configuration (configuration)
+    (let* ((manager     (credential-manager-create configuration))
+           (credentials (authentication-tests--replacement configuration "nested-access"))
+           (thread      sb-thread:*current-thread*)
+           (refusal     (make-condition 'authentication-error :message "Synthetic refusal.")))
+      (credential-source-save (credential-manager-primary-source manager) credentials)
+      (bordeaux-threads:with-recursive-lock-held
+          ((cl-rfc8628::credential-manager--account-lock manager))
+        (test-assert
+         (eq ':nested-success
+             (with-credentials (outer manager)
+               (test-assert *credentials-in-request-scope* "the actual credential scope is active")
+               (test-assert (eq thread sb-thread:*current-thread*) "the outer callback uses its caller")
+               (with-credentials (inner manager)
+                 (test-assert (eq thread sb-thread:*current-thread*) "the nested callback uses its caller")
+                 (test-assert (= 2 *secret-use-depth*) "both actual secret regions are active")
+                 (test-assert (string= (oauth-credentials-access-token outer)
+                                      (oauth-credentials-access-token inner))
+                              "nested credential loading succeeds on the already owned account lock")
+                 ':nested-success)))
+         "a real nested callback succeeds, rather than refusing")
+        (test-assert
+         (eq refusal
+             (handler-case (with-credentials (value manager)
+                             (declare (ignore value))
+                             (error refusal))
+               (authentication-error (condition) condition)))
+         "a refusal is propagated as the exact original condition")
+        (test-assert
+         (handler-case
+             (sb-sys:with-deadline (:seconds 0.02)
+               (with-credentials (value manager)
+                 (declare (ignore value))
+                 (sleep 1)
+                 nil))
+           (sb-sys:deadline-timeout () t))
+         "an interruptible callback can be cancelled while this thread owns the account lock"))))
+  nil)
+
+(-> test-credentials-committed-send-after-login () null)
+(defun test-credentials-committed-send-after-login ()
+  "Complete the supported synthetic transport after actual newer-login publication."
+  (with-test-configuration (configuration)
+    (let* ((manager      (credential-manager-create configuration))
+           (source       (credential-manager-primary-source manager))
+           (old          (authentication-tests--replacement configuration "committed-old-access"))
+           (new          (authentication-tests--replacement configuration "published-new-access"))
+           (client       (make-instance 'cl-rfc8628:rfc8628-device-authentication-client))
+           (provider     (make-instance 'codex-subscription-provider
+                                        :configuration configuration :credential-manager manager
+                                        :session-id "committed-send-test"))
+           (conversation (conversation-create configuration))
+           (order        nil))
+      (credential-source-save source old)
+      (test-call-with-function-replacements
+       (list
+        (list 'provider-post-event-stream
+              (lambda (url content &key headers keep-alive-p)
+                (declare (ignore url content keep-alive-p))
+                (push ':committed order)
+                (test-assert (equal (rest (assoc "Authorization" headers :test #'string-equal))
+                                    "Bearer committed-old-access")
+                             "the transport has committed the old authorization")
+                (sb-sys:with-deadline (:seconds 1)
+                  (cl-rfc8628:rfc8628-device-authentication-publish-credentials client manager new))
+                (push ':login-published order)
+                (test-assert (string= "published-new-access"
+                                      (oauth-credentials-access-token (credential-source-load source)))
+                             "login publishes before the committed transport finishes")
+                (push ':old-send-completed order)
+                (values (make-string-input-stream "") 200 nil))))
+       (lambda ()
+         (with-credentials (committed manager)
+           (let ((stream (provider-open-response-stream provider (json-object)
+                                                        :credentials committed :conversation conversation)))
+             (close stream)))))
+      (test-assert (equal (reverse order) '(:committed :login-published :old-send-completed))
+                   "the committed send completes after the newer login")
+      (with-credentials (next manager)
+        (test-assert (string= "published-new-access" (oauth-credentials-access-token next))
+                     "a new invocation loads the published credentials"))))
+  nil)
+
+(defclass authentication-tests-save-source (autolith-credential-source)
+  ((attempts :initform nil :accessor authentication-tests-save-attempts
+             :documentation "Replacement identities offered to this synthetic store.")
+   (failure :initform nil :accessor authentication-tests-save-failure
+            :documentation "Exact synthetic refusal, when requested."))
+  (:documentation "Exercise the real private-store save wrapper without disk or network effects."))
+
+(defmethod credential-source-save
+    ((source authentication-tests-save-source) (credentials oauth-credentials))
+  "Record each distinct save attempt and optionally signal an exact refusal."
+  (push credentials (authentication-tests-save-attempts source))
+  (sleep 0.02)
+  (when (authentication-tests-save-failure source)
+    (error (authentication-tests-save-failure source)))
+  credentials)
+
+(-> test-credentials-independent-save-attempts () null)
+(defun test-credentials-independent-save-attempts ()
+  "Allow separate exposed saves and report failure without printing credentials or conditions."
+  (with-test-configuration (configuration)
+    (let* ((source  (make-instance 'authentication-tests-save-source
+                                   :pathname (configuration-auth-path configuration)))
+           (first   (authentication-tests--replacement configuration "first-save-secret"))
+           (second  (authentication-tests--replacement configuration "second-save-secret"))
+           (refusal (make-condition 'authentication-error :message "condition-secret"))
+           (log     (make-string-output-stream)))
+      (dolist (replacement (list first second))
+        (test-assert
+         (eq replacement
+             (sb-sys:with-deadline (:seconds 0.001)
+               (credential-source-save source replacement)))
+         "each accessible save gets an independent allowance rather than the expired caller allowance"))
+      (setf (authentication-tests-save-failure source) refusal)
+      (let ((*error-output* log))
+        (test-assert
+         (eq refusal (handler-case (credential-source-save source first)
+                       (authentication-error (condition) condition)))
+         "save failure preserves the exact refusal"))
+      (test-assert (equal (reverse (authentication-tests-save-attempts source))
+                          (list first second first))
+                   "every exposed replacement receives its own attempt")
+      (let ((text (get-output-stream-string log)))
+        (test-assert (plusp (length text)) "save failure is prominently reported")
+        (dolist (secret '("first-save-secret" "second-save-secret" "condition-secret"))
+          (test-assert (not (search secret text)) "failure diagnostics contain no credential or condition text")))))
+  nil)

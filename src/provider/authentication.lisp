@@ -198,6 +198,20 @@ The file belongs to another tool, so a symbolic link to it is followed."
         (error ()
           nil)))))
 
+(defmethod credential-source-save :around
+    ((source autolith-credential-source) (credentials oauth-credentials))
+  "Give each exposed private-store replacement its own interruptible save allowance."
+  (declare (ignore source credentials))
+  (handler-case
+      (sb-sys:with-deadline (:seconds 5 :override t)
+        (call-next-method))
+    ((or error sb-sys:deadline-timeout) (condition)
+      (handler-case
+          (format *error-output*
+                  "~&Credential save failed; the replacement may not be recoverable.~%")
+        (error () nil))
+      (error condition))))
+
 (defmethod credential-source-save ((source autolith-credential-source)
                                    (credentials oauth-credentials))
   "Atomically save CREDENTIALS to Autolith's private store with mode 0600."

@@ -5012,3 +5012,38 @@ Transport is synthetic; retry delays are suppressed."
                           (not (eq mode ':no-generation)))
                       "the failed-attempt observer latches only genuine generation evidence")))))
   nil)
+
+(-> test-provider-only-copy-stream-preservation-skip () null)
+(defun test-provider-only-copy-stream-preservation-skip ()
+  "Skip stream preservation without probing, reading, replacing or closing the handler's body."
+  (let* ((body      (make-instance 'test-error-body-character-stream
+                                   :source "{\"error\":{\"message\":\"safe message\"}}"))
+         (condition (make-condition 'http-request-failed :body body :status 401
+                                    :headers nil :uri (quri:uri "https://example.invalid/") :method ':post))
+         (seen      nil)
+         (log       (make-string-output-stream)))
+    (unwind-protect
+         (progn
+           (let ((*error-output* log))
+            (handler-case
+                (handler-bind ((http-request-failed
+                                 (lambda (actual)
+                                   (setf seen actual)
+                                   (test-assert (eq body (dexador.error:response-body actual))
+                                                "the actual handler sees its original only-copy stream")
+                                   (test-assert (eq body (provider--note-unpreserved-error-body
+                                                          (dexador.error:response-body actual)))
+                                                "preservation skips without stream substitution")
+                                   (test-assert (zerop (test-error-body-reads body))
+                                                "the preservation observer does not consume the body")
+                                   (test-assert (zerop (test-error-body-closes body))
+                                                "the preservation observer does not close the body"))))
+                  (error condition))
+              (http-request-failed () nil)))
+           (test-assert (eq condition seen) "handler condition identity is unchanged")
+           (test-assert (char= #\{ (read-char body)) "the handler can read the untouched stream")
+           (let ((text (get-output-stream-string log)))
+             (test-assert (= 1 (count #\Newline text)) "one sanitized skip diagnostic is emitted")
+             (test-assert (not (search "safe message" text)) "body contents are not logged")))
+      (close body)))
+  nil)
