@@ -162,6 +162,9 @@ The output pipe also captures threads and grandchild processes."
     (bootstrap-call-railed
      (lambda ()
        (load (merge-pathnames ".qlot/setup.lisp" source-root))
+       (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+        (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources
+                          source-root :consumer "bootstrap")
        (uiop:symbol-call '#:ql '#:quickload :cffi :silent t)
        (let ((profile-library-directory
                (merge-pathnames ".guix-profile/lib/" (user-homedir-pathname)))
@@ -190,11 +193,16 @@ The output pipe also captures threads and grandchild processes."
            "--script"
            (namestring (merge-pathnames "script/build-recovery.lisp"
                                         source-root))))
-    (bootstrap-section "Building the fast startup image")
-    (bootstrap-run-railed
-     (list sbcl-command
-           "--script"
-           (namestring (merge-pathnames "script/build-active.lisp"
-                                        source-root))))
-    (bootstrap-done
-     "Autolith dependencies, private native libraries, recovery image, and fast startup image are installed.")))
+    (if (autolith-prepared-dependency-sources-p)
+        (progn
+          (bootstrap-note "Prepared dependencies are diagnostic only; no active core was built.")
+          (bootstrap-done
+           "Dependencies and recovery image are installed; prepared-source active images are unsupported."))
+        (progn
+          (bootstrap-section "Building the fast startup image")
+          (bootstrap-run-railed
+           (list sbcl-command
+                 "--script"
+                 (namestring (merge-pathnames "script/build-active.lisp" source-root))))
+          (bootstrap-done
+           "Autolith dependencies, private native libraries, recovery image, and fast startup image are installed.")))))

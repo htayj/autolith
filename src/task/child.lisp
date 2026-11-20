@@ -312,7 +312,7 @@ the root's cache key. Siblings with matching prefixes still share one key."
   (append
    (list (list :indicator ':status :required t
                :validate (lambda (value)
-                           (not (null (member value '(:success :failed :aborted))))))
+                           (not (null (member value '(:success :failed :aborted :suspended))))))
          (list :indicator ':request-count
                :validate  (lambda (value) (typep value '(integer 0))))
          (list :indicator ':duration-ms
@@ -334,10 +334,14 @@ the root's cache key. Siblings with matching prefixes still share one key."
 (defun task--read-result-artifact
     (pathname &key (maximum-octets *task-result-maximum-octets*))
   "Read exactly one bounded, schema-checked durable child result."
-  (sexp-store:snapshot-read-record
-   pathname :grammar (task--result-grammar) :maximum-octets maximum-octets
-   :properties-p t :keyword-keys-p t :maximum-length 128
-   :fields (task--result-fields)))
+  (let ((result (sexp-store:snapshot-read-record
+                 pathname :grammar (task--result-grammar) :maximum-octets maximum-octets
+                 :properties-p t :keyword-keys-p t :maximum-length 128
+                 :fields (task--result-fields))))
+    (when (and (eq (getf result :status) ':suspended)
+               (not (task-review-required-result-p result)))
+      (error 'task-error :tool-name "job.get" :message "Invalid administrative checkpoint artifact."))
+    result))
 
 (-> task--write-result-artifact (task-job list) pathname)
 (defun task--write-result-artifact (job result)
@@ -502,9 +506,10 @@ the root's cache key. Siblings with matching prefixes still share one key."
 
 (-> task-job-cancel-execution-descendants (task-job keyword) list)
 (defun task-job-cancel-execution-descendants (job reason)
-  "Cancel tool descendants and wait one bounded interval for their cleanup.
-Live executions retain their pool ownership and remain inspectable after return."
-  (let* ((executions
+  "Cancel descendants within mission caps or one bounded ordinary cleanup interval."
+  (let* ((ledger (execution-lease-ledger-for (task-job-mission-context job)))
+         (reason (if ledger (execution-lease-cleanup-reason ledger job reason) reason))
+         (executions
            (job-pool-descendant-jobs
             (task-orchestrator-execution-pool (task-job-orchestrator job))
             (job-identifier job)))
@@ -512,12 +517,17 @@ Live executions retain their pool ownership and remain inspectable after return.
                       (* *task-descendant-cleanup-timeout-seconds*
                          internal-time-units-per-second))))
     (dolist (execution executions)
-      (job-cancel execution :reason reason :cascade-p t))
+      (if ledger
+          (execution-lease-cancel ledger execution
+                                  (execution-lease-cleanup-reason ledger execution reason))
+          (job-cancel execution :reason reason :cascade-p t)))
     (dolist (execution executions)
-      (job-await execution
-                 :timeout-seconds
-                 (max 0 (/ (- deadline (get-internal-real-time))
-                           internal-time-units-per-second))))
+      (if ledger
+          (execution-lease-await-closure ledger execution)
+          (job-await execution
+                     :timeout-seconds
+                     (max 0 (/ (- deadline (get-internal-real-time))
+                               internal-time-units-per-second)))))
     executions))
 
 (-> task-assignment-origin (agent) list)
@@ -543,7 +553,7 @@ Live executions retain their pool ownership and remain inspectable after return.
                            (list :target (conversation-identifier conversation)
                                  :kind   ':post))))
 
-(-> task-run-child (task-job) list)
+(-> task-run-child (task-job) (or list task-administrative-checkpoint))
 (defun task-run-child (job)
   "Create and run JOB's real in-process child session through a terminal child turn."
   (let* ((parent       (task-job-parent-agent job))
@@ -639,22 +649,26 @@ Live executions retain their pool ownership and remain inspectable after return.
                 (application-world-server (world-host-application host)) host)
                (setf observer (application-assignment-observer
                                (world-host-application host) observer job)))
-             (task-child-inherit-reference-history job conversation provider)
-             (let ((result
-                     (agent-run-user-turn
-                      child
-                      (getf (task-job-item job) :task)
-                      :observer          observer
-                      :automatic-p       t
-                      :operation-request (task-child-assignment-request job conversation)
-                       :goal-context     (task-child-goal-context job configuration))))
-               (task--assemble-child-result
-                job :provider-result result
-                    :child           child
-                      :conversation  conversation)))
+             (task-call-with-review-boundary
+              job conversation
+              (lambda ()
+                (task-child-inherit-reference-history job conversation provider)
+                (let ((result
+                        (agent-run-user-turn
+                         child
+                         (getf (task-job-item job) :task)
+                         :observer          observer
+                         :automatic-p       t
+                         :operation-request (task-child-assignment-request job conversation)
+                         :goal-context      (task-child-goal-context job configuration))))
+                  (task--assemble-child-result
+                   job :provider-result result
+                       :child           child
+                       :conversation    conversation)))))
         (unwind-protect
              (progn
-               (task-job-cancel-execution-descendants job ':parent-finished)
+               (task-job-cancel-execution-descendants
+                job (or (job-cancellation-reason job) ':parent-finished))
                (when (participant-state-goal (agent-participant-state child))
                  (conversation-append-record
                   conversation (goal->record (participant-state-goal (agent-participant-state child))))))

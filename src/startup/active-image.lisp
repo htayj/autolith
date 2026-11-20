@@ -23,6 +23,13 @@
                     "script/build-active.lisp"
                     "script/runtime-requirement.lisp"
                     "script/windows-stat.lisp"
+                    "script/production-dependencies.lisp"
+                    "script/dependency-setup.lisp"
+                    "script/prepare-dependency-sources.lisp"
+                    "patches/dependencies/manifest.sexp"
+                    "patches/dependencies/build-manifest.json"
+                    "patches/dependencies/babel-bounded-count.patch"
+                    "patches/dependencies/yason-early-specials.patch"
                     "autolith.asd"
                     "VERSION"
                     "qlfile"
@@ -35,6 +42,7 @@
 (-> active-image-build-record-create (pathname) list)
 (defun active-image-build-record-create (source-root)
   "Return the exact source and runtime identity for a new active image of SOURCE-ROOT."
+  (uiop:symbol-call '#:cl-user '#:autolith-require-savable-dependency-sources)
   (active-image--call-translating-errors
    (lambda ()
      (image-build-record (uiop:ensure-directory-pathname source-root)
@@ -44,10 +52,12 @@
 (defun active-image-build-record-compatible-p (record source-root)
   "Return true when RECORD exactly matches SOURCE-ROOT and this runtime."
   (handler-case
-      (image-build-record-compatible-p
-       record
-       (uiop:ensure-directory-pathname (platform-truename *platform* source-root))
-       :inputs #'active-image-source-paths)
+      ;; A retained prepared selection cannot become source-only by unsetting ENV.
+      (and (not (uiop:symbol-call '#:cl-user '#:autolith-prepared-dependency-sources-p))
+           (image-build-record-compatible-p
+            record
+            (uiop:ensure-directory-pathname (platform-truename *platform* source-root))
+            :inputs #'active-image-source-paths))
     (error ()
       nil)))
 
@@ -154,6 +164,7 @@ takes a fraction of a second, and otherwise loads the system from source."
 The build record is computed here, so it names exactly the source this process
 loaded; the process exits inside the save. Hosts without fork build their image
 this way, from a fresh process that script/build-active.lisp starts."
+  (uiop:symbol-call '#:cl-user '#:autolith-require-savable-dependency-sources)
   (image-save pathname
               (active-image-build-record-create
                (uiop:ensure-directory-pathname (platform-truename *platform* source-root)))
@@ -203,6 +214,7 @@ this way, from a fresh process that script/build-active.lisp starts."
 
 SAVER :AUTOMATIC forks this process where the host can; :FRESH-PROCESS always
 loads the system in a new SBCL, so the image holds nothing else from this heap."
+  (uiop:symbol-call '#:cl-user '#:autolith-require-savable-dependency-sources)
   (let ((source-root (uiop:ensure-directory-pathname
                       (platform-truename *platform* source-root))))
     (active-image--call-translating-errors

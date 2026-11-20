@@ -232,7 +232,9 @@ tables. The orchestrator owns cross-pool ordering, child naming, hurry-up policy
 nesting depth, and lifecycle listeners."))
 
 (defclass session-job (job)
-  ((cancellation-observation
+  ((lease-ticket :initarg :lease-ticket :initform nil :reader session-job-lease-ticket
+                 :documentation "Host admission reservation, never a returned tool value.")
+   (cancellation-observation
     :initform      nil
     :accessor      session-job-cancellation-observation
     :documentation "Autolith cancellation timing and once-only warning, under the orchestrator lock.")
@@ -310,6 +312,10 @@ nesting depth, and lifecycle listeners."))
     :accessor      task-job-execution-metadata
     :type          list
     :documentation "Portable identity and attempted model captured before child execution.")
+   (administrative-checkpoint
+    :initform      nil
+    :accessor      task-job-administrative-checkpoint
+    :documentation "Host-constructed checkpoint authority, never obtained from a returned plist.")
    (telemetry-run
     :initarg       :telemetry-run
     :initform      nil
@@ -613,3 +619,183 @@ parent, and borrowed capabilities are released at terminal state."))
 (defmethod tool-decode-native-arguments ((tool task-job-tool) arguments)
   "Detach job values with their textual decoder's marker policy."
   (task-json-normalize arguments :tool-name (tool-canonical-name tool)))
+
+;;;; -- Administrative Checkpoints --
+
+(defstruct (task-administrative-checkpoint
+             (:constructor task--make-administrative-checkpoint (context generation attempt data)))
+  "Ephemeral host authority. DATA is inspection evidence, never restart authority."
+  (context nil :read-only t)
+  (generation nil :read-only t)
+  (attempt nil :read-only t)
+  (data nil :read-only t))
+
+(defgeneric task-checkpoint-current-p (context generation attempt)
+  (:documentation "Validate the exact host mission generation and latched review attempt, without I/O."))
+
+(defmethod task-checkpoint-current-p (context generation attempt)
+  "Unknown origins cannot mint administrative results."
+  (declare (ignore context generation attempt))
+  nil)
+
+(defgeneric task-checkpoint-mission-identifier (context)
+  (:documentation "Read the exact host mission identity without I/O or lifecycle reentry."))
+
+(defmethod task-checkpoint-mission-identifier (context)
+  "Unknown origins have no checkpoint mission identity."
+  (declare (ignore context))
+  nil)
+
+(-> task-checkpoint-data-p (t) boolean)
+(defun task-checkpoint-data-p (data)
+  "Recognize bounded portable checkpoint evidence, not execution authority."
+  (and (listp data)
+       (handler-case
+            (and (eql 24 (list-length data))
+                 (equal (loop for (key) on data by (lambda (tail) (rest (rest tail))) collect key)
+                        '(:version :job-id :execution-id :generation :mission-id :run-token
+                          :original-cap :owners :attempt :cursor :next-action :durable-checkpoint-p))
+                 (eql 1 (getf data :version))
+                (every (lambda (key)
+                         (let ((value (getf data key)))
+                           (and (stringp value) (<= 1 (length value) 128))))
+                       '(:job-id :execution-id :generation :mission-id :run-token))
+                (typep (getf data :attempt) '(integer 1))
+                (or (null (getf data :original-cap)) (integerp (getf data :original-cap)))
+                (listp (getf data :owners))
+                (typep (list-length (getf data :owners)) '(integer 0 64))
+                (every (lambda (value) (and (stringp value) (<= 1 (length value) 128)))
+                       (getf data :owners))
+                (typep (getf data :durable-checkpoint-p) 'boolean)
+                (eq (getf data :next-action) ':review-required)
+                (task-checkpoint-cursor-p (getf data :cursor))
+                t)
+         (error () nil))))
+
+(-> task-review-required-result-p (t &key (:record list)) boolean)
+(defun task-review-required-result-p (result &key record)
+  "Validate an administrative projection, optionally against its durable ownership record.
+  This predicate grants no replay, provider, tool or continuation authority."
+  (and (listp result)
+       (handler-case
+           (let ((data (getf result :administrative-checkpoint)))
+             (and (eq (getf result :status) ':suspended)
+                  (eq (getf result :outcome) ':review-required)
+                  (eq (getf result :execution-state) ':aborted)
+                  (not (getf result :yielded-p))
+                  (task-checkpoint-data-p data)
+                  (equal (getf result :id) (getf data :job-id))
+                  (eql (getf result :durable-checkpoint-p)
+                       (getf data :durable-checkpoint-p))
+                  (eq (getf result :next-action) (getf data :next-action))
+                  (equal (getf result :cursor) (getf data :cursor))
+                  (or (null record)
+                      (and (equal (getf data :job-id) (getf record :job-id))
+                           (equal (getf data :execution-id) (getf record :execution-id))
+                           (equal (getf data :owners) (getf record :owners))
+                           (equal data (getf record :administrative-checkpoint))))
+                  t))
+         (error () nil))))
+
+(-> task-job-capture-review-checkpoint
+    (task-job &key (:context t) (:generation string) (:attempt (integer 1))
+                  (:mission-id string) (:cursor list) (:durable-checkpoint-p boolean))
+    (option task-administrative-checkpoint))
+(defun task-job-capture-review-checkpoint
+    (job &key context generation attempt mission-id cursor durable-checkpoint-p)
+  "Capture one host checkpoint while JOB still owns its original live execution.
+The context protocol must validate the exact latched attempt without I/O. This
+constructor performs bounded bookkeeping only, never storage or model work.
+Privileged Lisp can subvert this in-process boundary; returned tool data cannot."
+  (cl-jobpond:job-call-with-admission
+   job
+   (lambda ()
+     (when (and (eq context (task-job-mission-context job))
+                (task-checkpoint-current-p context generation attempt)
+                (task-checkpoint-lineage-current-p context job nil)
+                (equal mission-id (task-checkpoint-mission-identifier context))
+                (or (null (job-deadline job))
+                    (< (get-internal-real-time) (job-deadline job)))
+                (not (task-job-administrative-checkpoint job)))
+       (let ((data (list :version              1
+                         :job-id               (session-job-identifier job)
+                         :execution-id         (session-job-execution-identifier job)
+                         :generation generation :mission-id mission-id
+                         :run-token            (job-run-token job)
+                         :original-cap         (job-deadline job)
+                         :owners               (copy-list (job-owner-identifiers job))
+                         :attempt attempt :cursor (copy-tree cursor)
+                         :next-action          ':review-required
+                         :durable-checkpoint-p durable-checkpoint-p)))
+         (when (task-checkpoint-data-p data)
+           (setf (task-job-administrative-checkpoint job)
+                 (task--make-administrative-checkpoint
+                  context generation attempt data))))))))
+
+(-> task-job--checkpoint-data (task-job) (option list))
+(defun task-job--checkpoint-data (job)
+  "Validate retained host authority during terminal publication, without lifecycle admission.
+  The library already owns the publication claim. Accepted cancellation wins."
+  (let ((candidate (task-job-administrative-checkpoint job)))
+    (when (and (task-administrative-checkpoint-p candidate)
+               (not (job-cancellation-reason job)))
+      (let ((data (task-administrative-checkpoint-data candidate)))
+        (when (and (task-checkpoint-data-p data)
+                   (task-checkpoint-lineage-current-p
+                    (task-administrative-checkpoint-context candidate) job t)
+                   (eq (task-job-mission-context job)
+                       (task-administrative-checkpoint-context candidate))
+                   (task-checkpoint-current-p
+                    (task-administrative-checkpoint-context candidate)
+                    (task-administrative-checkpoint-generation candidate)
+                    (task-administrative-checkpoint-attempt candidate))
+                   (equal (getf data :mission-id)
+                          (task-checkpoint-mission-identifier
+                           (task-administrative-checkpoint-context candidate)))
+                   (equal (getf data :generation)
+                          (task-administrative-checkpoint-generation candidate))
+                   (eql (getf data :attempt)
+                        (task-administrative-checkpoint-attempt candidate))
+                   (equal (getf data :job-id) (session-job-identifier job))
+                   (equal (getf data :execution-id) (session-job-execution-identifier job))
+                   (equal (getf data :owners) (job-owner-identifiers job))
+                   (equal (getf data :run-token) (job-run-token job))
+                   (eql (getf data :original-cap) (job-deadline job))
+                   (or (null (job-deadline job))
+                       (< (get-internal-real-time) (job-deadline job))))
+          (copy-tree data))))))
+
+(-> task-checkpoint-projection (t &key (:record list)) list)
+(defun task-checkpoint-projection (result &key record)
+  "Return the single administrative projection shared by progress, continuity and notices."
+  (when (task-review-required-result-p result :record record)
+    (list :administrative-status ':suspended :outcome ':review-required
+          :execution-state ':aborted :next-action ':review-required
+          :cursor               (copy-tree (getf result :cursor))
+          :durable-checkpoint-p (getf result :durable-checkpoint-p)
+          :persistence-failed   (getf result :persistence-failed))))
+
+(-> task-checkpoint-cursor-p (t) boolean)
+(defun task-checkpoint-cursor-p (cursor)
+  "Recognize bounded legacy and sequence-addressed review cursors as evidence only."
+  (handler-case
+      (and (listp cursor)
+           (member (list-length cursor) '(6 14))
+           (let ((keys (loop for (key) on cursor by (lambda (tail) (rest (rest tail))) collect key)))
+             (or (equal keys '(:conversation-id :request-count :next-action))
+                 (and (equal keys '(:conversation-id :request-count :next-action :sequence :intent :accounting :persistence-failed))
+                      (typep (getf cursor :sequence) '(integer 0))
+                      (stringp (getf cursor :intent)) (<= (length (getf cursor :intent)) 1000)
+                      (typep (getf cursor :persistence-failed) 'boolean)
+                      (let ((accounting (getf cursor :accounting)))
+                        (and (listp accounting) (eql (list-length accounting) 10)
+                             (equal (loop for (key) on accounting by (lambda (tail) (rest (rest tail))) collect key)
+                                    '(:turns-used :tokens-used :requests-outstanding :tokens-reserved :unknown-usage))
+                             (every (lambda (value) (typep value '(integer 0)))
+                                    (loop for tail on accounting by (lambda (tail) (rest (rest tail))) collect (second tail))))))))
+           (let ((id (getf cursor :conversation-id)))
+             (and (stringp id) (<= 1 (length id) 128)))
+           (typep (getf cursor :request-count) '(integer 0))
+           (eq (getf cursor :next-action) ':review-required)
+           t)
+    (error () nil)))

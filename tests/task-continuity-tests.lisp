@@ -511,3 +511,271 @@
                           "Re-emitting an existing digest needs no additional capacity"))
            (test-assert (string= before (uiop:read-file-string path :external-format :utf-8))
                         "A duplicate grant does not change earlier metadata")))))))
+
+
+;;;; -- Administrative Publication Contract --
+
+(defclass task-checkpoint-test-context (mission-context)
+  ((current-p :initform t :accessor task-checkpoint-test-current-p
+              :documentation "Whether the fixture's original attempt is current."))
+  (:documentation "Inert host authority for publication tests, not a mission producer."))
+
+(defmethod task-checkpoint-current-p ((context task-checkpoint-test-context) generation attempt)
+  "Validate the single exact fixture generation and attempt without I/O."
+  (and (task-checkpoint-test-current-p context)
+       (equal generation "generation-1") (eql attempt 1)))
+
+(defmethod task-checkpoint-mission-identifier ((context task-checkpoint-test-context))
+  "Return the inert fixture's exact mission identity."
+  (declare (ignore context))
+  "mission-1")
+
+(-> task-checkpoint-tests--publication (keyword function) t)
+(defun task-checkpoint-tests--publication (mode inspect)
+  "Run a real admitted task and claimed host publication, then call INSPECT."
+  (task-continuity-tests--fixture
+   (lambda (parent orchestrator context template path)
+     (declare (ignore context path))
+     (let* ((origin   (make-instance 'task-checkpoint-test-context :application nil :goal nil))
+            (start    (bt:make-semaphore))
+            (captured (bt:make-semaphore))
+            (release  (bt:make-semaphore))
+            (claimed  (bt:make-semaphore))
+            (bodies 0) (cleanups 0) (publications 0)
+            (job
+              (first
+               (job-pool-submit-batch
+                (task-orchestrator-pool orchestrator)
+                (list
+                 (list :name                         "Checkpoint publication fixture"
+                       :maximum-runtime-milliseconds 30000
+                       :root-identifier              (task-parent-root-conversation-identifier parent)
+                       :owner-identifiers            nil
+                       :function
+                       (lambda (job)
+                         (unwind-protect
+                              (progn
+                                (assert (bt:wait-on-semaphore start :timeout 10))
+                                (incf bodies)
+                                (unless (eq mode ':forged)
+                                  (let* ((cursor (list :conversation-id
+                                                       (conversation-identifier (agent-conversation parent))
+                                                       :request-count 0 :next-action ':review-required))
+                                         (durable-p
+                                           (handler-case
+                                               (progn
+                                                 (when (eq mode ':checkpoint-storage)
+                                                   (error 'task-error :tool-name "job.get"
+                                                          :message               "Injected checkpoint storage failure."))
+                                                 (task-continuity--write
+                                                  (merge-pathnames "checkpoint.sexp"
+                                                                   (task--artifact-root (agent-configuration parent) job))
+                                                  cursor :require-absent t)
+                                                 t)
+                                             (task-error () nil)))
+                                         (candidate
+                                           (task-job-capture-review-checkpoint
+                                            job :context origin :generation "generation-1"
+                                            :attempt 1 :mission-id "mission-1" :cursor cursor
+                                            :durable-checkpoint-p durable-p)))
+                                    (assert candidate)
+                                    (test-assert
+                                     (null (task-job-capture-review-checkpoint
+                                            job :context origin :generation "generation-1"
+                                            :attempt 1 :mission-id "mission-1" :cursor nil))
+                                     "A competing construction cannot replace the issued checkpoint")
+                                    (case mode
+                                      (:stale
+                                       (setf (task-checkpoint-test-current-p origin) nil))
+                                      ((:owners :generation :mission-id :execution-id :run-token :attempt)
+                                       (let ((data (task-administrative-checkpoint-data candidate)))
+                                         (setf (getf data mode)
+                                               (case mode (:owners
+                                                           '("foreign")) (:attempt
+                                                                          2)
+                                                     (otherwise
+                                                      "foreign"))))))))
+                                (bt:signal-semaphore captured)
+                                (when (eq mode ':cancel-before)
+                                  (assert (bt:wait-on-semaphore release :timeout 10)))
+                                (list :status ':suspended :output "Review required"
+                                      :administrative-checkpoint '(:forged t)
+                                      :outcome ':review-required :yielded-p nil))
+                           (incf cleanups)))
+                       :terminal-result-function
+                       (lambda (job state result report)
+                         (incf publications)
+                         (when (eq mode ':cancel-after)
+                           (bt:signal-semaphore claimed)
+                           (assert (bt:wait-on-semaphore release :timeout 10)))
+                         (flet ((publish ()
+                                  (task-job--terminal-record job :state state :result result :report report)))
+                           (case mode
+                             (:artifact-storage
+                              (test-call-with-function-replacements
+                               (list (list 'task--write-result-artifact
+                                           (lambda (job result)
+                                             (declare (ignore job result))
+                                             (error 'task-error :tool-name "job.get"
+                                                    :message               "Injected artifact storage failure."))))
+                               #'publish))
+                             (:terminal-storage
+                              (let ((write (symbol-function 'task-continuity--write)))
+                                (test-call-with-function-replacements
+                                 (list (list 'task-continuity--write
+                                             (lambda (path record &key require-absent)
+                                               (if (equal "terminal.sexp" (file-namestring path))
+                                                   (error 'task-error :tool-name "job.get"
+                                                          :message               "Injected terminal storage failure.")
+                                                   (funcall write path record :require-absent require-absent)))))
+                                 #'publish)))
+                             (otherwise
+                              (publish)))))
+                       :initargs
+                       (list :orchestrator orchestrator :execution-identifier (make-user-identifier)
+                             :definition        (task-job-definition template)
+                             :item              (list :agent "task" :task "Inspect checkpoint publication" :async t)
+                             :parent-agent parent :mission-context origin :detached-p t
+                             :completion-owner-conversation
+                             (conversation-identifier (agent-conversation parent))
+                             :completion-policy ':continue)))))))
+       (unwind-protect
+            (progn
+              (task-continuity-record-job job parent)
+              (bt:signal-semaphore start)
+              (assert (bt:wait-on-semaphore captured :timeout 10))
+              (case mode
+                (:cancel-before
+                 (test-assert (job-cancel job :reason ':requested)
+                              "Accepted cancellation before publication wins")
+                 (bt:signal-semaphore release))
+                (:cancel-after
+                 (assert (bt:wait-on-semaphore claimed :timeout 10))
+                 (test-assert (not (job-cancel job :reason ':requested))
+                              "The library refuses cancellation after its publication claim")
+                 (bt:signal-semaphore release)))
+              (multiple-value-bind (snapshot terminal-p) (job-await job :timeout-seconds 10)
+                (assert terminal-p)
+                (test-assert (= 1 bodies cleanups publications)
+                             "The actual body, unwind cleanup and terminal callback run once")
+                (funcall inspect parent orchestrator job snapshot)))
+         (bt:signal-semaphore start)
+         (bt:signal-semaphore release)
+         (task-completion-release parent))))))
+
+(-> test-task-checkpoint-publication () null)
+(defun test-task-checkpoint-publication ()
+  "Preserve trusted suspension through artifacts, live projection and fresh artifact-only recovery."
+  (task-checkpoint-tests--publication
+   ':trusted
+   (lambda (parent orchestrator job snapshot)
+     (let* ((result    (getf snapshot :result))
+            (entry     (task-continuity--find parent (session-job-execution-identifier job)))
+            (directory (uiop:pathname-directory-pathname (pathname (getf entry :path))))
+            (record    (getf entry :record))
+            (artifact  (task--read-result-artifact (merge-pathnames "result.sexp" directory)))
+            (live      (task-completion--snapshot
+                        job snapshot :root (uiop:pathname-parent-directory-pathname directory)))
+            (notice    (task-completion--notice
+                        (list :payload (cl-jobpond:completion-event live)))))
+       (test-assert (and (eq ':aborted (getf snapshot :state))
+                         (null (getf snapshot :cancellation-reason))
+                         (task-review-required-result-p result :record record))
+                    "Trusted administrative publication is physically aborted without cancellation")
+       (test-assert (task-review-required-result-p artifact :record record)
+                    "The full artifact retains the validated checkpoint")
+       (test-assert (eq ':review-required (getf notice :outcome))
+                    "The host live boundary overrides the library's physical cancellation outcome")
+       (test-assert (eq ':review-required
+                         (getf (task-continuity-classify entry parent orchestrator) :classification))
+                    "Live continuity classifies suspension before generic completion")
+       (delete-file (merge-pathnames "terminal.sexp" directory))
+       (let* ((registry (task-augment-tool-registry
+                         (make-default-tool-registry :configuration (agent-configuration parent))))
+              (restored (agent-create :configuration (agent-configuration parent)
+                                      :provider      (agent-provider parent)
+                                      :conversation  (agent-conversation parent)
+                                      :tool-registry registry :worker nil))
+              (fresh    (task-run-tool-orchestrator (tool-registry-find registry "task" "run"))))
+         (unwind-protect
+              (progn
+                (task-completion-restore restored)
+                (let ((pending (task-completion-pending restored)))
+                  (test-assert (and (= 1 (length pending))
+                                    (eq ':review-required (getf (first pending) :outcome))
+                                    (eq ':aborted (getf (first pending) :execution-state)))
+                               "A fresh runtime restores artifact-only suspension for notification"))
+                (test-assert (null (task-orchestrator-list-jobs fresh))
+                             "Artifact-only restoration dispatches no job")
+                (test-assert
+                 (task-continuity-tests--refused-p
+                  (lambda ()
+                    (task-continuity-revive
+                     (make-instance 'tool-context :configuration (agent-configuration restored)
+                                    :agent restored :registry registry)
+                     fresh (session-job-execution-identifier job) :authorized-p t)))
+                 "Even explicit revive authorization cannot replay suspended authority"))
+           (task-completion-release restored)
+           (task-orchestrator-close fresh))))))
+  nil)
+
+(-> test-task-checkpoint-publication-refusals () null)
+(defun test-task-checkpoint-publication-refusals ()
+  "Reject forged or stale authority and preserve the library's cancellation linearization."
+  (dolist (mode '(:forged :owners :generation :mission-id :execution-id :run-token :attempt :stale
+                  :cancel-before :cancel-after :checkpoint-storage))
+    (task-checkpoint-tests--publication
+     mode
+     (lambda (parent orchestrator job snapshot)
+       (declare (ignore parent orchestrator job))
+       (let ((result (getf snapshot :result)))
+         (if (member mode '(:cancel-after :checkpoint-storage))
+             (progn
+               (test-assert (task-review-required-result-p result)
+                            "Valid retained authority preserves review-required")
+               (when (eq mode ':checkpoint-storage)
+                 (test-assert (not (getf result :durable-checkpoint-p))
+                              "An unwritten checkpoint makes no durability promise")))
+             (test-assert (not (task-review-required-result-p result))
+                          "Raw or mismatched evidence cannot mint suspension"))
+         (when (eq mode ':cancel-before)
+           (test-assert (and (eq ':aborted (getf snapshot :state))
+                             (eq ':requested (getf snapshot :cancellation-reason))
+                             (eq ':aborted (getf result :status)))
+                        "Accepted user cancellation is not mislabelled as review-required"))))))
+  nil)
+
+(-> test-task-checkpoint-publication-storage () null)
+(defun test-task-checkpoint-publication-storage ()
+  "Keep the primary suspension and consistent durability across storage failures."
+  (dolist (mode '(:artifact-storage :terminal-storage))
+    (task-checkpoint-tests--publication
+     mode
+     (lambda (parent orchestrator job snapshot)
+       (declare (ignore orchestrator))
+       (let* ((result        (getf snapshot :result))
+              (entry         (task-continuity--find parent (session-job-execution-identifier job)))
+              (directory     (uiop:pathname-directory-pathname (pathname (getf entry :path))))
+              (artifact-path (merge-pathnames "result.sexp" directory))
+              (terminal-path (merge-pathnames "terminal.sexp" directory))
+              (disk          (if (probe-file artifact-path)
+                                 (task--read-result-artifact artifact-path)
+                                 (getf (task-continuity--read terminal-path) :result))))
+         (test-assert (and (task-review-required-result-p result)
+                           (eq ':aborted (getf snapshot :state))
+                           (getf result :persistence-failed))
+                      "Secondary storage failure does not replace the primary administrative outcome")
+         (test-assert (equal (getf result :administrative-checkpoint)
+                             (getf disk :administrative-checkpoint))
+                      "Surviving disk evidence and live publication agree on checkpoint durability")
+         (test-assert (task-review-required-result-p disk :record (getf entry :record))
+                      "Surviving fallback storage retains exact durable ownership")
+         (test-assert (eq (getf result :persistence-failure-phase)
+                          (if (eq mode ':artifact-storage) ':artifact ':terminal-metadata))
+                      "The secondary failure identifies its exact storage phase")))))
+  nil)
+
+(defmethod task-checkpoint-lineage-current-p ((context task-checkpoint-test-context) job publication-p)
+  "S2 publication tests provide an explicit host authority protocol without S3 mission scopes."
+  (declare (ignore context job publication-p))
+  t)

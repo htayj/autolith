@@ -1,5 +1,12 @@
 ;;;; -- Autolith Systems --
 
+;; Direct ASDF callers participate in an explicit dependency candidate selection.
+;; Ordinary source and minimal recovery retain their existing setup when none is selected.
+(let ((root (uiop:pathname-directory-pathname *load-truename*)))
+  (unless (fboundp 'cl-user::autolith-setup-dependency-sources)
+    (load (merge-pathnames "script/production-dependencies.lisp" root)))
+  (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources root))
+
 (defclass autolith-source-file (asdf:cl-source-file)
   ()
   (:documentation "An Autolith source file, loaded without SBCL's self-redeclaration reports."))
@@ -275,6 +282,7 @@
                                           (:file "inference/environment")
                                           (:file "task/agents")
                                           (:file "task/state")
+                                          (:file "task/execution-lease")
                                           (:file "task/runtime")
                                           (:file "task/child")
                                           (:file "task/notes")
@@ -323,6 +331,7 @@
                                           (:file "application/conversation-maintenance")
                                           (:file "world/application")
                                           (:file "application/mission")
+                                          (:file "application/mission-lease")
                                           (:file "application/mission-candidate-accounting")
                                           (:file "application/mission-inference")
                                           (:file "application/mission-gates")

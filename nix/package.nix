@@ -57,9 +57,14 @@ let
   qlotSourcesWithoutBuildMetadata =
     lib.subtractLists qlotLibrariesWithBuildMetadata (builtins.attrNames qlotGitSources);
 
+  dependencyRepairs = import ./dependency-repairs.nix { inherit pkgs src; };
+
   # Override the package scope so Dexador and every other transitive consumer
   # use the locked CL+SSL source, rather than a second Quicklisp copy.
   lispPackages = pkgs.sbclPackages.overrideScope (final: previous: {
+    babel = previous.babel.overrideAttrs (dependencyRepairs.override "babel");
+    yason = previous.yason.overrideAttrs (dependencyRepairs.override "yason");
+    cffi = previous.cffi.overrideAttrs dependencyRepairs.overrideCffi;
     cl_plus_ssl = previous.cl_plus_ssl.overrideAttrs {
       version = qlotVersion "cl+ssl";
       src = qlotSource "cl+ssl";
@@ -78,7 +83,7 @@ let
     pname = "defingerprinter";
     version = qlotVersion "defingerprinter";
     src = defingerprinterSource;
-    lispLibs = with pkgs.sbclPackages; [ cffi babel bordeaux-threads ];
+    lispLibs = with lispPackages; [ cffi babel bordeaux-threads ];
   };
 
   # Import upstream packaging from the same locked checkout as the Lisp binding.
@@ -709,6 +714,11 @@ let
               (error "No Nix ASDF mapping exists for ~A" source-root))
             (setf (second entry) (format nil "~A//" cache-root))
             (asdf:initialize-output-translations configuration))))
+      (defparameter cl-user::*autolith-packaged-dependency-repair*
+        '(:identity "${dependencyRepairs.identity}" :kind :nix
+          :asds (#P"${lispPackages.babel}/babel.asd"
+                 #P"${lispPackages.yason}/yason.asd"
+                 #P"${lispPackages.cffi}/cffi.asd")))
       (defpackage #:ql
         (:use #:cl)
         (:export #:quickload))
@@ -748,6 +758,10 @@ let
 
   imageIdentity = pkgs.writeText "autolith-image-identity" ''
     ${autolithSystem}
+    ${dependencyRepairs.identity}
+    ${lispPackages.babel}
+    ${lispPackages.yason}
+    ${lispPackages.cffi}
   '';
 
   # The test system and FiveAM are development dependencies. Only the flake's

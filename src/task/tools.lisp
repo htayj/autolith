@@ -498,6 +498,7 @@ CACHE, when supplied, belongs to one caller snapshot, including negative reads."
                                               :artifact-available-p artifact-available-p)
                  :artifact               artifact))))
     (append
+     (task-checkpoint-projection result)
      (list :id                  (getf snapshot :job-id)
            :execution-id        (getf snapshot :execution-id)
            :type                :task
@@ -714,7 +715,7 @@ jobs return three NIL values; each frontend owns its error and presentation."
                    :state        (case (getf result :status)
                                    (:success
                                     ':completed)
-                                   (:aborted
+                                   ((:aborted :suspended)
                                     ':aborted)
                                    (otherwise
                                     ':failed))

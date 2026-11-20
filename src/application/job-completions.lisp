@@ -21,6 +21,7 @@ A completion for a different owner is recorded without starting a turn."
                   (conversation-adopted-participant conversation))
            (eq (getf notice :completion-policy) ':continue)
            (application-world-agent-present-p application)
+           (not (eq (getf notice :outcome) ':review-required))
            (cond
              (mission-id
               (and (mission-goal-p goal)

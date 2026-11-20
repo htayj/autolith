@@ -33,6 +33,9 @@
                     :reservation-charged-tokens :reservation-charge-requests
                     :conversation-file :detached :output-path
                     :undelivered-prompt-count :agent-definition
+                    :administrative-checkpoint :outcome :execution-state :next-action
+                    :cursor :durable-checkpoint-p :persistence-failed :persistence-failure-phase
+                    :persistence-correction-failed :review-required-evidence :accounting-report
                     :worktree :worktree-artifact-path :worktree-error)
                 append (list field (getf result field))))
         (storage (if artifact-available-p :artifact :omitted)))
@@ -180,9 +183,10 @@ rebuilt while the role is still available, the artifact is written before the re
 is compacted, and the parent session and borrowed capabilities are dropped last.
 
 The child's reported status decides the terminal state, since the pool only sees
-that a body returned. An artifact that cannot be written downgrades the state to
-:FAILED rather than claiming a success whose output nobody can find."
+that a body returned. Persistence failure downgrades a noncancelled ordinary
+result to :FAILED; accepted cancellation keeps its initiating cause and :ABORTED."
   (let* ((undelivered-prompt-count (task-job-close-steering job))
+         (checkpoint               (task-job--checkpoint-data job))
          (reported                 (and (listp result) (getf result :status)))
          (final-state              (case reported
                                      (:success
@@ -191,8 +195,10 @@ that a body returned. An artifact that cannot be written downgrades the state to
                                       :aborted)
                                      (:failed
                                       :failed)
-                                     (otherwise
-                                      state)))
+                                    (:suspended
+                                     :failed)
+                                    (otherwise
+                                     state)))
          (final-result             (and (listp result) (copy-list result)))
          (final-report             report)
          (definition-summary
@@ -208,24 +214,63 @@ that a body returned. An artifact that cannot be written downgrades the state to
                                  (or final-report "The child produced no result."))
             final-state
             (if (eq final-state :completed) :failed final-state)))
+    ;; Returned fields cannot mint host authority, even on an otherwise valid result.
+    (dolist (key '(:administrative-checkpoint :outcome :execution-state :next-action
+                   :cursor :durable-checkpoint-p :persistence-failed :persistence-failure-phase
+                   :persistence-correction-failed :review-required-evidence :accounting-report))
+      (remf final-result key))
+    (let ((candidate (task-job-administrative-checkpoint job)))
+      (when (task-administrative-checkpoint-p candidate)
+        (setf (getf final-result :review-required-evidence)
+              (copy-tree (task-administrative-checkpoint-data candidate)))))
+    (unless checkpoint
+      (let ((partial (task-controller-review-report (task-job-mission-context job) job)))
+        (when partial
+          (setf final-state ':aborted
+                (getf final-result :review-required-evidence) partial
+                (getf final-result :outcome) ':review-required
+                (getf final-result :execution-state) ':unresolved))))
+    (let ((accounting (task-controller-accounting-report (task-job-mission-context job) job)))
+      (when accounting
+        (setf (getf final-result :accounting-report) accounting)))
+    (when (job-cancellation-reason job)
+      (setf final-state ':aborted))
+    (when checkpoint
+      (setf final-state ':aborted
+            final-report nil
+            (getf final-result :id) (getf checkpoint :job-id)
+            (getf final-result :yielded-p) nil
+            (getf final-result :administrative-checkpoint) checkpoint
+            (getf final-result :outcome) ':review-required
+            (getf final-result :execution-state) ':aborted
+            (getf final-result :next-action) ':review-required
+            (getf final-result :cursor) (copy-tree (getf checkpoint :cursor))
+            (getf final-result :durable-checkpoint-p) (getf checkpoint :durable-checkpoint-p)))
+    (when (and checkpoint (getf (getf checkpoint :cursor) :persistence-failed))
+      (setf (getf final-result :persistence-failed) t
+            (getf final-result :persistence-failure-phase) ':checkpoint
+            (getf final-result :error) "Review checkpoint cursor persistence failed."))
     (loop for (key value) on (mission-task-job-accounting-summary job) by (lambda (tail) (rest (rest tail)))
           do (setf (getf final-result key) value))
     (when (plusp undelivered-prompt-count)
       (setf (getf final-result :undelivered-prompt-count)
             undelivered-prompt-count))
     (setf (getf final-result :status)
-          (case final-state
-            (:completed
-             :success)
-            (:aborted
-             :aborted)
-            (otherwise
-             :failed))
+          (if checkpoint ':suspended
+              (case final-state
+                (:completed
+                 :success)
+                (:aborted
+                 :aborted)
+                (otherwise
+                 :failed)))
           (getf final-result :agent-definition) definition-summary)
     (setf final-result (task-worktree-finalize-result job final-result))
-    (when (and (eq final-state ':completed)
-               (eq (getf final-result :status) ':failed))
-      (setf final-state ':failed))
+    (when (or (and (eq final-state ':completed) (eq (getf final-result :status) ':failed))
+              (and checkpoint (getf final-result :worktree-error)))
+      (setf final-state ':failed
+            checkpoint nil
+            (getf final-result :status) ':failed))
     (handler-case
         (setf final-result
               (append final-result
@@ -233,14 +278,27 @@ that a body returned. An artifact that cannot be written downgrades the state to
                             (namestring
                              (task--write-result-artifact job final-result)))))
       (error (condition)
-        (setf final-state :failed
-              (getf final-result :status) :failed
-              (getf final-result :error)
-              (format nil "Could not persist task artifact: ~A" condition)
-              final-report
-              (or final-report
-                  (bounded-string (princ-to-string condition)
-                                  :limit *task-retained-output-limit*)))))
+        (cond
+          (checkpoint
+           (setf (getf checkpoint :durable-checkpoint-p) nil
+                 (getf final-result :durable-checkpoint-p) nil
+                 (getf final-result :persistence-failed) t
+                 (getf final-result :persistence-failure-phase) ':artifact
+                 (getf final-result :error) "Review checkpoint artifact persistence failed."))
+          ((job-cancellation-reason job)
+           (setf final-state ':aborted
+                 (getf final-result :status) ':aborted
+                 (getf final-result :persistence-failed) t
+                 (getf final-result :persistence-failure-phase) ':artifact))
+          (t
+           (setf final-state :failed
+                 (getf final-result :status) :failed
+                 (getf final-result :error)
+                 (format nil "Could not persist task artifact: ~A" condition)
+                 final-report
+                 (or final-report
+                     (bounded-string (princ-to-string condition)
+                                     :limit *task-retained-output-limit*)))))))
     (setf final-result
           (task-job--compact-result final-result
                                     :artifact-available-p
@@ -250,11 +308,34 @@ that a body returned. An artifact that cannot be written downgrades the state to
                (bounded-string final-report
                                :limit *task-retained-output-limit*)))
     (when (session-job-completion-owner-conversation job)
-      (task-continuity-record-terminal
-       job (task-job-parent-agent job)
-       (list :status      (getf final-result :status)
-             :output-path (getf final-result :output-path))
-       :state final-state))
+      (handler-case
+          (task-continuity-record-terminal
+           job (task-job-parent-agent job) final-result :state final-state)
+        (error ()
+          (cond
+            (checkpoint
+             (setf (getf checkpoint :durable-checkpoint-p) nil
+                   (getf final-result :durable-checkpoint-p) nil
+                   (getf final-result :persistence-failed) t
+                   (getf final-result :persistence-failure-phase) ':terminal-metadata
+                   (getf final-result :error) "Review checkpoint continuity persistence failed.")
+             (handler-case
+                 (task-continuity--amend-checkpoint-publication
+                  job (task-job-parent-agent job) final-result)
+               (error ()
+                 (setf (getf final-result :persistence-correction-failed) t))))
+            ((job-cancellation-reason job)
+             (setf final-state ':aborted
+                   (getf final-result :status) ':aborted
+                   (getf final-result :persistence-failed) t
+                   ;; Retain both finite phases when both one-shot writers fail.
+                   (getf final-result :persistence-failure-phase)
+                   (if (eq (getf final-result :persistence-failure-phase) ':artifact)
+                       ':artifact-and-terminal-metadata ':terminal-metadata)))
+            (t
+             (setf final-state ':failed
+                   (getf final-result :status) ':failed
+                   (getf final-result :error) "Task continuity persistence failed."))))))
     (task-job--compact-progress job final-state)
     (setf (task-job-item job) (task-job--compact-item job)
           (task-job-definition-summary job) definition-summary
@@ -264,7 +345,8 @@ that a body returned. An artifact that cannot be written downgrades the state to
           (task-job-inherited-reference-p job) nil
           (task-job-inherited-reference-items job) nil
           (task-job-command-authorization-function job) nil
-          (task-job-tool-authorization-function job) nil)
+          (task-job-tool-authorization-function job) nil
+          (task-job-administrative-checkpoint job) nil)
     (values final-result final-report final-state)))
 
 (-> session-job--cancelled-ancestor-reason
@@ -294,7 +376,7 @@ caused by its agent moving or parking, is also ignored here."
   "Return the cancellation reason inherited by task JOB, or NIL."
   (session-job--cancelled-ancestor-reason job))
 
-(-> task-job--run (task-job) list)
+(-> task-job--run (task-job) (or list task-administrative-checkpoint))
 (defun task-job--run (job)
   "Run JOB's child agent on a pool worker and return its portable result.
 
@@ -386,22 +468,25 @@ The parent waits only its own cleanup budget; this execution remains running."
 (-> tool-execution-job--run (tool-execution-job) tool-result)
 (defun tool-execution-job--run (job)
   "Call JOB's operation exactly once after checking task ancestry."
-  (job-check-cancellation job)
-  (let ((reason (session-job--cancelled-ancestor-reason job)))
-    (when reason
-      (error 'job-aborted
-             :message
-             (format nil "Execution ~A was ~(~A~) with its parent."
-                     (session-job-identifier job) reason)
-             :identifier (job-identifier job)
-             :reason     reason)))
-  (let ((operation                    (tool-execution-job-operation-function job))
-        (*tool-execution-current-job* job))
-    (unless operation
-      (error 'tool-error
-             :message   "The asynchronous tool operation is no longer available."
-             :tool-name (tool-execution-job-tool-name job)))
-    (funcall operation)))
+  (execution-lease-call
+   (session-job-lease-ticket job) job
+   (lambda ()
+    (job-check-cancellation job)
+    (let ((reason (session-job--cancelled-ancestor-reason job)))
+      (when reason
+        (error 'job-aborted
+               :message
+               (format nil "Execution ~A was ~(~A~) with its parent."
+                       (session-job-identifier job) reason)
+               :identifier (job-identifier job)
+               :reason     reason)))
+    (let ((operation                    (tool-execution-job-operation-function job))
+          (*tool-execution-current-job* job))
+      (unless operation
+        (error 'tool-error
+               :message   "The asynchronous tool operation is no longer available."
+               :tool-name (tool-execution-job-tool-name job)))
+      (funcall operation)))))
 
 (-> tool-execution-job--terminal-record
     (tool-execution-job &key (:state keyword) (:result t) (:report (option string)))
@@ -516,11 +601,17 @@ condition report, and terminal state, as TOOL-EXECUTION-JOB--TERMINAL-RECORD doe
       (when (or (job-cancellation-requested-p parent-job)
                 (job-terminal-p parent-job))
         (task-orchestrator--refuse-cancelled-parent parent-job))))
-  (let* ((publications *shell-log-publications*)
-         (publication  nil)
+  (let* ((publications  *shell-log-publications*)
+         (publication   nil)
+         (context       (mission--agent-context parent-agent))
+         (lease-tickets nil)
          (session-order
-           (first (task-orchestrator-reserve-session-orders orchestrator 1)))
-         (identifier   (format nil "exec:~D" session-order))
+           (first (multiple-value-bind (orders tickets)
+                      (execution-lease-reserve
+                       context (lambda () (task-orchestrator-reserve-session-orders orchestrator 1)))
+                    (setf lease-tickets tickets)
+                    orders)))
+         (identifier    (format nil "exec:~D" session-order))
          (entry
           (list :function    (lambda (job)
                                (let ((*shell-log-publications*
@@ -581,7 +672,8 @@ condition report, and terminal state, as TOOL-EXECUTION-JOB--TERMINAL-RECORD doe
                  :root-identifier
                  (task-parent-root-conversation-identifier parent-agent)
                  :initargs
-                 (list :orchestrator         orchestrator
+                 (list :lease-ticket         (first lease-tickets)
+                         :orchestrator       orchestrator
                         :mission-context     (mission--agent-context parent-agent)
                        :execution-identifier (task-execution-identifier-generate
                                               (agent-configuration parent-agent)
@@ -740,8 +832,15 @@ that check atomic with cascading cancellation."
                (mission--admit context :inference-p nil :new-work-p t))
              context))
          (count                     (length entries))
+         (lease-tickets             nil)
          (session-orders
-           (task-orchestrator-reserve-session-orders orchestrator count))
+           (multiple-value-bind (orders tickets)
+               (execution-lease-reserve
+                mission-context
+                (lambda () (task-orchestrator-reserve-session-orders orchestrator count))
+                :count count)
+             (setf lease-tickets tickets)
+             orders))
          (root-conversation-identifier
            (task-parent-root-conversation-identifier parent-agent))
          (owner-identifiers         (task-parent-owner-identifiers parent-agent))
@@ -771,7 +870,7 @@ that check atomic with cascading cancellation."
              (agent-conversation parent-agent) reference-byte-limit)))
     (let ((pool-entries
             (mapcar
-             (lambda (entry session-order)
+             (lambda (entry session-order lease-ticket)
                 (let* ((item (getf entry :item))
                        (inherited-p
                          (not (null (gethash entry reference-enabled-entries))))
@@ -794,7 +893,8 @@ that check atomic with cascading cancellation."
                                                        (task-child-agent-job parent-agent))
                         :root-identifier          root-conversation-identifier
                         :initargs
-                        (list :orchestrator          orchestrator
+                        (list :lease-ticket          lease-ticket
+                              :orchestrator          orchestrator
                               :telemetry-run         (unless (getf entry :detached)
                                                        (or (getf entry :telemetry-run) *telemetry-run*))
                               :execution-identifier  (task-execution-identifier-generate
@@ -827,7 +927,8 @@ that check atomic with cascading cancellation."
                               :tool-authorization-function
                               tool-authorization-function))))
              entries
-             session-orders)))
+             session-orders
+             (or lease-tickets (make-list count)))))
       (let ((jobs
               (with-lock-held ((task-orchestrator-lock orchestrator))
                 (let ((reserved-count

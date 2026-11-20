@@ -1,0 +1,11 @@
+--- a/encode.lisp
++++ b/encode.lisp
+@@ -7,6 +7,8 @@
+ 
+ (in-package :yason)
+ 
++(declaim (special true false))
++
+ (defvar *json-output*)
+ 
+ (defparameter *default-indent* nil

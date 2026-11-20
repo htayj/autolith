@@ -37,6 +37,8 @@
           (or (and (not child-core) (first arguments))
               (uiop:getenv "AUTOLITH_ACTIVE_CORE")
               default-core))))
+  (load (merge-pathnames "script/production-dependencies.lisp" source-root))
+  (autolith-require-savable-dependency-sources)
   (load (merge-pathnames "script/runtime-requirement.lisp" source-root))
   (autolith-require-minimum-runtime version-pathname)
   (unless (probe-file project-setup)
@@ -44,6 +46,7 @@
   (format t "~&Loading Autolith for its preloaded active image.~%")
   (finish-output)
   (load project-setup)
+  (uiop:symbol-call '#:cl-user '#:autolith-setup-dependency-sources source-root)
   (load (merge-pathnames "script/build-sandbox.lisp" source-root))
   (uiop:symbol-call '#:ql '#:quickload :cffi :silent t)
   (let ((profile-library-directory

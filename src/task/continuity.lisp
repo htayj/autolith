@@ -29,6 +29,15 @@
     (when (> (utf8-string-length text) *task-continuity-maximum-octets*)
       (task-continuity--fail "Continuity metadata exceeds its readable UTF-8 size limit."
                              :code ':storage-limit))
+    (handler-case
+        (unless (sexp-store:plist-schema-p
+                 (sexp-config:read-source text (task--result-grammar))
+                 :keyword-keys-p t :maximum-length 128)
+          (task-continuity--fail "Continuity metadata is not a readable property record."
+                                 :code ':storage-shape))
+      (sexp-config:sexp-config-error ()
+        (task-continuity--fail "Continuity metadata is outside its bounded reader grammar."
+                               :code ':storage-shape)))
     (snapshot-write-text path text :require-absent require-absent)))
 
 (-> task-continuity--owner-executions (session-job agent) list)
@@ -214,6 +223,7 @@ The result is a list of at most one entry, so callers can append scans."
   "Project timing, reported usage and artifact locations without result bodies."
   (when result
     (append
+     (task-checkpoint-projection result)
      (loop for key in '(:status :label :error :request-count :duration-ms :conversation-file :worktree-artifact-path)
            append (list key (task--compact-native-value (getf result key) 1000)))
      (task--shell-log-reference-summary (getf result :shell-logs))
@@ -262,6 +272,15 @@ The result is a list of at most one entry, so callers can append scans."
              ((and live (not (job-terminal-p live)))
               ':live-owned-detached)
              (artifact-error
+              ':dead-needing-decision)
+             ((task-review-required-result-p
+               (or result (getf terminal :result)
+                   (and live (getf (job-snapshot live) :result))) :record record)
+              ':review-required)
+             ((eq (getf (or result (getf terminal :result)) :status) ':suspended)
+              ':dead-needing-decision)
+             ;; Ownership evidence is a no-replay fence even without terminal files.
+             ((member :administrative-checkpoint record)
               ':dead-needing-decision)
              ((or (and live (job-terminal-p live)) result terminal)
               ':completed)
@@ -435,6 +454,8 @@ require a new human decision rather than an automatic second attempt."
                                :classification)))
     (unless (and authorized-p (not (typep viewer 'task-child-agent)))
       (task-continuity--fail "Recovery requires explicit primary-owner authority." :code ':authority))
+    (when (member :administrative-checkpoint record)
+      (task-continuity--fail "Administrative suspension requires fresh mission authority, not revive."))
     (when (eq classification :live-owned-detached)
       (task-continuity--write
        (merge-pathnames "reattach.sexp" directory)
@@ -518,6 +539,35 @@ require a new human decision rather than an automatic second attempt."
                     :progress progress)))))
   nil)
 
+(-> task-continuity--amend-checkpoint-publication (task-job agent list) null)
+(defun task-continuity--amend-checkpoint-publication (job parent result)
+  "Correct surviving evidence after a terminal metadata failure within its writer claim.
+No new publication claim or spending authority is acquired. If correction also
+fails, unwritten failure details cannot be promised to a fresh reader."
+  (let* ((path     (task-continuity-record-job job parent))
+         (artifact (merge-pathnames "result.sexp" (uiop:pathname-directory-pathname path)))
+         (data     (task-job--checkpoint-data job)))
+    (when data
+      (setf (getf data :durable-checkpoint-p) nil))
+    (unless (and data (equal data (getf result :administrative-checkpoint)))
+      (task-continuity--fail "Checkpoint correction lacks originating authority."))
+    (with-lock-held ((task-orchestrator-artifact-lock (session-job-orchestrator job)))
+      (let ((record (task-continuity--read path)))
+        (setf (getf record :administrative-checkpoint) (copy-tree data))
+        (task-continuity--write path record))
+      (when (probe-file artifact)
+        (let ((stored (task--read-result-artifact artifact)))
+          (unless (and (task-review-required-result-p stored)
+                       (equal (getf stored :id) (session-job-identifier job))
+                       (equal (getf (getf stored :administrative-checkpoint) :execution-id)
+                              (session-job-execution-identifier job)))
+            (task-continuity--fail "Checkpoint correction belongs to another execution."))
+          (dolist (key '(:administrative-checkpoint :durable-checkpoint-p :persistence-failed
+                         :persistence-failure-phase :error))
+            (setf (getf stored key) (copy-tree (getf result key))))
+          (snapshot-write-text artifact (format nil "~A~%" (task--write-readable-sexp stored)))))))
+  nil)
+
 (-> task-continuity-record-terminal (session-job agent list &key (:state keyword)) null)
 (defun task-continuity-record-terminal (job parent result &key state)
   "Persist terminal metadata for an opaque asynchronous tool without replaying it."
@@ -529,6 +579,16 @@ require a new human decision rather than an automatic second attempt."
           (setf result (copy-list result)
                 (getf result :shell-logs) (getf metadata :shell-logs)
                 (getf result :shell-logs-omitted) (getf metadata :shell-logs-omitted)))))
+    (when (and (typep job 'task-job) (task-review-required-result-p result))
+      (let ((data (task-job--checkpoint-data job)))
+        (when (and data (getf result :persistence-failed))
+          (setf (getf data :durable-checkpoint-p) nil))
+        (unless (equal data (getf result :administrative-checkpoint))
+          (task-continuity--fail "Administrative checkpoint lacks its originating host authority."))
+        (with-lock-held ((task-orchestrator-artifact-lock (session-job-orchestrator job)))
+          (let ((record (task-continuity--read path)))
+            (setf (getf record :administrative-checkpoint) (copy-tree data))
+            (task-continuity--write path record)))))
     (task-continuity--write target (list :state state :result result
                                     :ended-at (get-universal-time)) :require-absent t))
   nil)
