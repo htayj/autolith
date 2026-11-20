@@ -56,6 +56,7 @@
                                   "script/build-recovery.lisp"
                                   "script/runtime-requirement.lisp"
                                   "script/windows-stat.lisp"
+                                  "recovery/bootstrap.lisp"
                                   "recovery/runtime.lisp"
                                   "script/trace-context.lisp"
                                   "recovery/launcher.lisp"
@@ -80,6 +81,7 @@
                        :source-clean-p
                        (uiop:symbol-call '#:sbcl-generations '#:source-clean-p
                                          source :paths paths)
+                       :bootstrap-blob              (file-identity "recovery/bootstrap.lisp")
                        :runtime-blob                (file-identity "recovery/runtime.lisp")
                        :trace-context-source-blob
                        (file-identity "script/trace-context.lisp")

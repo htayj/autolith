@@ -1522,6 +1522,9 @@
   test-image-commit-replay-probe)
 
 (define-test-suite recovery
+  test-recovery-bootstrap-authority
+  test-recovery-bootstrap-refusal
+  test-recovery-bootstrap-dependency-errors
   test-recovery-launcher-trace-context
   test-recovery-object-store-copy
   test-recovery-xdg-directories

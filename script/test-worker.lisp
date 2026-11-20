@@ -20,7 +20,8 @@
   (sort
    (remove-duplicates
     (append (uiop:symbol-call '#:autolith '#:active-image-source-paths source-root)
-            '("script/check.lisp" "script/test-worker.lisp" "script/roots.lisp")
+            '("recovery/bootstrap.lisp" "recovery/runtime.lisp"
+              "script/check.lisp" "script/test-worker.lisp" "script/roots.lisp")
             (mapcar (lambda (pathname) (enough-namestring pathname source-root))
                     (uiop:symbol-call '#:autolith '#:source-lisp-pathnames
                                       (merge-pathnames "tests/" source-root))))
