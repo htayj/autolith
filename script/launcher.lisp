@@ -513,7 +513,10 @@ before deleting the listed directories."
              (launcher-refresh-sandbox)
              (launcher-run (apply #'launcher-active-source-command context arguments))))
       (cond
-        ((launcher-request-from-source-p request)
+        ((or (launcher-request-from-source-p request)
+             ;; Prepared providers cannot supply a compatible saved active image.
+             (let ((selection (uiop:getenv "AUTOLITH_DEPENDENCY_SELECTION")))
+               (and selection (plusp (length selection)))))
          (run-source))
         ((launcher-active-image-valid-p context)
          (run-core))
