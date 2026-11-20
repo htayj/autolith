@@ -2301,6 +2301,7 @@
   test-mission-inference-unknown-usage-policy-settlement
   test-mission-inference-unknown-usage-policy-limits
   test-mission-inference-unknown-usage-policy-restore
+  test-mission-inference-policy-process-death
   test-mission-inference-unknown-usage-policy-fail-closed
   test-mission-inference-unknown-usage-policy-review
   test-job-completion-controller-unknown-usage-policy)
@@ -2468,3 +2469,12 @@
   test-mission-child-goal-fault-evidence
   test-mission-child-notice-fault-evidence
     test-mission-accounting-cutover-races)
+
+(define-test-suite conversation-writer-boundaries
+  test-conversation-writer-aliases
+  test-conversation-writer-sequence-faults
+  test-conversation-writer-alternation
+  test-conversation-writer-stale-checkpoints
+  test-conversation-writer-semantic-replay
+  test-conversation-writer-source-faults
+  test-conversation-writer-append-uncertainty)
