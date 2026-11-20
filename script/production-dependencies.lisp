@@ -9,7 +9,7 @@
                          (uiop:pathname-directory-pathname *load-truename*))))
 
 (defparameter *autolith-dependency-repair-identity*
-  "0ebec4f0a3b3ed5d9a5a62fa7207d4c3a594359c3ef2f54bddfc909e382c9531"
+  "4b956fb21e6afa662f0e8e9e2d1a5087c3f133a01d85c7995a33307b1e703e33"
   "Source-owned manifest identity; verify alongside the Nix JSON projection.")
 
 (defvar *autolith-dependency-selection* nil
