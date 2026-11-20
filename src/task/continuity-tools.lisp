@@ -45,7 +45,7 @@ Offsets refer to execution-ID order in the current inventory, not a snapshot."
       (loop for row in (nthcdr start rows)
             for trial = (append selected (list row))
             repeat limit
-            if (<= (length (task--write-readable-sexp (page trial)))
+            if (<= (task--readable-sexp-character-count (page trial))
                    *task-tool-content-limit*)
               do (setf selected trial)
             else do (when (null selected)

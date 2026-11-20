@@ -1592,6 +1592,8 @@
   test-task-agent-discovery-precedence
   test-task-agents-tool
   test-task-tool-default-argument-types
+  test-task-readable-character-count
+  test-task-character-count-stream
   test-task-child-steering-mailbox
   test-task-child-messaging)
 

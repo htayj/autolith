@@ -282,3 +282,83 @@ Repeated subtrees are copied independently; cyclic conses signal TASK-ERROR."
                      :escape   t
                      :circle   nil
                      :pretty   pretty-p)))
+
+
+;;;; -- Readable Character Measurement --
+
+(defclass task-character-count-stream (trivial-gray-streams:fundamental-character-output-stream)
+  ((count
+    :initform      0
+    :accessor      task-character-count-stream-count
+    :documentation "The number of characters written, without retained text.")
+   (column
+    :initform      0
+    :accessor      task-character-count-stream-column
+    :documentation "Characters since the last newline, as in a string output stream."))
+  (:documentation "A synchronous counting sink for non-pretty task measurements."))
+
+(defclass task-readable-string-proxy ()
+  ((value
+    :initarg       :value
+    :reader        task-readable-string-proxy-value
+    :documentation "The original string leaf, borrowed only during measurement."))
+  (:documentation "A temporary printer view of a normalized CHARACTER string."))
+
+(defmethod trivial-gray-streams:stream-write-char
+    ((stream task-character-count-stream) character)
+  "Count CHARACTER and update the string-stream column."
+  (incf (task-character-count-stream-count stream))
+  (setf (task-character-count-stream-column stream)
+        (if (char= character #\Newline)
+            0
+            (1+ (task-character-count-stream-column stream))))
+  character)
+
+(defmethod trivial-gray-streams:stream-write-string
+    ((stream task-character-count-stream) string &optional (start 0) end)
+  "Count the selected range without copying STRING, including empty ranges."
+  (let* ((end     (or end (length string)))
+         (newline (position #\Newline string :start start :end end :from-end t)))
+    (incf (task-character-count-stream-count stream) (- end start))
+    (setf (task-character-count-stream-column stream)
+          (if newline
+              (- end newline 1)
+              (+ (task-character-count-stream-column stream) (- end start)))))
+  string)
+
+(defmethod trivial-gray-streams:stream-line-column ((stream task-character-count-stream))
+  "Return the logical column used by line-sensitive atom printers."
+  (task-character-count-stream-column stream))
+
+(defmethod print-object ((proxy task-readable-string-proxy) stream)
+  "Emit normalized quoted string syntax without a CHARACTER-array copy."
+  (write-char #\" stream)
+  (loop for character across (task-readable-string-proxy-value proxy)
+        do (when (or (char= character #\") (char= character #\\))
+             (write-char #\\ stream))
+           (write-char character stream))
+  (write-char #\" stream)
+  proxy)
+
+(-> task--readable-sexp-character-count (t) (integer 0))
+(defun task--readable-sexp-character-count (value)
+  "Count normalized non-pretty readable VALUE without retaining its text.
+
+Direct string visits borrow leaves through private proxies. Other atoms use
+their ordinary printers, whose internal allocation is not bounded here."
+  (with-standard-io-syntax
+    (let ((mapped
+            (handler-case
+                (portable-value-map
+                 value
+                 (lambda (item child)
+                   (declare (ignore child))
+                   (if (stringp item)
+                       (make-instance 'task-readable-string-proxy :value item)
+                       item)))
+              (portable-value-error ()
+                (error 'task-error :tool-name "child.spawn"
+                       :message               "Task result data is cyclic or exceeds its structural bounds.")))))
+      (with-open-stream (stream (make-instance 'task-character-count-stream))
+        (write mapped :stream stream :readably t :escape t :circle nil :pretty nil)
+        (task-character-count-stream-count stream)))))

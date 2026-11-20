@@ -99,7 +99,7 @@
 (-> task--compact-native-value (t integer) t)
 (defun task--compact-native-value (value limit)
   "Return native VALUE or a descriptor when its readable form exceeds LIMIT."
-  (let ((characters (length (task--write-readable-sexp value))))
+  (let ((characters (task--readable-sexp-character-count value)))
     (if (<= characters limit)
         value
         (list :omitted :characters characters))))

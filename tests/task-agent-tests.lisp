@@ -1446,3 +1446,90 @@
       (platform-delete-directory-tree *platform* root :validate t
                                      :if-does-not-exist         ':ignore)))
   nil)
+
+
+;;;; -- Readable Summary Measurements --
+
+(defclass task-tests-count-printer ()
+  ((emit
+    :initarg       :emit
+    :reader        task-tests-count-printer-emit
+    :documentation "The synchronous printer operation to exercise."))
+  (:documentation "An opaque atom for stream-sensitive measurement controls."))
+
+(defmethod print-object ((object task-tests-count-printer) stream)
+  "Exercise the ordinary atom printer on both serialization and counting sinks."
+  (funcall (task-tests-count-printer-emit object) stream)
+  object)
+
+(-> test-task-readable-character-count () null)
+(defun test-task-readable-character-count ()
+  "Match normalized syntax, opaque printer columns, errors and large shared leaves."
+  (let* ((base      (make-array 9 :element-type 'base-char :initial-contents "a\"\\bcdefg"))
+         (wide      (make-array 9 :element-type 'character :initial-contents base))
+         (displaced (make-array 5 :element-type 'character :displaced-to wide
+                                 :displaced-index-offset 1))
+         (filled    (make-array 9 :element-type 'character :initial-contents wide :fill-pointer 4))
+         (printer   (make-instance 'task-tests-count-printer
+                                  :emit (lambda (stream)
+                                          (fresh-line stream)
+                                          (format stream "~10T:atom"))))
+         (values    (list nil t :|Mixed keyword| 'task--write-readable-sexp
+                          22/7 #c(3/7 5/11) "" base wide displaced filled
+                          (list 'quote (cons base :tail))
+                          (vector base wide)
+                          (list (format nil "a~C~Cb" #\Tab #\Return) printer)
+                          (list (format nil "a~%b") printer))))
+    (let ((*print-pretty* t) (*print-escape* nil) (*print-readably* nil)
+          (*print-base* 16) (*print-case* ':downcase) (*package* (find-package :keyword)))
+      (dolist (value values)
+        (test-assert (= (length (task--write-readable-sexp value))
+                        (task--readable-sexp-character-count value))
+                     "Measurement matches normalized serialization under standard I/O bindings")))
+    (let* ((leaf       (make-string 65536 :initial-element #\"))
+           (value      (make-list 32 :initial-element leaf))
+           (characters (+ 1 (* 32 (+ 3 (* 2 (length leaf)))))))
+      (test-assert (= characters (task--readable-sexp-character-count value))
+                   "Repeated shared leaves count independently with every escape")
+      (test-assert (eq value (task--compact-native-value value characters))
+                   "An exact limit retains the original value")
+      (test-assert (equal (list :omitted :characters characters)
+                          (task--compact-native-value value (1- characters)))
+                   "One-character overflow reports the exact count"))
+    (let ((captured nil)
+          (original nil))
+      (setf original
+            (make-instance 'task-tests-count-printer
+                           :emit (lambda (stream)
+                                   (setf captured stream)
+                                   (error 'print-not-readable :object original))))
+      (test-assert
+       (handler-case (progn (task--readable-sexp-character-count (list base original)) nil)
+         (print-not-readable (condition)
+           (eq original (print-not-readable-object condition))))
+       "Opaque printer errors retain their actual condition and original object")
+      (test-assert (not (open-stream-p captured))
+                   "A printer failure closes the synchronous counting sink")))
+  nil)
+
+(-> test-task-character-count-stream () null)
+(defun test-task-character-count-stream ()
+  "Check stream return values, selected ranges, empty writes and string-stream columns."
+  (with-open-stream (stream (make-instance 'task-character-count-stream))
+    (let ((text (format nil "xxa~%b~C~Cyy" #\Tab #\Return)))
+      (test-assert (eq text (write-string text stream :start 2 :end 7))
+                   "WRITE-STRING returns its original string")
+      (test-assert (and (= 5 (task-character-count-stream-count stream))
+                        (= 3 (trivial-gray-streams:stream-line-column stream)))
+                   "Only newline resets the character string-stream column")
+      (test-assert (eq text (write-string text stream :start 4 :end 4))
+                   "An empty range returns its original string")
+      (test-assert (and (= 5 (task-character-count-stream-count stream))
+                        (= 3 (trivial-gray-streams:stream-line-column stream)))
+                   "An empty range does not change count or column")
+      (test-assert (char= #\Newline (write-char #\Newline stream))
+                   "WRITE-CHAR returns its input character")
+      (test-assert (and (= 6 (task-character-count-stream-count stream))
+                        (zerop (trivial-gray-streams:stream-line-column stream)))
+                   "A newline increments the count and resets the column")))
+  nil)
