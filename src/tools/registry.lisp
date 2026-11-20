@@ -460,6 +460,16 @@
   (:method ((result tool-result))
     (slot-value result 'details)))
 
+(defgeneric tool-result-completion-projection (result)
+  (:documentation
+   "Return an owned pure producer-thread snapshot, or NIL to keep legacy delivery.
+Builtin opt-in requires exact classes and unchanged reviewed method closures.
+Successful snapshots preserve values, not identity; their metadata is read-only.
+Extensions retain completion-thread accessor invocation and error timing.")
+  (:method (result)
+    (declare (ignore result))
+    nil))
+
 (-> tool-result--normalize-content-blocks (list) list)
 (defun tool-result--normalize-content-blocks (blocks)
   "Validate BLOCKS and bound their aggregate model-visible text."
