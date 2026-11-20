@@ -2216,3 +2216,104 @@
            (test-assert (and (= checkpoints 1) (plusp copies) (= renders 31))
                         "semantic publication alone checkpoints its recoverable mutation"))))))
   nil)
+
+(-> fullscreen-test--application-widget-insertion
+    (&key (:kind keyword) (:needle string) (:expected string) (:cursor integer)) null)
+(defun fullscreen-test--application-widget-insertion (&key kind needle expected cursor)
+  "Click a real KIND widget through the application bridge into a non-end draft."
+  (with-test-configuration (configuration)
+    (let* ((terminal    (make-instance 'recording-terminal :columns 120 :rows 20))
+           (ui          (fullscreen-test--ui terminal))
+           (application (make-instance 'application :configuration configuration
+                                                   :conversation   (conversation-create configuration)
+                                                   :ui             ui))
+           (controller  (make-instance 'application-input-controller
+                                       :application application :main-thread (current-thread))))
+      (setf (application-input-controller application) controller)
+      (with-terminal-ui (active ui)
+        (application-connect-transcript-actions application)
+        (ecase kind
+          (:cancel
+           (terminal-ui-set-command-activities
+            active '((:id "exec:7" :type :tool :index 7 :tool "shell.run"
+                      :description "Build 中文 release" :state :running :detached t))))
+          (:memory
+           (application-present application
+                                (application--related-memories-notice 1 :ids '("K8vQ2mp")))
+           (terminal-ui-resize active 40 :rows 20)
+           (terminal-ui-resize active 120 :rows 20)))
+        (terminal-ui-set-input active "abcd")
+        (terminal-ui-edit-input active ':left)
+        (terminal-ui-edit-input active ':left)
+        (test-assert (= 2 (line-editor-cursor (terminal-ui-editor active)))
+                     "the draft cursor starts between b and c")
+        (with-lock-held ((application-input-controller-lock controller))
+          (test-assert
+           (every #'deque-empty-p
+                  (list (application-input-controller-work-items controller)
+                        (application-input-controller-initial-work-items controller)
+                        (application-input-controller-steering-items controller)
+                        (application-input-controller-steering-in-flight-items controller)
+                        (application-input-controller-pending-apply-items controller)))
+           "the attached controller starts without accepted work"))
+        (let* ((queued        (copy-tree (terminal-ui-queued-input-previews active)))
+               (steering      (copy-tree (terminal-ui-steering-input-previews active)))
+               (frame         (map 'list #'clinedi:ansi-strip (fullscreen-test--frame active)))
+               (row           (position-if (lambda (text) (search needle text)) frame))
+               (text          (and row (nth row frame)))
+               (start         (and text (search needle text)))
+               (events        nil)
+               (process-event (symbol-function 'terminal-ui-process-event)))
+          (test-assert start "the real widget is painted and hit-testable")
+          (when start
+            (let ((column (1+ (terminal--spans-width
+                               (list (terminal-span ':plain (subseq text 0 start)))))))
+              (test-call-with-function-replacements
+               (list (list 'terminal-ui-process-event
+                           (lambda (received event)
+                             (let ((result (multiple-value-list (funcall process-event received event))))
+                               (push (list event result) events)
+                               (values-list result)))))
+               (lambda ()
+                 (multiple-value-bind (action payload)
+                     (fullscreen-test--click active column (1+ row))
+                   (test-assert (and (eq action ':changed) (null payload))
+                                "release changes the draft without submitting or queuing"))))
+              (test-assert
+               (equal (reverse events)
+                      (list (list (list ':click column (1+ row)) '(:changed nil))
+                            (list (list ':release column (1+ row)) '(:changed nil))))
+               "both actual pointer packets traverse process-event in order")))
+          (test-assert (equal expected (line-editor-text (terminal-ui-editor active)))
+                       "the complete call is inserted between the original draft halves")
+          (test-assert (= cursor (line-editor-cursor (terminal-ui-editor active)))
+                       "the cursor follows the insertion rather than the original suffix")
+          (test-assert (null (terminal-ui-pending-action active))
+                       "dispatch clears the pending action")
+          (test-assert (and (equal queued (terminal-ui-queued-input-previews active))
+                            (equal steering (terminal-ui-steering-input-previews active)))
+                       "insertion does not add queued or steering previews")
+          (with-lock-held ((application-input-controller-lock controller))
+            (test-assert
+             (every #'deque-empty-p
+                    (list (application-input-controller-work-items controller)
+                          (application-input-controller-initial-work-items controller)
+                          (application-input-controller-steering-items controller)
+                          (application-input-controller-steering-in-flight-items controller)
+                          (application-input-controller-pending-apply-items controller)))
+             "insertion accepts no work into any actual controller deque"))))))
+  nil)
+
+(-> test-terminal-fullscreen-application-cancel-insertion () null)
+(defun test-terminal-fullscreen-application-cancel-insertion ()
+  "Insert the painted live cancellation widget through real fullscreen pointer dispatch."
+  (fullscreen-test--application-widget-insertion
+   :kind ':cancel :needle "(job.cancel"
+   :expected "ab(job.cancel :id \"exec:7\")cd" :cursor 27))
+
+(-> test-terminal-fullscreen-application-memory-insertion () null)
+(defun test-terminal-fullscreen-application-memory-insertion ()
+  "Insert the reflowed memory widget through real fullscreen pointer dispatch."
+  (fullscreen-test--application-widget-insertion
+   :kind ':memory :needle "K8vQ2mp"
+   :expected "ab(memory \"K8vQ2mp\")cd" :cursor 20))

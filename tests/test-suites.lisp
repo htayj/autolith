@@ -2496,3 +2496,7 @@
   test-conversation-writer-semantic-replay
   test-conversation-writer-source-faults
   test-conversation-writer-append-uncertainty)
+
+(define-test-suite fullscreen-application-insertion
+  test-terminal-fullscreen-application-cancel-insertion
+  test-terminal-fullscreen-application-memory-insertion)
