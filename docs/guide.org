@@ -1038,9 +1038,9 @@ continue using the session while the form runs. =??= and =?text= are chat;
 spaces, tabs, and line breaks after =?= select asynchronous Lisp. Continue an
 incomplete form on another line as with ordinary Lisp input.
 
-The submission line names the =exec:N= job and shows its =job.cancel= call. In
-fullscreen, click the call to insert it into the composer. A tool you call
-yourself that goes to the background, such as
+The submission line names the =exec:N= job and shows its passive =job.cancel=
+call. Enter or copy that call into the composer to cancel the job. A tool you
+call yourself that goes to the background, such as
 =(shell.run :command "make" :async t)=, shows the same line as a background
 tool call of the model.
 
