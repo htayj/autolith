@@ -2668,8 +2668,9 @@ Only conversation projections change; mission execution and accounting owners do
              :pathname (conversation-pathname conversation)
              :sequence (conversation-next-sequence conversation)))
     (with-recursive-lock-held ((conversation-append-lock conversation))
-      (let ((current-title  (conversation-title conversation))
-            (current-source (conversation-title-source conversation)))
+      (let ((current-title      (conversation-title conversation))
+            (current-source     (conversation-title-source conversation))
+            (entry-writer-state (conversation-writer-state conversation)))
         (when (and (eq source ':generated)
                    (eq current-source ':generated))
           (return-from conversation-set-title current-title))
@@ -2690,10 +2691,12 @@ Only conversation projections change; mission execution and accounting owners do
                (list :title :value normalized :source source))
             (error (condition)
               (let ((published-record
-                      (conversation--published-title-record conversation
-                                                            :sequence sequence
-                                                            :title    normalized
-                                                            :source   source)))
+                      (and (null entry-writer-state)
+                           (eq (conversation-writer-state conversation) ':writing)
+                           (conversation--published-title-record conversation
+                                                                 :sequence sequence
+                                                                 :title    normalized
+                                                                 :source   source))))
                 (if published-record
                     (progn
                       (setf (conversation-next-sequence conversation) (1+ sequence)
