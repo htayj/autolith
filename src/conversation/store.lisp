@@ -3423,6 +3423,29 @@ transcript show automatic INPUT as a short notice."
               (conversation--restore-automatic-message-state conversation state)))))
       (values item record))))
 
+(-> conversation--receipt-segments-intact-p
+    (list list pathname &key (:post-state list)) boolean)
+(defun conversation--receipt-segments-intact-p (capture paths active &key post-state)
+  "Check captured objects and retired revisions, optionally proving POST-STATE.
+
+Read candidate metadata before each object identity check. This closes atomic
+replacement windows during classification, not migration after the final proof."
+  (let ((post-segments (rest post-state)))
+    (and (equal paths (mapcar #'first (getf capture :segments)))
+         (or (null post-state) (= (length paths) (length post-segments)))
+         (every (lambda (entry)
+                  (let* ((path     (first entry))
+                         (revision (when (or post-state (not (equal active path)))
+                                     (multiple-value-list (sexp-store:file-revision path))))
+                         (status   (platform-path-status *platform* path)))
+                    (and status
+                         (platform-file-status-same-object-p (second entry) status)
+                         (if (equal active path)
+                             (>= (platform-file-status-size status) (getf capture :size))
+                             (equal (third entry) revision))
+                         (or (null post-state) (equal revision (pop post-segments))))))
+                (getf capture :segments)))))
+
 (-> conversation--classify-automatic-receipt-tail (conversation list list) (values keyword list))
 (defun conversation--classify-automatic-receipt-tail (conversation capture receipt)
   "Prove this attempt committed or left only its own incomplete tail under both locks.
@@ -3446,15 +3469,7 @@ on the source lock, segment identities, revision and validated record boundary."
                    (= (conversation-picker-revision-read identity) (1+ (getf capture :revision))))
         (return (values ':ambiguous nil)))
       (if (getf capture :persisted-p)
-          (unless (and (equal paths (mapcar #'first (getf capture :segments)))
-                       (every (lambda (entry)
-                                (let ((status (platform-path-status *platform* (first entry))))
-                                  (and status
-                                       (platform-file-status-same-object-p (second entry) status)
-                                       (if (equal active (first entry))
-                                           (>= (platform-file-status-size status) (getf capture :size))
-                                           (equal (third entry) (multiple-value-list (sexp-store:file-revision (first entry))))))))
-                              (getf capture :segments)))
+          (unless (conversation--receipt-segments-intact-p capture paths active)
             (return (values ':ambiguous nil)))
           (unless (and (= sequence 1) (= (length paths) 1))
             (return (values ':ambiguous nil))))
@@ -3553,7 +3568,20 @@ on the source lock, segment identities, revision and validated record boundary."
             (handler-case
                 (multiple-value-bind (outcome found)
                     (conversation--classify-automatic-receipt-tail conversation capture receipt)
-                  (let ((post-state (conversation--writer-source-state conversation)))
+                  (let* ((post-state (conversation--writer-source-state conversation))
+                         (paths      (conversation-storage-pathnames identity))
+                         (active     (conversation-storage-active-pathname identity)))
+                    ;; The candidate state is read once, before the final object proof.
+                    (unless (and (equal identity (getf capture :identity))
+                                 (equal active (getf capture :active))
+                                 (= (first post-state) (1+ (getf capture :revision))
+                                    (conversation-picker-revision-read identity))
+                                 (if (getf capture :persisted-p)
+                                     (conversation--receipt-segments-intact-p
+                                      capture paths active :post-state post-state)
+                                     (and (= (length paths) 1) (= (length (rest post-state)) 1)
+                                          (equal (namestring (first paths)) (first (second post-state))))))
+                      (setf outcome ':ambiguous found nil post-state nil))
                     (setf (getf receipt :outcome) outcome
                           (getf receipt :record) found
                           (getf receipt :post-state) post-state)))
