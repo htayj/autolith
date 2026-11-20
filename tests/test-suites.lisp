@@ -1146,6 +1146,8 @@
 (define-test-suite conversation
   test-conversation-image-input
   test-conversation-inherited-reference
+  test-conversation-tool-details-stream
+  test-conversation-bounded-tool-details
   test-conversation-ephemeral-tool-projection
   test-conversation-ephemeral-append-interruption
   test-conversation-malformed-tool-projections

@@ -3456,6 +3456,56 @@ output for one identifier, so it fails instead of poisoning replay."
 (defparameter *conversation-tool-details-maximum-octets* (* 64 1024)
   "Maximum portable structured tool metadata retained in one durable result.")
 
+(defclass conversation-tool-details-stream
+    (trivial-gray-streams:fundamental-character-output-stream)
+  ((limit :initarg       :limit
+          :reader        conversation-tool-details-stream-limit
+          :type          (integer 0 *)
+          :documentation "Maximum accepted UTF-8 byte count.")
+   (octets :initform      0
+           :accessor      conversation-tool-details-stream-octets
+           :type          (integer 0 *)
+           :documentation "Exact count through the first over-budget character, then saturated.")
+   (invalid-character :initform      nil
+                      :accessor      conversation-tool-details-stream-invalid-character
+                      :type          (or null character)
+                      :documentation "First unencodable character, without its backing text."))
+  (:documentation "Count readable metadata bytes without retaining printer output."))
+
+(defmethod trivial-gray-streams:stream-write-char
+    ((stream conversation-tool-details-stream) character)
+  "Count valid UTF-8 bytes through overflow and remember the first invalid scalar."
+  (let ((code (char-code character)))
+    (cond
+      ((or (<= #xD800 code #xDFFF) (> code #x10FFFF))
+       (unless (conversation-tool-details-stream-invalid-character stream)
+         (setf (conversation-tool-details-stream-invalid-character stream) character)))
+      ((<= (conversation-tool-details-stream-octets stream)
+           (conversation-tool-details-stream-limit stream))
+       (incf (conversation-tool-details-stream-octets stream)
+             (cond
+               ((< code #x80)
+                1)
+               ((< code #x800)
+                2)
+               ((< code #x10000)
+                3)
+               (t
+                4))))))
+  character)
+
+(defmethod trivial-gray-streams:stream-write-string
+    ((stream conversation-tool-details-stream) string &optional (start 0) end)
+  "Consume the selected STRING range without copying or retaining it."
+  (loop for index from start below (or end (length string))
+        do (trivial-gray-streams:stream-write-char stream (char string index)))
+  string)
+
+(defmethod trivial-gray-streams:stream-line-column
+    ((stream conversation-tool-details-stream))
+  "Return NIL because the non-pretty metadata printer needs no column tracking."
+  nil)
+
 (-> conversation--bounded-tool-details (t) t)
 (defun conversation--bounded-tool-details (details)
   "Return portable bounded DETAILS or a truthful omission descriptor."
@@ -3471,13 +3521,21 @@ output for one identifier, so it fails instead of poisoning replay."
           (lambda (value)
             (or (null value) (eq value t) (keywordp value)
                 (stringp value) (numberp value)))))
-        (let* ((text   (with-standard-io-syntax
-                         (let ((*print-circle* nil) (*print-readably* t))
-                           (write-to-string details))))
-               (octets (utf8-string-length text)))
-          (if (<= octets *conversation-tool-details-maximum-octets*)
-              details
-              (list :omitted-p t :reason ':metadata-size-limit :octets octets))))
+        (with-open-stream
+            (stream (make-instance 'conversation-tool-details-stream
+                                   :limit *conversation-tool-details-maximum-octets*))
+          (with-standard-io-syntax
+            (let ((*print-circle* nil) (*print-readably* t))
+              (write details :stream stream)))
+          ;; Encode only after printing succeeds so printer errors take precedence.
+          (when (conversation-tool-details-stream-invalid-character stream)
+            (utf8-string-to-octets
+             (string (conversation-tool-details-stream-invalid-character stream))))
+          (let ((octets (conversation-tool-details-stream-octets stream)))
+            (if (<= octets *conversation-tool-details-maximum-octets*)
+                details
+                (list :omitted-p t :reason ':metadata-size-limit
+                      :octets octets :octets-lower-bound-p t)))))
     ((or sexp-config-error print-not-readable) ()
       (list :omitted-p t :reason ':metadata-not-portable))))
 

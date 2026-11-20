@@ -882,6 +882,81 @@
       (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
   nil)
 
+(-> test-conversation-tool-details-stream () null)
+(defun test-conversation-tool-details-stream ()
+  "Test range emission, UTF-8 saturation, return values and stream cleanup."
+  (let* ((backing (coerce (list #\x #\a (code-char #x1F600) #\z) 'string))
+         (slice   (make-array 2 :element-type 'character
+                              :displaced-to backing :displaced-index-offset 1))
+         (stream  (make-instance 'conversation-tool-details-stream :limit 4)))
+    (with-open-stream (output stream)
+      (test-assert (eq backing (write-string backing output :start 1 :end 1))
+                   "empty ranges return their input")
+      (test-assert (zerop (conversation-tool-details-stream-octets output))
+                   "empty ranges emit no bytes")
+      (test-assert (eq slice (write-string slice output :start 0 :end 2))
+                   "displaced ranges return their input")
+      (test-assert (= 5 (conversation-tool-details-stream-octets output))
+                   "a multibyte crossing records the first over-budget count")
+      (test-assert (eql #\a (write-char #\a output))
+                   "character writes return their character")
+      (test-assert (= 5 (conversation-tool-details-stream-octets output))
+                   "later output does not grow the saturated count"))
+    (test-assert (not (open-stream-p stream)) "normal exit closes the sink"))
+  (let ((stream  (make-instance 'conversation-tool-details-stream :limit 4))
+        (failure (make-condition 'simple-error :format-control "writer failed")))
+    (test-assert
+     (eq failure
+         (handler-case
+             (with-open-stream (output stream)
+               (write-string "abc" output :start 1 :end 3)
+               (test-assert (= 2 (conversation-tool-details-stream-octets output))
+                            "ordinary start/end ranges count only selected characters")
+               (error failure))
+           (error (condition) condition)))
+     "writer errors retain their original condition identity")
+    (test-assert (not (open-stream-p stream)) "error exit closes the sink"))
+  nil)
+
+(-> test-conversation-bounded-tool-details () null)
+(defun test-conversation-bounded-tool-details ()
+  "Test exact limits, portable identity and genuine deferred encoding failures."
+  (let* ((exact   (make-string 65534 :element-type 'character :initial-element #\a))
+         (over    (make-string 65535 :element-type 'character :initial-element #\a))
+         (shared  (copy-seq "shared"))
+         (details (list shared shared :number 1/3)))
+    (test-assert (eq exact (conversation--bounded-tool-details exact))
+                 "exactly 65536 encoded bytes are accepted by identity")
+    (test-assert (eq details (conversation--bounded-tool-details details))
+                 "legal repeated string identity is preserved")
+    (test-assert
+     (equal (conversation--bounded-tool-details over)
+            '(:omitted-p t :reason :metadata-size-limit
+              :octets 65537 :octets-lower-bound-p t))
+     "overflow reports a truthful lower bound without retaining output")
+    (test-assert
+     (equal (conversation--bounded-tool-details (list (make-hash-table)))
+            '(:omitted-p t :reason :metadata-not-portable))
+     "unsupported atoms retain the portability omission"))
+  (let ((invalid (code-char #xD800)))
+    (when invalid
+      (dolist (details (list (string invalid)
+                            (list (make-string 65536 :element-type    'character
+                                                     :initial-element #\a)
+                                  (string invalid))))
+        (test-assert
+         (handler-case (progn (conversation--bounded-tool-details details) nil)
+           (utf8-conversion-failed (condition)
+             (eq (ls-compat:utf8-conversion-failed-direction condition) :encode)))
+         "the genuine encoder rejects invalid scalars before and after overflow"))
+      ;; SBCL's NaN printer signals PRINT-NOT-READABLE even under standard syntax.
+      (test-assert
+       (equal (conversation--bounded-tool-details
+               (list (string invalid) (sb-kernel:make-single-float #x7FC00000)))
+              '(:omitted-p t :reason :metadata-not-portable))
+       "a genuine later printer failure precedes deferred encoder failure")))
+  nil)
+
 (-> test-conversation-ephemeral-tool-projection () null)
 (defun test-conversation-ephemeral-tool-projection ()
   "Test request-local tool correlation stays out of durable history and replay."
