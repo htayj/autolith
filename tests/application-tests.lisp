@@ -10817,6 +10817,34 @@
                    "finalized markdown bodies carry copy widgets")))
   nil)
 
+(-> test-application-live-widget-insertion () null)
+(defun test-application-live-widget-insertion ()
+  "Dispatch real cancellation and memory widgets into the composer."
+  (multiple-value-bind (application root) (application-operation-tests--application)
+    (unwind-protect
+         (let ((terminal (make-instance 'recording-terminal :columns 120 :rows 12)))
+           (with-terminal-ui (active (terminal-ui-create :terminal terminal :fullscreen-p t))
+             (setf (application-ui application) active)
+             (application-connect-transcript-actions application)
+             (dolist (case (list
+                            (list :cancel
+                                  (terminal-ui--command-activity-row-at
+                                   '(:id "live-widget-job" :tool "lisp" :description "Running form"
+                                     :state :running) 0 120 :identity-width 16 :tool-width 4)
+                                  (terminal-ui--job-cancel-text "live-widget-job"))
+                            (list :memory
+                                  (application--related-memories-notice 1 :ids '("live-widget-memory"))
+                                  (format nil "(memory ~S)" "live-widget-memory"))))
+               (terminal-ui-set-input active "")
+               (let ((widget (find-if #'termdown:widget-p (second case))))
+                 (test-assert widget (format nil "the real ~A row renders an insertion widget" (first case)))
+                 (when widget
+                   (funcall (terminal-ui-action-function active) (termdown:widget-action widget)))
+                 (test-assert (equal (third case) (line-editor-text (terminal-ui-editor active)))
+                              (format nil "the real ~A widget dispatch inserts into the composer" (first case)))))))
+      (platform-delete-directory-tree *platform* root :validate t :if-does-not-exist ':ignore)))
+  nil)
+
 (-> test-operation-request-turn () null)
 (defun test-operation-request-turn ()
   "Test an operation's generated request reaches the model but shows as its notice."

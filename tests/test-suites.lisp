@@ -1584,6 +1584,7 @@
   test-agent-parallel-tool-wave
   test-agent-tool-wave-cancellation
   test-agent-tool-wave-retained-cleanup
+  test-agent-tool-wave-projection-outside-publication
   test-agent-tool-concurrency-key
   test-agent-exclusive-tool-waves
   test-agent-completion-accessors
@@ -1878,6 +1879,7 @@
   test-presentation-configuration-isolation
   test-operation-request-turn
   test-application-transcript-actions
+  test-application-live-widget-insertion
   test-application-command-tips
   test-application-banner-policy
   test-replay-skips-notice
@@ -2432,6 +2434,7 @@
   test-credentials-committed-send-after-login
   test-credentials-independent-save-attempts
   test-provider-only-copy-stream-preservation-skip)
+
 (define-test-suite mission-lease
   test-mission-lease-real-child-decline
   test-mission-lease-ancestor-cap
@@ -2474,6 +2477,7 @@
   test-conversation-writer-aliases
   test-conversation-writer-sequence-faults
   test-conversation-writer-alternation
+  test-conversation-append-input-history-order
   test-conversation-writer-stale-checkpoints
   test-conversation-writer-semantic-replay
   test-conversation-writer-source-faults

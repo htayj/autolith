@@ -3329,6 +3329,7 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
         (task-orchestrator-close orchestrator))))
   nil)
 
+
 ;;;; -- Completion Snapshot Baseline --
 
 (defclass agent-test-completion-result (tool-result)
@@ -3527,6 +3528,176 @@ REASONING-CONTEXT is the retention mode its response metadata reports."
 
 
 ;;;; -- Completion Ownership --
+
+(defclass agent-test-blocked-result (tool-result)
+  ((entered :initform (sb-thread:make-semaphore) :reader agent-test-blocked-result-entered
+            :documentation "Signals entry into the selected projection.")
+   (await-ready :initform (sb-thread:make-semaphore) :reader agent-test-blocked-result-await-ready
+                :documentation "Allows an owner await fault only after projection starts.")
+   (release :initform (sb-thread:make-semaphore) :reader agent-test-blocked-result-release
+            :documentation "Releases interrupt-resistant projection in fixture cleanup.")
+   (thread :initform nil :accessor agent-test-blocked-result-thread
+           :documentation "The producer thread whose whole publication path is joined.")
+   (calls :initform 0 :accessor agent-test-blocked-result-calls
+          :documentation "Projection calls for this result, excluding the sibling plan."))
+  (:documentation "A real open-generic result that holds projection until released."))
+
+(defmethod tool-result-completion-projection ((result agent-test-blocked-result))
+  "Hold only this result's projection, with a finite emergency release bound."
+  (sb-sys:without-interrupts
+    (incf (agent-test-blocked-result-calls result))
+    (setf (agent-test-blocked-result-thread result) (current-thread))
+    (sb-thread:signal-semaphore (agent-test-blocked-result-entered result))
+    (sb-thread:signal-semaphore (agent-test-blocked-result-await-ready result))
+    (unless (sb-thread:wait-on-semaphore (agent-test-blocked-result-release result) :timeout 30)
+      (error "Blocked projection fixture exceeded its emergency release bound.")))
+  nil)
+
+(defclass agent-test-blocked-projection-tool (tool)
+  ((result :initarg :result :reader agent-test-blocked-projection-tool-result
+           :documentation "The selected result whose projection blocks."))
+  (:documentation "A registry tool returning one blocked subclass and an ordinary sibling."))
+
+(defmethod tool-execute ((tool agent-test-blocked-projection-tool)
+                         (context tool-context) (arguments hash-table))
+  "Return the subclass through the real registry rather than replacing projection."
+  (declare (ignore context))
+  (if (equal "blocked" (tool-argument arguments "kind" :required t))
+      (agent-test-blocked-projection-tool-result tool)
+      (tool-success "ordinary sibling")))
+
+(-> test-agent-tool-wave-projection-outside-publication () null)
+(defun test-agent-tool-wave-projection-outside-publication ()
+  "Return cancelled and failed owners before releasing an open-generic projection."
+  (dolist (mode '(:cancel :await-fault))
+    (with-test-configuration (configuration)
+      (let* ((agent                     (task-tests--primary-agent configuration "projection-boundary"))
+             (orchestrator              (task-orchestrator-create))
+             (definition                (task-agent-definition-create
+                                         :name "projection-boundary" :description "Projection boundary test."
+                                         :instructions "Run local fixture tools." :source ':test))
+             (result                    (make-instance 'agent-test-blocked-result :content "blocked" :success-p t))
+             (tool                      (make-instance 'agent-test-blocked-projection-tool
+                                                       :namespace "projection-boundary" :name "probe"
+                                                       :description "Produce local blocked projection fixtures."
+                                                       :parameters  (tool-object-schema
+                                                                     (json-object "kind" (tool-string-property "Result kind."))
+                                                                     '("kind"))
+                                                       :result      result))
+             (submit                    (symbol-function 'job-pool-submit-batch))
+             (await                     (symbol-function 'job-await))
+             (release                   (symbol-function 'agent--release-tool-executions))
+             (publish                   (symbol-function 'agent--publish-tool-execution))
+             (producer-exited           (sb-thread:make-semaphore))
+             (owner                     nil)
+             (owner-thread              nil)
+             (producers                 nil)
+             (captured                  nil)
+             (closed-p                  nil)
+             (late-installs             0)
+             (fault-p                   nil)
+             (returned-before-release-p nil))
+        (tool-registry-register (agent-tool-registry agent) tool)
+        (unwind-protect
+             (test-call-with-function-replacements
+              (list
+               (list 'job-pool-submit-batch
+                     (lambda (pool specifications)
+                       (if (eq pool (task-orchestrator-pool orchestrator))
+                           (funcall submit pool specifications)
+                           (setf producers
+                                 (funcall
+                                  submit pool
+                                  (mapcar
+                                   (lambda (specification)
+                                     (let* ((copy     (copy-list specification))
+                                            (function (getf copy :function)))
+                                       (setf (getf copy :function)
+                                             (lambda (job)
+                                               (unwind-protect (funcall function job)
+                                                 ;; This surrounds the whole producer, including publication.
+                                                 (sb-sys:without-interrupts
+                                                   (when (eq (current-thread) (agent-test-blocked-result-thread result))
+                                                     (sb-thread:signal-semaphore producer-exited))))))
+                                       copy))
+                                   specifications))))))
+               (list 'job-await
+                     (lambda (job &rest arguments)
+                       (when (and (eq mode ':await-fault) (eq (current-thread) owner-thread) (not fault-p))
+                         (unless (sb-thread:wait-on-semaphore (agent-test-blocked-result-await-ready result) :timeout 5)
+                           (error "Projection did not enter before the await fault."))
+                         (setf fault-p t)
+                         (error "Injected wave await failure after projection entry."))
+                       (apply await job arguments)))
+               (list 'agent--publish-tool-execution
+                     (lambda (vector index execution)
+                       (when closed-p (incf late-installs))
+                       (funcall publish vector index execution)))
+               (list 'agent--release-tool-executions
+                     (lambda (vector)
+                       (funcall release vector)
+                       (setf captured vector closed-p t))))
+              (lambda ()
+                (unwind-protect
+                     (progn
+                       (setf owner
+                             (first
+                              (job-pool-submit-batch
+                               (task-orchestrator-pool orchestrator)
+                               (list
+                                (list :root-identifier (conversation-identifier (agent-conversation agent))
+                                      :initargs        (list :orchestrator orchestrator :parent-agent agent
+                                                             :definition definition :item (list :task "Run projection fixtures.")
+                                                             :completion-owner-conversation
+                                                             (conversation-identifier (agent-conversation agent))
+                                                             :execution-identifier (make-identifier))
+                                      :function
+                                      (lambda (job)
+                                        (declare (ignore job))
+                                        (setf owner-thread (current-thread))
+                                        (let ((*agent-maximum-concurrent-tool-workers* 2)
+                                              (cl-jobpond:*shutdown-timeout-seconds*   0.05))
+                                          (agent--run-tool-wave
+                                           agent
+                                           (loop for kind in '("blocked" "sibling")
+                                                 collect (list :call (agent-test-call
+                                                                      :call-id kind :namespace "projection-boundary" :name "probe"
+                                                                      :arguments (json-encode (json-object "kind" kind)))
+                                                               :tool tool :persistence ':durable))
+                                           :observer (callback-agent-observer-create)))))))))
+                       (test-assert (sb-thread:wait-on-semaphore (agent-test-blocked-result-entered result) :timeout 5)
+                                    (format nil "~A enters the real open-generic projection" mode))
+                       (when (eq mode ':cancel)
+                         (job-cancel owner :reason ':test-cancel :cascade-p t))
+                       (setf returned-before-release-p
+                             (nth-value 1 (funcall await owner :timeout-seconds 2))))
+                  (sb-thread:signal-semaphore (agent-test-blocked-result-release result))
+                  (test-assert (sb-thread:wait-on-semaphore producer-exited :timeout 5)
+                               (format nil "~A joins the retained producer's whole publication path" mode))
+                  (when owner
+                    (test-assert (nth-value 1 (funcall await owner :timeout-seconds 5))
+                                 (format nil "~A owner returns after fixture cleanup" mode)))
+                  (dolist (producer producers)
+                    (test-assert (nth-value 1 (funcall await producer :timeout-seconds 5))
+                                 "each wave producer is terminal after release"))
+                  (when (agent-test-blocked-result-thread result)
+                    (test-assert (not (eq ':timed-out
+                                          (sb-thread:join-thread (agent-test-blocked-result-thread result)
+                                                                 :timeout 5 :default ':timed-out)))
+                                 "the retained producer thread has exited")))
+                (format t "PROJECTION-BOUNDARY mode=~S returned-before-release=~S calls=~D late-installs=~D~%"
+                        mode returned-before-release-p (agent-test-blocked-result-calls result) late-installs)
+                (test-assert returned-before-release-p
+                             (format nil "~A owner becomes terminal while projection is still blocked" mode))
+                (test-assert (= 1 (agent-test-blocked-result-calls result))
+                             "the selected blocked execution projects exactly once")
+                (test-assert (and captured (every #'null captured))
+                             "cleanup releases all vector roots without late repopulation")
+                (test-assert (zerop late-installs) "no execution is installed after wave closure")
+                (when (eq mode ':await-fault)
+                  (test-assert fault-p "the owner encountered the intended await failure"))))
+          (task-orchestrator-close orchestrator)))))
+  nil)
 
 (defclass agent-test-projection-tool (tool)
   ((next :initarg :next :accessor agent-test-projection-tool-next
