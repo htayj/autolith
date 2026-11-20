@@ -81,6 +81,140 @@
       (fiveam:rem-test 'test-suite-runner-cross-thread-probe)))
   nil)
 
+(-> test-runner--producer-cleanup (t keyword) list)
+(defun test-runner--producer-cleanup (parent exit)
+  "Observe a held producer's successful join before releasing its reservation."
+  (task-tests--require-cleanup)
+  (let* ((*test-case-running-p*       nil)
+         (*task-tests--orchestrators* nil)
+         (entered                     (sb-thread:make-semaphore :count 0))
+         (release                     (sb-thread:make-semaphore :count 0))
+         (unwound                     (sb-thread:make-semaphore :count 0))
+         (events-lock                 (sb-thread:make-mutex :name "runner join events"))
+         (events                      nil)
+         (id                          nil)
+         (job                         nil)
+         (orchestrator                nil)
+         (producer-thread             nil)
+         (observed-reserved           nil)
+         (primary                     (make-condition 'simple-error :format-control "runner primary"))
+         (throw-value                 (list :runner-throw))
+         (join                        (symbol-function 'bordeaux-threads:join-thread))
+         (clear                       (symbol-function 'identifier-clear-reservations)))
+    (labels ((note (event)
+               (sb-thread:with-mutex (events-lock) (push event events)))
+
+             (body ()
+               (setf orchestrator (task-tests--orchestrator)
+                     id (make-user-identifier :namespace "test-runner-producer")
+                     job (task-orchestrator-start-execution-job
+                          orchestrator parent :tool-name "runner.cleanup.fixture"
+                          :summary "held producer" :detached-p t :completion-policy ':notify
+                          :operation-function
+                          (lambda ()
+                            (setf producer-thread sb-thread:*current-thread*)
+                            (unwind-protect
+                                 (progn
+                                   (sb-thread:signal-semaphore entered)
+                                   (sb-thread:wait-on-semaphore release :timeout 30))
+                              (setf observed-reserved
+                                    (identifier-reserved-p id :namespace "test-runner-producer"))
+                              (sb-thread:signal-semaphore unwound))
+                            (tool-success "released"))))
+               (test-assert (sb-thread:wait-on-semaphore entered :timeout 5)
+                            "the real non-shell producer entered")
+               (test-assert (not (job-terminal-p job)) "the producer is outstanding")
+               (note (list :inner-start))
+               (test-call-with-case-identifiers (lambda () (values)))
+               (note (list :inner-end))
+               (test-assert (not (job-terminal-p job)) "the nested boundary leaves the job outstanding")
+               (note (list :body-left))
+               (ecase exit
+                 (:return
+                  (values :runner-return 17))
+                 (:error
+                  (error primary))
+                 (:throw
+                  (throw 'runner-producer throw-value)))))
+      (unwind-protect
+           (test-call-with-function-replacements
+            (list (list 'bordeaux-threads:join-thread
+                        (lambda (thread &rest arguments)
+                          (multiple-value-prog1 (apply join thread arguments)
+                            (note (list :joined thread)))))
+                  (list 'identifier-clear-reservations
+                        (lambda ()
+                          (note (list :cleared
+                                      (and id (identifier-reserved-p id :namespace "test-runner-producer"))))
+                          (funcall clear))))
+            (lambda ()
+              (ecase exit
+                (:return
+                 (test-assert (equal '(:runner-return 17)
+                                     (multiple-value-list (test-call-with-case-identifiers #'body)))
+                              "the normal return preserves every value"))
+                (:error
+                 (test-assert (eq primary
+                                 (handler-case (test-call-with-case-identifiers #'body)
+                                   (simple-error (condition) condition)))
+                              "cleanup preserves the exact primary condition"))
+                (:throw
+                 (test-assert (eq throw-value
+                                 (catch 'runner-producer (test-call-with-case-identifiers #'body)))
+                              "cleanup preserves the exact throw value")))))
+        (when (and job (not (job-terminal-p job)))
+          (sb-thread:signal-semaphore release)
+          (session-job-await job 5)))
+      (setf events (nreverse events))
+      (let* ((left        (position :body-left events :key #'first))
+             (inner-start (position :inner-start events :key #'first))
+             (inner-end   (position :inner-end events :key #'first))
+             (joined      (position-if (lambda (event)
+                                         (and (eq :joined (first event))
+                                              (eq producer-thread (second event))))
+                                       events :start (or left 0)))
+             (cleared     (position :cleared events :key #'first :start (or left 0))))
+        (test-assert (and left joined cleared (< left joined cleared))
+                     "the real successful producer join occurs after body exit and before clearing")
+        (test-assert (and cleared (second (nth cleared events)))
+                     "the reservation is still held immediately before clearing")
+        (test-assert (and inner-start inner-end
+                          (notany (lambda (event) (member (first event) '(:joined :cleared)))
+                                  (subseq events (1+ inner-start) inner-end)))
+                     "the nested boundary neither joins nor clears")
+        (test-assert (nth-value 1 (session-job-await job 0)) "the actual job is terminal")
+        (test-assert (and producer-thread (not (sb-thread:thread-alive-p producer-thread)))
+                     "the selected producer thread is dead after closing")
+        (test-assert (sb-thread:wait-on-semaphore unwound :timeout 1)
+                     "the producer's own cleanup completed")
+        (test-assert observed-reserved "the producer unwound while its identifier was reserved")
+        (test-assert (not (identifier-reserved-p id :namespace "test-runner-producer"))
+                     "the successful outer boundary released the reservation")
+        (test-assert (null (assoc orchestrator
+                                  (sb-ext:symbol-global-value '*task-tests--cleanup-failures*)))
+                     "the real close introduced no quarantine record")
+        (list :exit exit :body-left left :joined joined :cleared cleared
+              :reserved-before-clear       (and cleared (second (nth cleared events)))
+              :reserved-in-producer-unwind observed-reserved
+              :terminal                    (nth-value 1 (session-job-await job 0))
+              :thread-dead                 (not (sb-thread:thread-alive-p producer-thread))
+              :events                      (mapcar (lambda (event)
+                                                     (if (eq :joined (first event))
+                                                         (list :joined (if (eq producer-thread (second event)) :producer :other))
+                                                         event))
+                                                   events))))))
+
+(-> test-runner-producer-cleanup () null)
+(defun test-runner-producer-cleanup ()
+  "Close real outstanding producers at return, error and throw case boundaries."
+  (task-tests--require-cleanup)
+  (with-test-configuration (configuration root)
+    (declare (ignore root))
+    (let ((parent (task-tests--primary-agent configuration "runner-producer-parent")))
+      (dolist (exit '(:return :error :throw))
+        (test-runner--producer-cleanup parent exit))))
+  nil)
+
 (-> test-runner--identifier-probe () null)
 (defun test-runner--identifier-probe ()
   "Allocate a full second's capacity without releasing any within the case."
