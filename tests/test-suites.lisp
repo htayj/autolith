@@ -1174,6 +1174,7 @@
   test-conversation-receipt-attribution-controls
   test-conversation-title-entry-poison
   test-conversation-receipt-migration-window
+  test-conversation-title-natural-entry-poison
   test-conversation-segment-validation
   test-conversation-legacy-storage
   test-conversation-working-seconds
