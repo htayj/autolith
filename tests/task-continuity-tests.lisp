@@ -696,7 +696,7 @@
                                       :provider      (agent-provider parent)
                                       :conversation  (agent-conversation parent)
                                       :tool-registry registry :worker nil))
-              (fresh    (task-run-tool-orchestrator (tool-registry-find registry "task" "run"))))
+              (fresh    (task-run-tool-orchestrator (tool-registry-find registry "child" "spawn"))))
          (unwind-protect
               (progn
                 (task-completion-restore restored)

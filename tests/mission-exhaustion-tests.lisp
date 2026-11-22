@@ -1308,7 +1308,7 @@
                                              :description "Real multi-call wave sibling" :parameters
                                              (tool-object-schema (json-object) nil)))
       (task-augment-tool-registry registry))
-     (let* ((run-tool (tool-registry-find registry "task" "run"))
+     (let* ((run-tool (tool-registry-find registry "child" "spawn"))
             (tool-context
              (make-instance 'tool-context :configuration configuration :worker nil :conversation
                             (application-conversation application) :registry registry :agent
@@ -3778,7 +3778,7 @@
                                              :description "Finite actual nested authority leaf."
                                              :parameters  (tool-object-schema (json-object) nil)))
       (task-augment-tool-registry registry)
-      (let* ((run-tool     (tool-registry-find registry "task" "run"))
+      (let* ((run-tool     (tool-registry-find registry "child" "spawn"))
              (tool-context (make-instance 'tool-context :configuration configuration :worker nil
                                          :conversation (application-conversation application) :registry registry
                                          :agent (application-agent application) :call-id "authority-root")))
@@ -3943,7 +3943,7 @@
            (provider      (make-instance 'mission-accounting-test-child-provider :outcome (rest (assoc :provider outcomes))))
            (application   (mission-inference-test--application configuration provider))
            (registry      (task-augment-tool-registry (application-tool-registry application)))
-           (run-tool      (tool-registry-find registry "task" "run"))
+           (run-tool      (tool-registry-find registry "child" "spawn"))
            (orchestrator  (task-run-tool-orchestrator run-tool))
            (conversation  (application-conversation application))
            (path          (conversation-pathname conversation))
@@ -4242,7 +4242,7 @@
           (registry
            (task-augment-tool-registry
             (application-tool-registry application)))
-          (run-tool             (tool-registry-find registry "task" "run"))
+          (run-tool             (tool-registry-find registry "child" "spawn"))
           (orchestrator         (task-run-tool-orchestrator run-tool))
           (conversation         (application-conversation application))
           (path                 (conversation-pathname conversation))
