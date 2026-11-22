@@ -1521,11 +1521,17 @@
                      (declare (ignore configuration conversation tools goal-context compaction-p))
                      nil)))
        (lambda ()
+        (let* ((*provider-input-measurement-credentials*
+                 (context-route-tests--credentials base "switched-test-account" "switched-test-bearer"))
+               (*provider-input-measurement-route*
+                 (provider-input-measurement--route old-provider *provider-input-measurement-credentials*)))
          (conversation-set-model-selection conversation "gpt-6.2-astra" "high" :provider "chatgpt")
          (conversation-append-user-message conversation (make-string 160000 :initial-element #\a))
          (let* ((*provider-context-request* (provider-context-request-create old-provider conversation #()))
                 (request                    (provider-request-object old-provider conversation #())))
-           (setf (getf *provider-context-request* :wire) (provider-context--wire-plan old-provider request)
+           (setf (getf *provider-context-request* :route) *provider-input-measurement-route*
+                 (getf *provider-context-request* :wire-provider) old-provider
+                 (getf *provider-context-request* :wire) (provider-context--wire-plan old-provider request)
                  (getf *provider-context-request* :wire-characters)
                  (provider-context--request-characters old-provider (provider-request-history old-provider request)))
            (conversation-append-provider-item conversation reasoning)
@@ -1555,7 +1561,7 @@
                             "new encoded context still counts at the request boundary")))
            (setf (gethash "input" request) (vector (json-object "type" "message" "role" "user" "content" "changed")))
            (test-assert (not (nth-value 1 (provider-context--matched-input new-provider request)))
-                        "changed encoded history cannot reuse measured occupancy"))))))
+                        "changed encoded history cannot reuse measured occupancy")))))))
   nil)
 
 ;;;; -- Measured Ordinary Input Regression --

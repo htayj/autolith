@@ -12187,7 +12187,7 @@
          (test-note-recorded-goal-reply application "Which option next?")
          (test-assert (eq (getf (application-goal application) :status) ':active)
                       "intervening progress resets consecutive questions")
-         (application--goal-update application "Updated objective" :literal-p t)
+         (application--goal-update application "Updated objective")
          (test-assert (and (not (getf (application-goal application) :previous-question-p))
                            (getf (application-goal application) :last-response-sequence))
                       "goal update resets only streak")))))
@@ -12277,7 +12277,7 @@
                       (application-agent application) (application-agent-observer application)
                       :messages '("Choose option A.") :request-number 1))
                     (:update
-                     (application--goal-update application "New objective" :literal-p t))
+                     (application--goal-update application "New objective"))
                     (:pause-resume
                      (application-goal-request application ':pause nil)
                      (test-call-with-function-replacements

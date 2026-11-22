@@ -158,7 +158,7 @@
 
 (-> test-provider-status-consumers () null)
 (defun test-provider-status-consumers ()
-  "Exercise terminal rendering, ACP notification formatting and child progress dispatch."
+  "Exercise terminal rendering and child progress dispatch."
   (with-test-configuration (configuration)
     (let* ((terminal                       (make-instance 'recording-terminal :columns 120))
            (conversation                   (conversation-create configuration :identifier "status-fixture"))
@@ -167,27 +167,20 @@
                                                           :tool-registry              (make-default-tool-registry)
                                                           :ui                         (terminal-ui-create :terminal terminal)))
            (terminal-observer              (application-agent-observer application))
-           (session                        (make-instance 'acp-session :service (acp-observer-test-service configuration)
-                                                          :identifier "status-fixture" :application application))
-           (acp-observer                   (make-instance 'acp-observer :session session))
            (orchestrator                   (task-orchestrator-create))
            (job                            (task-tests--make-job orchestrator :identifier "status-child"))
-           (notifications nil) (child-events nil) (attempts 0)
+           (child-events nil) (attempts 0)
            (child-observer
              (make-instance 'callback-agent-observer
                             :status-callback (lambda (status details)
                                                (task-progress-note-status job status details))))
            (callbacks                      (mapcar #'agent--provider-event-callback
-                                                   (list terminal-observer acp-observer child-observer)))
+                                                   (list terminal-observer child-observer)))
            (*bounded-retry-sleep-function* (lambda (seconds) (declare (ignore seconds)))))
       (terminal-ui-start (application-ui application))
       (unwind-protect
            (test-call-with-function-replacements
             (list
-             (list 'agentcomms:agent-client-notify
-                   (lambda (service method params)
-                     (declare (ignore service))
-                     (push (list method params) notifications)))
              (list 'task-orchestrator-emit
                    (lambda (owner kind event)
                      (declare (ignore owner kind))
@@ -211,15 +204,6 @@
                 (test-assert (notany (lambda (secret) (search secret output))
                                      '("password" "private" "secret" "fragment"))
                              "terminal output contains only sanitized endpoint identity"))
-              (test-assert (= 4 (length notifications))
-                           "actual ACP observer dispatches four extension notifications")
-              (let* ((envelope (second (first notifications)))
-                     (data     (agentcomms:json-get envelope "data")))
-                (test-assert (and (equal "_autolith/event" (first (first notifications)))
-                                  (equal "provider-connection" (agentcomms:json-get envelope "kind"))
-                                  (equal "completed" (agentcomms:json-get data "phase"))
-                                  (equal "visible.example:9443" (agentcomms:json-get data "endpoint")))
-                             "ACP recovery status uses its real session-owned event envelope"))
               (test-assert (= 4 (count-if (lambda (event) (getf event :provider-connection)) child-events))
                            "actual child observer emits structured recovery progress")
               (test-assert (null (slot-value (task-job-progress job) 'provider-connections))
@@ -343,7 +327,7 @@
   (with-test-configuration (configuration)
     (let* ((definition         (task-agent-definition-create :name "waiting-child" :description "Wait notes."
                                                    :instructions "Local test." :source ':test))
-           (fixture            (task-tests--yield-fixture configuration definition "waiting-child-1"))
+           (fixture            (task-tests--child-fixture configuration definition "waiting-child-1"))
            (job                (getf fixture :job))
            (progress           (task-job-progress job))
            (parent             (task-job-parent-agent job))

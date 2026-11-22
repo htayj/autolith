@@ -2266,7 +2266,7 @@
                (process-event (symbol-function 'terminal-ui-process-event)))
           (test-assert start "the real widget is painted and hit-testable")
           (when start
-            (let ((column (1+ (terminal--spans-width
+            (let ((column (1+ (termdown:spans-width
                                (list (terminal-span ':plain (subseq text 0 start)))))))
               (test-call-with-function-replacements
                (list (list 'terminal-ui-process-event

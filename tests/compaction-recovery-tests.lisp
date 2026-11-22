@@ -870,7 +870,7 @@
                (provider     (make-instance 'compaction-recovery-test-provider
                                             :configuration configuration
                                             :results       (list (agent-test-result
-                                                                  "summary" (list (agent-test-compaction-message))
+                                                                  "summary" (list (agent-test-checkpoint-call))
                                                                   :usage (json-object "input_tokens" 120 "output_tokens" 30)))))
                (items        (compaction-image-tests--items 100000))
                (source       (conversation-compaction-summary-view conversation items))

@@ -129,7 +129,7 @@ proof. This traversal does not introduce an atomic goal capture boundary."
                              thereis (and (stringp value) (> (length value) limit)))
                        (> (length (getf record :gates)) limit))
                    (1+ limit)
-                   (task--readable-sexp-characters record)))
+                   (task--readable-sexp-character-count record)))
 
              (records-size (items kind)
                "Measure without retaining a projection of the supplied goal tree."
@@ -139,8 +139,8 @@ proof. This traversal does not introduce an atomic goal capture boundary."
                             sum (record-size (mission-exhaustion--coverage-record item kind))))
                    0)))
       (let* ((empty (envelope :omitted-criteria criterion-count :omitted-gates gate-count))
-             (reserved (task--readable-sexp-characters empty))
-             (complete-size (+ (task--readable-sexp-characters (envelope :complete t))
+             (reserved (task--readable-sexp-character-count empty))
+             (complete-size (+ (task--readable-sexp-character-count (envelope :complete t))
                                (records-size criteria :criteria) (records-size gates :gates))))
         (when (and (> reserved limit) (> complete-size limit))
           (mission--reject :evaluator-coverage "Coverage omission envelope exceeds the evidence bound."))
@@ -514,7 +514,7 @@ Structural pre-redaction checks are a filter, not a claim of complete redaction.
                                                          :observed  (gethash "observed" candidate)
                                                          :citations (gethash "citations" candidate)))
                              :diagnostic          (gethash "diagnostic" candidate)
-                             :issue-kind (gethash "issue_kind" candidate) :tool "mission.exhaustion"
+                             :issue-kind (papercut--issue-kind (gethash "issue_kind" candidate)) :tool "mission.exhaustion"
                              :source-conversation (conversation-identifier
                                                    (application-conversation (mission-context-application context))))
                           (cond (papercut

@@ -229,5 +229,5 @@ Styled asynchronous Lisp results, images and oversized observer details stay leg
   (handler-case
       (tool-completion--capture result nil)
     ((or unbound-slot type-error sexp-config-error print-not-readable
-         conversation-tool-details-overflow utf8-conversion-failed) ()
+         utf8-conversion-failed) ()
       nil)))
