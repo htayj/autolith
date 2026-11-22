@@ -10,6 +10,9 @@
 (defvar *mission-schedule-notice-lock* (make-recursive-lock "Mission occurrence notices")
   "Serialize durable occurrence lookup, append and conversation replacement.")
 
+(defvar *mission-schedule-notice-sources* (make-hash-table :test #'eq :weakness ':key)
+  "Durable side-status sources keyed by owning conversation and guarded by the notice lock.")
+
 (defmethod (setf application-conversation) :around (conversation (application application))
   "Keep occurrence presentation and conversation replacement in separate critical sections."
   (with-recursive-lock-held (*mission-schedule-notice-lock*)
@@ -525,6 +528,18 @@ Explicit failure/unknown keywords are never treated as successful execution."
          (eq (getf current :state) (getf wakeup :state))
          (equal (getf current :result) (getf wakeup :result)))))
 
+(-> mission-schedule--notice-sources (conversation) hash-table)
+(defun mission-schedule--notice-sources (conversation)
+  "Return the side-status sources in the durable history of CONVERSATION.
+The history of each conversation object is read once."
+  (or (gethash conversation *mission-schedule-notice-sources*)
+      (let ((sources (make-hash-table :test #'equal)))
+        (conversation-map-records
+         conversation (lambda (entry)
+                        (when (eq (first entry) ':side-status)
+                          (setf (gethash (getf (rest entry) :source) sources) t))))
+        (setf (gethash conversation *mission-schedule-notice-sources*) sources))))
+
 (-> mission-schedule--publish-notice (mission-schedule-service list keyword) null)
 (defun mission-schedule--publish-notice (service wakeup reason)
   "Revalidate and append atomically with recovery; present outside the scheduler lock."
@@ -544,17 +559,18 @@ Explicit failure/unknown keywords are never treated as successful execution."
          (spans        (application-failure-line (format nil "scheduled occurrence: ~A" body)))
          (record       nil))
     (with-recursive-lock-held (*mission-schedule-notice-lock*)
-      (with-recursive-lock-held ((mission-schedule-lock service))
-        (when (mission-schedule--notice-current-p service wakeup)
-          (with-recursive-lock-held ((conversation-append-lock conversation))
-            (let ((found-p nil))
-              (conversation-map-records
-               conversation (lambda (entry)
-                              (when (and (eq (first entry) ':side-status)
-                                         (equal source (getf (rest entry) :source)))
-                                (setf found-p t))))
-              (unless found-p
-                (setf record (mission-schedule--append-notice service source spans)))))))
+      (let ((sources (mission-schedule--notice-sources conversation)))
+        (with-recursive-lock-held ((mission-schedule-lock service))
+          (when (and (mission-schedule--notice-current-p service wakeup)
+                     (not (gethash source sources)))
+            (with-recursive-lock-held ((conversation-append-lock conversation))
+              (let ((appended-p nil))
+                (unwind-protect
+                     (setf record     (mission-schedule--append-notice service source spans)
+                           appended-p t)
+                  (if appended-p
+                      (setf (gethash source sources) t)
+                      (remhash conversation *mission-schedule-notice-sources*))))))))
       ;; Conversation replacement uses the notice lock, not the scheduler lock.
       (when (and record (eq conversation (application-conversation application))
                  (application-ui application))
