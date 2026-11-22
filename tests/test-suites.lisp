@@ -749,7 +749,7 @@
  test-world-server-stop test-world-server-switch
  test-world-channel-command-admission
  test-world-server-resume-order test-world-server-open-latest-touched
- test-world-server-startup-inbox
+ test-world-server-startup-inbox test-world-server-open-shares-participant
  test-world-server-open-passes-damage test-world-server-generation-warning-once
  test-world-server-open-constraints test-world-client-script-submissions
  test-world-client-script test-world-server-starting-host
