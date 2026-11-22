@@ -333,6 +333,7 @@
   test-mission-schedule-terminal-classification
   test-mission-schedule-notice-recovery-windows
   test-mission-schedule-restored-failure-notices
+  test-mission-schedule-notice-history-scan
   test-mission-schedule-notice-conversation-switch
   test-mission-schedule-non-error-controls
   test-mission-schedule-pending-exits
