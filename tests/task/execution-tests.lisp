@@ -617,6 +617,45 @@
                      "the fixture joins task writers before removing its state"))))
   nil)
 
+(-> test-task-child-parent-directory () null)
+(defun test-task-child-parent-directory ()
+  "Test a spawned child begins in the directory of its parent and records it as its channel workspace."
+  (with-test-configuration (configuration root)
+    (let* ((workspace    (world-tests--workspace root "parent"))
+           (parent-configuration
+            (configuration-copy configuration :working-directory workspace))
+           (provider     (make-instance 'task-test-provider :mode ':concurrent))
+           (parent       (agent-create :configuration parent-configuration :provider provider
+                                       :tool-registry (make-default-tool-registry)))
+           (conversation (agent-conversation parent))
+           (orchestrator (task-tests--orchestrator))
+           (job          (task-tests--make-job orchestrator
+                                              :identifier   "parent-directory"
+                                              :parent-agent parent
+                                              :item         (list :task "Report the directory."))))
+      (unwind-protect
+           (progn
+             (conversation-append-user-message conversation "Delegate a report.")
+             (setf (participant-state-identity (agent-participant-state parent))
+                   (world-register-conversation parent-configuration conversation)
+                   (slot-value job 'completion-owner-conversation)
+                   (conversation-identifier conversation))
+             (with-lock-held ((cl-jobpond::job--lock job))
+               (setf (job-state job) ':running))
+             (test-assert (eq (getf (task-run-child job) :status) ':success)
+                          "the spawned child completes the task")
+             (let* ((child   (participant-state-conversation (task-job-participant-state job)))
+                    (channel (world-channel-find (world-load configuration)
+                                                 (conversation-identifier child))))
+               (test-assert (and (string= (conversation-origin-directory child) workspace)
+                                 channel
+                                 (string= (channel-workspace channel) workspace))
+                            "the child begins in its parent's directory and its channel records that workspace")))
+        (lisp-worker-pool-stop-all (agent-worker parent))
+        (test-assert (task-orchestrator-close orchestrator)
+                     "the fixture joins task writers before removing its state"))))
+  nil)
+
 (-> test-task-child-sends-to-parent () null)
 (defun test-task-child-sends-to-parent ()
   "Send to @parent from a spawned child's first provider turn."
