@@ -976,6 +976,49 @@
                     "restored FAILED without result and CLAIMED-to-UNKNOWN each receive exactly one notice"))))
   nil)
 
+(-> test-mission-schedule-notice-history-scan () null)
+(defun test-mission-schedule-notice-history-scan ()
+  "Read conversation history at most once per reconciliation of many retained failures."
+  (mission-schedule-tests--fixture
+   (lambda (application service path clock commands executions)
+     (declare (ignore commands executions))
+     (setf (slot-value service 'enqueue) (lambda (owner command) (declare (ignore owner command)) nil))
+     (dotimes (index 4)
+       (application-mission-schedule-add application :id (format nil "refused-~D" index)
+                                        :content "Refused" :at 100))
+     (application-mission-schedules-wake application)
+     (test-assert (= 4 (length (mission-schedule-test--notices application)))
+                  "each admission refusal receives a notice")
+     (application-mission-schedule-add application :id "unannounced" :content "Unannounced" :at 100)
+     (test-call-with-function-replacements
+      (list (list 'mission-schedule--publish-notice
+                  (lambda (owner wakeup reason) (declare (ignore owner wakeup reason)) nil)))
+      (lambda () (application-mission-schedules-wake application)))
+     (test-assert (= 4 (length (mission-schedule-test--notices application)))
+                  "the last refusal remains unannounced before restart")
+     (let ((original (application-conversation application))
+           (map      (symbol-function 'conversation-map-records))
+           (scans    0))
+       (unwind-protect
+            (progn
+              (setf (application-conversation application) (conversation-load (conversation-pathname original)))
+              (let ((restored (mission-schedule-service-create application :path path :clock clock)))
+                (setf (gethash application *mission-schedule-services*) restored)
+                (test-call-with-function-replacements
+                 (list (list 'conversation-map-records
+                             (lambda (conversation function)
+                               (incf scans)
+                               (funcall map conversation function))))
+                 (lambda ()
+                   (loop repeat 2
+                         do (setf scans 0)
+                            (mission-schedule--announce restored)
+                            (test-assert (<= scans 1) "one reconciliation reads the history at most once")
+                            (test-assert (= 5 (length (mission-schedule-test--notices application)))
+                                         "a restart announces only the missing occurrence"))))))
+         (setf (application-conversation application) original)))))
+  nil)
+
 (-> test-mission-schedule-notice-conversation-switch () null)
 (defun test-mission-schedule-notice-conversation-switch ()
   "Switch at both publication boundaries and inspect both durable histories."
