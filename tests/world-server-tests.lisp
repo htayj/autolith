@@ -1831,6 +1831,32 @@ the version the client says it is, when it says one."
                   "only the first channel takes the warning")))
   nil)
 
+(-> test-world-server-open-shares-participant () null)
+(defun test-world-server-open-shares-participant ()
+  "Test the resident agent of a reopened channel carries its registered participant under a user initialization method."
+  (let* ((generic  #'initialize-instance)
+         (original (find-method generic '(:around) (list (find-class 'application)))))
+    (unwind-protect
+         (progn
+           ;; A user init file may define this method, which replaces the system's own.
+           (eval '(defmethod initialize-instance :around ((application application) &key)
+                    (call-next-method)))
+           (world-server-tests--call
+            (lambda (server configuration root)
+              (let ((local (configuration-copy configuration
+                                               :working-directory (world-tests--workspace root "a"))))
+                (world-tests--persisted-conversation local "bshare1" 1000)
+                (world-client-open configuration :channel "bshare1" :switch-p t)
+                (let* ((application (world-host-application (world-server--find-host server "bshare1")))
+                       (state       (agent-participant-state (application-agent application)))
+                       (identity    (participant-state-identity state)))
+                  (test-assert (eq state (application-participant-state application))
+                               "the resident agent shares the participant state of its application")
+                  (test-assert (and identity (equal (participant-residence identity) "bshare1"))
+                               "the resident agent carries the registered participant of its channel"))))))
+      (add-method generic original)))
+  nil)
+
 (-> test-world-server-open-passes-damage () null)
 (defun test-world-server-open-passes-damage ()
   "Test a workspace open passes over a channel whose conversation cannot be loaded, and names it."
