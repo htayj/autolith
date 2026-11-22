@@ -2269,20 +2269,12 @@
            (test-assert (= calls (context-admission-test-provider-network-calls provider)) "Legacy refusal occurs before any target transport.")))))
     nil))
 
-(-> test-context-measured-native-mechanical () null)
-(defun test-context-measured-native-mechanical ()
-  "Reject receipts across native checkpoints, mechanical bounding and projection rewind."
+(-> test-context-measured-mechanical-rewind () null)
+(defun test-context-measured-mechanical-rewind ()
+  "Reject receipts across mechanical bounding and projection rewind."
   (context-measured-tests--earned
    (lambda (fixture)
      (let ((owner (getf fixture :conversation)))
-       (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
-         (declare (ignore result))
-         (conversation-append-native-compaction
-          owner (list (json-object "type" "context_compaction" "encrypted_content" "synthetic-native-checkpoint"))
-          :family ':codex :summary "Synthetic native handoff")
-         (test-assert (null (conversation-input-measurement owner)) "Native compaction invalidates ordinary input evidence.")
-         (test-assert (null (provider-input-measurement-ticket-receipt owner ticket)) "Native publication revokes the outstanding ticket.")
-         (test-assert (null (conversation-input-measurement (conversation-load (conversation-pathname owner)))) "Native invalidation survives chunk reload."))
        (conversation-append-user-message owner "Inspect old evidence")
        (conversation-append-provider-item owner (precompaction-tests--call "measured-large-output"))
        (conversation-append-tool-result owner "measured-large-output" :tool-name "shell.run"
@@ -2290,7 +2282,7 @@
        (conversation-append-user-message owner "Next user turn")
        (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
          (agent--persist-provider-result (getf fixture :agent) result :request-number 4 :input-measurement ticket))
-       (test-assert (conversation-input-measurement-valid-p (conversation-input-measurement owner)) "Post-native ordinary success earns its own receipt.")
+       (test-assert (conversation-input-measurement-valid-p (conversation-input-measurement owner)) "A later ordinary success earns its own receipt.")
        (multiple-value-bind (result ticket) (context-measured-tests--attempt fixture)
          (declare (ignore result))
          (let ((paid (copy-tree (conversation-usage owner))))
@@ -2508,13 +2500,6 @@
 
 
 ;;;; -- Measured Admission with Paid Compaction and Missions --
-
-(defmethod provider-native-compact-conversation
-    ((provider context-measured-lifecycle-provider) (conversation conversation)
-     &key tool-namespaces event-callback)
-  "Select portable compaction for this owned transport fixture."
-  (declare (ignore provider conversation tool-namespaces event-callback))
-  (values nil nil))
 
 (-> test-context-measured-paid-summary-rejection () null)
 (defun test-context-measured-paid-summary-rejection ()
@@ -4181,7 +4166,7 @@ must carry actual projection provenance rather than infer it from a role."
 
 (-> test-context-admission-prepared-images () null)
 (defun test-context-admission-prepared-images ()
-  "Admit prepared screenshots on ordinary and native paths with output headroom."
+  "Admit prepared screenshots with output headroom."
   (with-test-environment (("AUTOLITH_CONTEXT_WINDOW" "272000")
                           ("AUTOLITH_CONTEXT_OUTPUT_RESERVE" "8192"))
     (with-test-configuration (configuration)
@@ -4204,11 +4189,8 @@ must carry actual projection provenance rather than infer it from a role."
         (test-assert (handler-case (progn (provider-open-response-stream provider request) t)
                        (provider-context-budget-error () nil))
                      "ordinary hard admission reaches the inert transport")
-        (test-assert (handler-case (progn (provider-open-native-compaction provider request) t)
-                       (provider-context-budget-error () nil))
-                     "native compaction reaches its real admitted boundary")
-        (test-assert (= 2 (context-admission-test-provider-network-calls provider))
-                     "both admitted generic calls reach transport exactly once")
+        (test-assert (= 1 (context-admission-test-provider-network-calls provider))
+                     "the admitted call reaches transport exactly once")
         (let* ((*provider-image-token-estimate* nil) (*image-input-maximum-patches* 1234)
                (image                         (json-object "type" "input_image" "image_url" "x")))
           (test-assert (= 1234 (provider-request-input-token-estimate provider image))
@@ -4216,10 +4198,6 @@ must carry actual projection provenance rather than infer it from a role."
           (let ((*provider-image-token-estimate* 6789))
             (test-assert (= 6789 (provider-request-input-token-estimate provider image))
                          "explicit portable allowances take precedence")))
-        (let ((large (json-object "input" (make-string (* 4 272000) :initial-element #\x))))
-          (test-assert (handler-case (progn (provider-open-native-compaction provider large) nil)
-                         (provider-context-budget-error () t))
-                       "native admission refuses genuinely oversized text"))
         (let ((capped (json-object "input" "small" "max_output_tokens" 272000)))
           (test-assert (handler-case (progn (provider-open-response-stream provider capped) nil)
                          (provider-context-budget-error () t))

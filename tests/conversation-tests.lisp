@@ -243,8 +243,8 @@
 
 (-> test-conversation-writer-stale-checkpoints () null)
 (defun test-conversation-writer-stale-checkpoints ()
-  "Refuse stale prepared summary/native checkpoints before durable invalidation."
-  (dolist (native-p '(nil t))
+  "Refuse stale prepared summary checkpoints before durable invalidation."
+  (progn
     (with-test-configuration (configuration)
       (let* ((a    (conversation-create configuration))
              (path (conversation-pathname a)))
@@ -253,11 +253,7 @@
                (plan         (conversation-compaction-capture a))
                (continuation (make-continuation :intent "summary")))
           (flet ((publish ()
-                   (if native-p
-                       (conversation-append-native-compaction
-                        a (list (json-object "type" "context_compaction" "encrypted_content" "checkpoint"))
-                        :family ':codex :continuation continuation :compaction plan)
-                       (conversation-append-summary a continuation :compaction plan))))
+                   (conversation-append-summary a continuation :compaction plan)))
             (conversation-append-user-message b "foreign arrival")
             (let ((revision (conversation-picker-revision-read path))
                   (before   (test-conversation--physical-source path))
@@ -275,11 +271,6 @@
                      (reloaded   (conversation-load path)))
                 (test-assert (equal "summary" (getf (getf properties :continuation) :intent))
                              "the checkpoint serializes the continuation intent")
-                (when native-p
-                  (let ((items (json-decode (getf properties :wire-json))))
-                    (test-assert (and (= 1 (length items))
-                                      (native-compaction-item-p (aref items 0)))
-                                 "native checkpoint wire data contains one valid compaction item")))
                 (test-assert (= (getf properties :through-seq) (1- (getf properties :seq))) "recomputed through is the actual precommit head")
                 (test-assert (< (getf properties :cutoff-seq) (getf properties :through-seq)) "the captured cutoff precedes the foreign arrival")
                 (test-assert (= 1 (length (getf properties :carry-forward))) "the foreign arrival is retained as carry-forward")

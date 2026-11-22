@@ -114,7 +114,7 @@
   test-context-measured-volatile-projection
   test-context-measured-storage-lifecycle
   test-context-measured-legacy-refusal
-  test-context-measured-native-mechanical
+  test-context-measured-mechanical-rewind
   test-context-measured-child-ownership
   test-context-measured-child-accounting
   test-context-admission-mission-large-budget
