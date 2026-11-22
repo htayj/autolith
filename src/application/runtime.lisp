@@ -1339,6 +1339,7 @@ AGENT, when supplied, retains its participant state and execution resources."
                    :tool-registry           tool-registry
                    :worker                  worker
                    :agent                   agent
+                   :participant-state       (agent-participant-state agent)
                    :ui                      ui
                    :permission-state        permission-state
                    :permission-mode         permission-mode
