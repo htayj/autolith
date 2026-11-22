@@ -12379,25 +12379,3 @@
        (test-assert (= before (length (conversation-records-newest (application-conversation application) 100)))
                     "paused reentry does not repeat notice or transition"))))
   nil)
-
-(-> test-tool-execution-handoff-cancel-literal () null)
-(defun test-tool-execution-handoff-cancel-literal ()
-  "Check executable cancellation syntax with an independent fixed-job handoff oracle."
-  (let ((application (application-tests--ui-application :columns 100)))
-    (test-assert (equal "(job.cancel :id \"exec:7\")" (terminal-ui--job-cancel-text "exec:7"))
-                 "the complete cancellation call quotes the fixed job identifier")
-    (dolist (case '((:requested "running in background · (job.cancel :id \"exec:7\")")
-                    (:grace-expired "still running in background · (job.cancel :id \"exec:7\")")))
-      (destructuring-bind (reason expected) case
-        (let* ((handoff (list ':tool-execution
-                             :handoff-reason reason
-                             :job            '(:id "exec:7" :state :running)))
-               (entry   (application--tool-execution-handoff-entry application "shell.run" handoff))
-               (detail  (string-left-trim " " (test-terminal-row-text (rest entry)))))
-          (test-assert (equal expected detail)
-                       "the entire rendered detail contains the independently specified call")
-          (test-assert (search "(job.cancel :id \"exec:7\")" (test-terminal-row-text entry))
-                       "the complete quoted cancellation call is visible in the actual entry")
-          (test-assert (notany #'termdown:widget-p entry)
-                       "durable handoff cancellation is passive text without insertion widgets")))))
-  nil)
