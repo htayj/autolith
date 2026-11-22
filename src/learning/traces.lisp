@@ -258,25 +258,40 @@ At most *ACTION-TRACE-LIMIT* turns are returned."
   "Call FUNCTION with the history of each recent conversation of CONFIGURATION's workspace.
 
 Conversations are visited newest first, at most *ACTION-TRACE-CONVERSATION-LIMIT*
-of them, until FUNCTION returns true. Each admission enforces the cache budget.
-The owner lock covers the pass, so visited histories are newer than unvisited
-ones even when another query runs concurrently."
+of them, until FUNCTION returns true. A conversation whose header names another
+workspace is skipped without reading its records. Each admission enforces the
+cache budget. The owner lock covers the pass, so visited histories are newer
+than unvisited ones even when another query runs concurrently."
   (with-lock-held (*action-trace-cache-lock*)
     (action-trace--cache-current)
     (let ((workspace (knowledge--workspace configuration)))
       (loop for pathname in (conversation-list configuration)
             repeat *action-trace-conversation-limit*
-            do (let ((history (handler-case (action-trace--read-locked pathname)
+            do (let ((history (handler-case
+                                  (let ((directory (action-trace--directory pathname)))
+                                    (and (not (and workspace
+                                                   directory
+                                                   (not (equal directory workspace))))
+                                         (action-trace--read-locked pathname)))
                                 (error ()
                                   nil))))
-                 (when (and history
-                            (not (and workspace
-                                      (action-trace-history-directory history)
-                                      (not (equal (action-trace-history-directory history)
-                                                  workspace))))
-                            (funcall function history))
+                 (when (and history (funcall function history))
                    (return))))))
   nil)
+
+(-> action-trace--directory (pathname) (option string))
+(defun action-trace--directory (pathname)
+  "Return the workspace named by the oldest header of the conversation at PATHNAME, or NIL."
+  (let ((oldest (first (conversation-storage-pathnames pathname))))
+    (and oldest
+         (block nil
+           (conversation--map-records
+            oldest
+            (lambda (record)
+              (return (and (eq (first record) ':conversation)
+                           (let ((origin (getf (rest record) :directory)))
+                             (and origin (namestring origin)))))))
+           nil))))
 
 (-> action-trace--history-traces (action-trace-history) list)
 (defun action-trace--history-traces (history)
