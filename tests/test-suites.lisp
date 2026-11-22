@@ -638,6 +638,7 @@
 (define-test-suite learning
   test-action-traces
   test-action-trace-residency
+  test-action-trace-incremental-reads
   test-procedure-templates
   test-procedure-lifecycle
   test-procedure-mining
