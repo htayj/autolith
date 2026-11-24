@@ -170,6 +170,31 @@
            (test-assert (= worker-calls 2) "only valid inputs reach the search worker"))))))
   nil)
 
+(-> test-openai-compatible-compaction-tool-choice () null)
+(defun test-openai-compatible-compaction-tool-choice ()
+  "Omit the forced submit tool choice from compaction requests and keep it on ordinary ones."
+  (with-test-configuration (configuration)
+    (let ((provider     (openai-compatible-provider-create
+                         configuration :name "compaction-choice-fixture" :family ':fixture))
+          (conversation (conversation-create configuration))
+          (tools        (continuation-tool-namespaces)))
+      (conversation-append-user-message conversation "Conversation to summarize.")
+      (flet ((encoded-request (compaction-p)
+               "Return the decoded JSON PROVIDER sends with the forced submit choice bound."
+               (let ((*provider-tool-choice* *continuation-submit-tool*))
+                 (json-decode
+                  (json-encode
+                   (provider-request-object provider conversation tools
+                                            :compaction-p compaction-p))))))
+        (test-assert (equal (gethash "tool_choice" (encoded-request t)) "auto")
+                     "compaction requests send the automatic choice instead of the forced tool")
+        (test-assert (equal (json-get (json-get (json-get (encoded-request nil) "tool_choice")
+                                                "function")
+                                      "name")
+                            (apply #'provider-wire-tool-name provider *continuation-submit-tool*))
+                     "ordinary requests keep their forced tool choice"))))
+  nil)
+
 (-> test-openai-compatible-provider-bootstrap () null)
 (defun test-openai-compatible-provider-bootstrap ()
   "Test deferred startup validation for user-defined model metadata."
@@ -1026,7 +1051,7 @@
                   (conversation-create provider-configuration :identifier
                                        "openai-compatible-compaction")))
              (conversation-append-user-message conversation "Compact this history.")
-             (test-compaction-request provider conversation)
+             (test-compaction-request provider conversation :forced-p nil)
              (multiple-value-bind (request delivery)
                  (provider-request-object provider conversation #() :compaction-p t)
                (let* ((messages       (json-get request "messages"))
