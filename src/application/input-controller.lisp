@@ -35,6 +35,9 @@
     (sb-ext:exit :code status :abort t))
   "The process termination boundary captured by each input controller.")
 
+(defvar *application-turn-cancellation-deliverable-p* nil
+  "True on a channel thread while its current work runs inside the cancellation handler.")
+
 (defclass application-input-controller ()
   ((application
     :initarg       :application
@@ -1078,7 +1081,10 @@ never waits for work that holds it."
     null)
 (defun application-input-controller--interrupt-main-for-turn-cancellation
     (controller)
-  "Promptly deliver CONTROLLER's pending turn cancellation to its main thread."
+  "Promptly deliver CONTROLLER's pending turn cancellation to its main thread.
+
+A thread outside its work handler keeps the request pending; the handler
+consumes it when the work enters."
   (if (application-assignment-cancel
        (application-input-controller-application controller) :reason ':cancelled)
       (application-input-controller--consume-turn-cancellation-delivery-p controller)
@@ -1088,9 +1094,9 @@ never waits for work that holds it."
             (interrupt-thread
              thread
              (lambda ()
-               (when
-                   (application-input-controller--consume-turn-cancellation-delivery-p
-                    controller)
+               (when (and *application-turn-cancellation-deliverable-p*
+                          (application-input-controller--consume-turn-cancellation-delivery-p
+                           controller))
                  (error (make-condition 'application-turn-cancelled)))))))))
   nil)
 
@@ -3090,7 +3096,12 @@ External tools cannot receive a local command sandbox grant. ASK owns the UI."
     boolean)
 (defun application-input-controller-begin-external-work
     (controller &key (kind ':message))
-  "Mark one runner-free external turn active without consuming FIFO work."
+  "Mark one runner-free external turn active without consuming FIFO work.
+
+A caller running the external work binds
+*APPLICATION-TURN-CANCELLATION-DELIVERABLE-P* inside its own
+APPLICATION-TURN-CANCELLED handler; otherwise an asynchronous cancellation
+stays pending until FINISH-EXTERNAL-WORK."
   (with-lock-held ((application-input-controller-lock controller))
     (unless (application-input-controller-stopping-p controller)
       (setf (slot-value controller 'main-thread) (current-thread)
