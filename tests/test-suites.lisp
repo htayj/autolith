@@ -1682,6 +1682,7 @@
   test-active-turn-interrupt-events
   test-detach-control-event-dispatch
   test-active-turn-cancellation-side-effects
+  test-exit-before-work-handler-keeps-cancellation-pending
   test-idle-interrupt-exits-without-force-hint
   test-recalled-follow-up-interrupt
   test-active-turn-stop-keys
