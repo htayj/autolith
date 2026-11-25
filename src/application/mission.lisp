@@ -194,7 +194,7 @@
   (let* ((application (mission-context-application context))
          (header      (format nil "■ mission ~(~A~)" status))
          (body        (sanitize-text (mission--bounded-text evidence)))
-         (style       (if (eq status ':blocked) ':notice ':failure)))
+         (style       (if (member status '(:blocked :paused)) ':notice ':failure)))
     (application-side-status-present
      application (format nil "mission ~A" (string-downcase status))
      (if (application-ui application)
@@ -674,6 +674,19 @@ Report whether the guarded goal is current or replaced; omit arbitrary goal evid
     (with-recursive-lock-held ((mission-context-lock context))
       (mission--admit context :inference-p nil :new-work-p t)
       (mission--transition context ':paused "User paused the mission.")))
+  nil)
+
+(-> application-mission-pause-idle (application) null)
+(defun application-mission-pause-idle (application)
+  "Pause the active mission after a goal continuation that made no tool calls."
+  (let ((context  (mission-context-find (application-conversation application)))
+        (evidence "A goal continuation made no tool calls. Use (goal :resume) to continue."))
+    (when context
+      (with-recursive-lock-held ((mission-context-lock context))
+        (when (and (eq (mission-context-goal context) (application-goal application))
+                   (eq (getf (mission-context-goal context) :status) ':active))
+          (mission--transition context ':paused evidence)
+          (mission--present-terminal-notice context ':paused evidence)))))
   nil)
 
 (-> mission-context-bind ((option mission-context) t) null)
