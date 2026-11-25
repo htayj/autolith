@@ -4932,7 +4932,8 @@ refusal, as a secondary value."
   "Run continuation turns while the mission is active.
 
 Wait for queued input, pending job results that will wake the model, or a
-scheduled wakeup before continuing."
+scheduled wakeup before continuing. Pause the mission after a continuation
+that made no tool calls, since repeating the prompt would only repeat its answer."
   (setf (application-deferred-goal-continuation application) nil)
   (loop
     (let ((goal (application-goal application)))
@@ -4964,15 +4965,19 @@ scheduled wakeup before continuing."
         (return))
       (incf (getf (application-goal application) :continuations))
       (application--record-goal application)
-      (when (eq ':failed
-                (nth-value 1
-                           (application--run-turn
-                            application *application-goal-continuation-prompt*
-                            :continuation-p              t
-                            :steering-function           steering-function
-                            :steering-persisted-function steering-persisted-function
-                            :pending-operations-function pending-operations-function)))
-        (return))))
+      (let ((actions (application-action-count application)))
+        (when (eq ':failed
+                  (nth-value 1
+                             (application--run-turn
+                              application *application-goal-continuation-prompt*
+                              :continuation-p              t
+                              :steering-function           steering-function
+                              :steering-persisted-function steering-persisted-function
+                              :pending-operations-function pending-operations-function)))
+          (return))
+        (when (= actions (application-action-count application))
+          (application-mission-pause-idle application)
+          (return)))))
   nil)
 
 (-> application-run-message

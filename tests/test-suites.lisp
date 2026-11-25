@@ -1874,6 +1874,7 @@
   test-mission-unknown-usage-and-recovery
   test-mission-gate-retries
   test-mission-acceptance-proof
+  test-goal-pauses-after-text-only-continuation
   test-mission-execution-gates
   test-mission-gate-freshness-after-mutation
   test-mission-artifact-freshness-after-mutation
