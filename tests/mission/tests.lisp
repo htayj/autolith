@@ -567,6 +567,51 @@
          (test-assert (getf (first (getf (application-goal application) :criteria)) :evidence)
                       "criterion evidence restores with mission state"))))))
 
+(-> mission-test--run-goal-continuations (list) list)
+(defun mission-test--run-goal-continuations (results)
+  "Run (goal) continuations over scripted RESULTS and return the observed outcome."
+  (with-test-configuration (configuration)
+    (let* ((application (mission-test--application configuration :results results))
+           (failure     nil))
+      (application-mission-start application (list :objective "Ask which file to delete")
+                                 :final-marker-p t)
+      (handler-case (application--run-goal-continuations application)
+        (error (condition)
+          (setf failure (princ-to-string condition))))
+      (list :goal      (copy-tree (application-goal application))
+            :remaining (length (scripted-provider-results (application-provider application)))
+            :failure   failure
+            :history   (prin1-to-string
+                        (conversation-records-newest (application-conversation application) 20))))))
+
+(-> test-goal-pauses-after-text-only-continuation () null)
+(defun test-goal-pauses-after-text-only-continuation ()
+  "Pause a (goal) mission after an automatic continuation that makes no tool calls."
+  (flet ((text () (mission-test--result "Which file should I delete: alpha.txt or beta.txt?"))
+         (call (identifier)
+           (agent-test-result (make-identifier)
+                              (list (agent-test-call :call-id identifier :namespace "test"
+                                                     :name "missing")))))
+    (destructuring-bind (&key goal remaining failure history)
+        (mission-test--run-goal-continuations (list (text) (text) (text) (text)))
+      (test-assert (null failure) "text-only continuations stop before the script runs out")
+      (test-assert (= 1 (getf goal :continuations)) "the first text-only continuation is the last")
+      (test-assert (= 3 remaining) "no further provider request follows the text-only turn")
+      (test-assert (eq ':paused (getf goal :status)) "the goal is paused, not left active")
+      (test-assert (find ':paused (getf goal :evidence) :key (lambda (entry) (getf entry :kind)))
+                   "the pause carries durable evidence")
+      (test-assert (search "mission paused" history) "the pause is shown in the transcript"))
+    (destructuring-bind (&key goal remaining failure &allow-other-keys)
+        (mission-test--run-goal-continuations
+         (list (call "first") (mission-test--result "Checked the first file.")
+               (call "second") (mission-test--result "Checked the second file.")
+               (text) (text)))
+      (test-assert (null failure) "tool-using continuations run without error")
+      (test-assert (= 3 (getf goal :continuations)) "continuations that call tools keep going")
+      (test-assert (= 1 remaining) "the loop stops at the first text-only continuation")
+      (test-assert (eq ':paused (getf goal :status)) "the text-only continuation pauses the goal")))
+  nil)
+
 (-> test-mission-execution-gates () null)
 (defun test-mission-execution-gates ()
   "Run command, artifact and Lisp gates through existing sandbox and worker boundaries."
